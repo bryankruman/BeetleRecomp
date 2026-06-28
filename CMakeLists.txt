@@ -1,49 +1,164 @@
+# CMakeLists.txt — BeetleRecomp (static-recomp PC port of Beetle Adventure Racing)
+#
+# Adapted from Zelda64Recomp/Zelda64Recomp @ dev (CMakeLists.txt). Pinned deps in this repo:
+#   lib/N64ModernRuntime @ main (recomp::start(Configuration) — see src/main/main.cpp)
+#   lib/rt64 @ main, lib/RmlUi @ 6.1.x, lib/lunasvg @ 3.5.x, lib/N64Recomp @ mod-tool-release
+#
+# !!! UNTESTED — not yet configured/built (no local toolchain). Treat as a first draft.
+#
+# Prereqs before this will configure/build:
+#   1) scripts/setup.*  -> `git submodule update --init --recursive` (populates the NESTED
+#      submodules: N64ModernRuntime/N64Recomp, rt64/contrib, etc.) and builds N64Recomp.
+#   2) ./N64Recomp BeetleRecomp.toml  -> populates RecompiledFuncs/*.c (this file globs them).
+#   3) A C++20 toolchain: Windows = VS2022 + clang-cl + Ninja (RT64 -> D3D12);
+#      Linux = clang + ninja + SDL2/GTK (RT64 -> Vulkan). See BUILDING.md.
+
 cmake_minimum_required(VERSION 3.20)
 project(BeetleRecomp LANGUAGES C CXX)
 
-# BeetleRecomp — modern PC port of Beetle Adventure Racing via static recompilation.
-#
-# This is a STARTING SKELETON modeled on Zelda64Recompiled's CMake setup. The exact
-# target/link wiring for N64ModernRuntime + RT64 + RmlUi must be adapted from upstream:
-#   https://github.com/Zelda64Recomp/Zelda64Recomp/blob/dev/CMakeLists.txt
-#
-# Prereqs: run scripts/setup.* (fetches submodules into lib/, builds the recompiler),
-# then ./N64Recomp BeetleRecomp.toml (generates RecompiledFuncs/). See BUILDING.md.
-
+set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-everything /W4")
+endif()
+if (WIN32)
+    # Avoid the constexpr mutex ctor so we don't require a fresh vcredist (matches upstream).
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR")
+endif()
+if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.24.0")
+    cmake_policy(SET CMP0135 NEW)
 endif()
 
-# --- Generated recompiler output -------------------------------------------------
-# Produced by:  ./N64Recomp BeetleRecomp.toml   (and later ./N64Recomp patches.toml)
-# Run the recompiler BEFORE configuring/building.
-file(GLOB RECOMPILED_FUNCS   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/RecompiledFuncs/*.c")
-file(GLOB RECOMPILED_PATCHES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/RecompiledPatches/*.c")
-if(NOT RECOMPILED_FUNCS)
-  message(WARNING "No RecompiledFuncs/*.c — run './N64Recomp BeetleRecomp.toml' first (see BUILDING.md).")
-endif()
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
-# --- Dependencies (fetched by scripts/setup.* into lib/) -------------------------
-# Uncomment as each is wired up. Their exact target names come from upstream CMake.
-# add_subdirectory(lib/N64ModernRuntime)   # librecomp, ultramodern (brings N64Recomp runtime)
-# add_subdirectory(lib/rt64)               # renderer: D3D12 on Windows, Vulkan on Linux
-# add_subdirectory(lib/RmlUi)              # UI
-# add_subdirectory(lib/lunasvg)            # SVG icons
+# ---- RT64 first: defines the `rt64` target + build_*_shader() helpers ----
+set(RT64_STATIC TRUE)
+set(RT64_SDL_WINDOW_VULKAN TRUE)
+add_compile_definitions(HLSL_CPU)
+add_subdirectory(${CMAKE_SOURCE_DIR}/lib/rt64 ${CMAKE_BINARY_DIR}/rt64)
 
-# --- Port executable -------------------------------------------------------------
-add_executable(BeetleRecomp
-  src/main/main.cpp
-  ${RECOMPILED_FUNCS}
-  ${RECOMPILED_PATCHES}
+# ---- UI libs (optional for a boot-only build; included to mirror upstream) ----
+set(BUILD_SHARED_LIBS OFF)
+set(LUNASVG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(${CMAKE_SOURCE_DIR}/lib/lunasvg)
+set(RMLUI_SVG_PLUGIN ON CACHE BOOL "" FORCE)
+set(RMLUI_TESTS_ENABLED OFF CACHE BOOL "" FORCE)
+add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RmlUi)
+target_compile_definitions(rmlui_core PRIVATE LUNASVG_BUILD_STATIC)
+
+# ---- N64ModernRuntime: provides the `librecomp` and `ultramodern` targets ----
+add_subdirectory(${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime)
+
+# Shared include set for the generated C and the host.
+set(RECOMP_INCLUDES
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/ultramodern/include
+    ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/librecomp/include
+    # Populated by recursive submodule init (N64ModernRuntime's nested N64Recomp):
+    ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/N64Recomp/include
 )
-target_include_directories(BeetleRecomp PRIVATE include)
 
-# target_link_libraries(BeetleRecomp PRIVATE
-#   librecomp ultramodern RT64 RmlUi lunasvg)
+# ---------------------------------------------------------------------------
+# RecompiledFuncs — N64Recomp output. Run `./N64Recomp BeetleRecomp.toml` FIRST,
+# or this target will have no sources and CMake will error.
+# ---------------------------------------------------------------------------
+add_library(RecompiledFuncs STATIC)
+target_compile_options(RecompiledFuncs PRIVATE
+    -fno-strict-aliasing                 # MANDATORY for recompiled C (it puns memory constantly)
+    -Wno-unused-variable
+    -Wno-implicit-function-declaration
+)
+target_include_directories(RecompiledFuncs PRIVATE ${RECOMP_INCLUDES})
+file(GLOB FUNC_C_SOURCES   CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/RecompiledFuncs/*.c)
+file(GLOB FUNC_CXX_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/RecompiledFuncs/*.cpp)
+target_sources(RecompiledFuncs PRIVATE ${FUNC_C_SOURCES} ${FUNC_CXX_SOURCES})
 
-# Recompiled C is machine-generated; see Zelda64Recomp for the per-file flags
-# (e.g. disabling certain optimizations/warnings on RecompiledFuncs).
+# ---------------------------------------------------------------------------
+# PatchesLib — recompiled custom patches. Disabled until patches exist
+# (RecompiledPatches/ is produced by `make -C patches && ./N64Recomp patches.toml`).
+# TODO(BAR): uncomment + add to the link list once you author patches.
+# ---------------------------------------------------------------------------
+# add_library(PatchesLib STATIC
+#     ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c
+#     ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.c)
+# target_compile_options(PatchesLib PRIVATE -fno-strict-aliasing -Wno-unused-variable -Wno-implicit-function-declaration)
+# target_include_directories(PatchesLib PRIVATE ${RECOMP_INCLUDES})
+
+# ---------------------------------------------------------------------------
+# Main executable
+# ---------------------------------------------------------------------------
+add_executable(BeetleRecomp
+    ${CMAKE_SOURCE_DIR}/src/main/main.cpp
+    # TODO(BAR): add as authored (mirroring Zelda's src/main + src/game):
+    #   src/main/rt64_render_context.cpp   (RT64 RendererContext subclass)
+    #   src/main/register_overlays.cpp / register_patches.cpp
+    #   src/game/input.cpp / config.cpp
+    #   rsp/aspMain.cpp                    (RSPRecomp output)
+)
+target_include_directories(BeetleRecomp PRIVATE
+    ${RECOMP_INCLUDES}
+    ${CMAKE_SOURCE_DIR}/lib/rt64/src
+    ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+if (CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+    target_compile_options(BeetleRecomp PRIVATE -march=nehalem -fno-strict-aliasing -fms-extensions)
+else()
+    target_compile_options(BeetleRecomp PRIVATE -fno-strict-aliasing -fms-extensions)
+endif()
+if (MSVC)
+    target_link_options(BeetleRecomp PRIVATE /OPT:NOICF)   # don't fold identical recompiled funcs
+endif()
+
+# ---- Windows: RT64 picks D3D12 by default; SDL2 via FetchContent ----
+if (WIN32)
+    include(FetchContent)
+    set(SDL2_VERSION "2.30.3")
+    FetchContent_Declare(sdl2
+        URL https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-devel-${SDL2_VERSION}-VC.zip)
+    FetchContent_MakeAvailable(sdl2)
+    target_include_directories(BeetleRecomp PRIVATE ${sdl2_SOURCE_DIR}/include)
+    target_link_directories(BeetleRecomp PRIVATE ${sdl2_SOURCE_DIR}/lib/x64)
+    add_compile_definitions(NOMINMAX)
+    add_custom_command(TARGET BeetleRecomp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${sdl2_SOURCE_DIR}/lib/x64/SDL2.dll"
+            "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxil.dll"
+            "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxcompiler.dll"
+            $<TARGET_FILE_DIR:BeetleRecomp>)
+    set_target_properties(BeetleRecomp PROPERTIES
+        LINK_FLAGS_DEBUG          "/SUBSYSTEM:CONSOLE"
+        LINK_FLAGS_RELEASE        "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
+    target_link_libraries(BeetleRecomp PRIVATE SDL2 Winmm.lib)
+    # TODO(BAR): app icon -> target_sources(BeetleRecomp PRIVATE icons/app.rc)
+endif()
+
+# ---- Linux: RT64 -> Vulkan ----
+if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+    find_package(SDL2 REQUIRED)
+    add_compile_definitions("RT64_SDL_WINDOW_VULKAN")
+    target_include_directories(BeetleRecomp PRIVATE ${SDL2_INCLUDE_DIRS})
+    set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+    find_package(Threads REQUIRED)
+    target_link_libraries(BeetleRecomp PRIVATE
+        "-latomic -static-libstdc++" ${CMAKE_DL_LIBS} Threads::Threads SDL2::SDL2)
+endif()
+
+# ---- Link the runtime + generated code ----
+target_link_libraries(BeetleRecomp PRIVATE
+    # PatchesLib            # enable once patches exist
+    RecompiledFuncs
+    librecomp
+    ultramodern
+    rt64
+    RmlUi::Core             # drop these three for a boot-only build with no UI
+    RmlUi::Debugger
+    lunasvg
+)
+
+set_property(TARGET BeetleRecomp PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
