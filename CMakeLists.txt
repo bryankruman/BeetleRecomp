@@ -22,6 +22,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# RmlUi menu UI is OFF by default for now (it needs Freetype — see BUILDING.md). The core
+# port (recompiled code + runtime + RT64) builds without it. Enable with -DBEETLE_ENABLE_UI=ON.
+option(BEETLE_ENABLE_UI "Build the RmlUi menu UI (requires Freetype)" OFF)
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-everything /W4")
 endif()
@@ -42,14 +46,18 @@ set(RT64_SDL_WINDOW_VULKAN TRUE)
 add_compile_definitions(HLSL_CPU)
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/rt64 ${CMAKE_BINARY_DIR}/rt64)
 
-# ---- UI libs (optional for a boot-only build; included to mirror upstream) ----
-set(BUILD_SHARED_LIBS OFF)
-set(LUNASVG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-add_subdirectory(${CMAKE_SOURCE_DIR}/lib/lunasvg)
-set(RMLUI_SVG_PLUGIN ON CACHE BOOL "" FORCE)
-set(RMLUI_TESTS_ENABLED OFF CACHE BOOL "" FORCE)
-add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RmlUi)
-target_compile_definitions(rmlui_core PRIVATE LUNASVG_BUILD_STATIC)
+# ---- UI libs (RmlUi + lunasvg). Gated OFF by default: RmlUi requires Freetype. On Windows,
+# add the lib/freetype-windows-binaries submodule + set FREETYPE_LIBRARY/FREETYPE_INCLUDE_DIRS
+# before this block, then configure with -DBEETLE_ENABLE_UI=ON. ----
+if (BEETLE_ENABLE_UI)
+    set(BUILD_SHARED_LIBS OFF)
+    set(LUNASVG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${CMAKE_SOURCE_DIR}/lib/lunasvg)
+    set(RMLUI_SVG_PLUGIN ON CACHE BOOL "" FORCE)
+    set(RMLUI_TESTS_ENABLED OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RmlUi)
+    target_compile_definitions(rmlui_core PRIVATE LUNASVG_BUILD_STATIC)
+endif()
 
 # ---- N64ModernRuntime: provides the `librecomp` and `ultramodern` targets ----
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime)
@@ -156,9 +164,9 @@ target_link_libraries(BeetleRecomp PRIVATE
     librecomp
     ultramodern
     rt64
-    RmlUi::Core             # drop these three for a boot-only build with no UI
-    RmlUi::Debugger
-    lunasvg
 )
+if (BEETLE_ENABLE_UI)
+    target_link_libraries(BeetleRecomp PRIVATE RmlUi::Core RmlUi::Debugger lunasvg)
+endif()
 
 set_property(TARGET BeetleRecomp PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
