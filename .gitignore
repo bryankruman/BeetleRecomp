@@ -1,0 +1,42 @@
+# --- Build output ---
+/build-cmake/
+/build/
+/out/
+*.o
+*.obj
+
+# --- N64Recomp generated code (regenerated from the ELF; do not commit) ---
+/RecompiledFuncs/
+/RecompiledPatches/
+
+# --- Recompiler executables copied to repo root by scripts/setup ---
+/N64Recomp
+/N64Recomp.exe
+/RSPRecomp
+/RSPRecomp.exe
+
+# --- Game binary / decomp artifacts (NEVER commit a ROM or ELF) ---
+/elf/*.elf
+/elf/*.z64
+/elf/*.bin
+*.z64
+*.n64
+*.v64
+
+# --- Patches build artifacts ---
+/patches/patches.elf
+/patches/patches.bin
+/patches/patches.map
+/patches/*.o
+
+# --- Generated symbol tables (large; regenerate from the decomp) ---
+/syms/*.toml
+
+# --- IDE / OS ---
+/.vs/
+/.idea/
+/.cache/
+CMakeUserPresets.json
+*.user
+.DS_Store
+Thumbs.db

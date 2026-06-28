@@ -1,0 +1,24 @@
+# Relocatable overlay sections for N64Recomp — one ELF section name per line.
+#
+# Beetle Adventure Racing loads ~130 relocatable code MODULES at runtime (ai, battle,
+# race, ..., uv*_rom — see the decomp's config/us/modules.yaml). Each module is a
+# relocatable unit and must be listed here so the recompiler emits LOOKUP_FUNC /
+# RELOC_HI16 / RELOC_LO16 for it instead of hard-coded calls/addresses.
+#
+# IMPORTANT: the decomp's *matching* ELF splits each module into many per-file
+# sub-sections (.UVAN_0, .UVBT_0, ...), which is NOT the per-module grouping wanted
+# here. Two ways forward:
+#
+#   1. (Quick, approximate) extract candidate section names from your current ELF:
+#          scripts/gen-overlays.sh elf/beetleadventurerac.us.elf overlays.us.txt
+#
+#   2. (Correct, preferred) build a per-module "recomp.elf" from the decomp — finish
+#      the `make recomp` target / write linker_scripts/us/recomp.ld so each module is
+#      ONE section — then point BeetleRecomp.toml `elf_path` at it and regenerate.
+#
+# This file is intentionally EMPTY for now: with no relocatable sections, N64Recomp
+# treats all modules as static. That is wrong for a real run but is the simplest
+# starting point for the very first recompile-and-boot experiment.
+#
+# (If the recompiler rejects comment lines in this file, delete them — keep only
+# bare section names.)

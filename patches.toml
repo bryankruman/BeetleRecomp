@@ -1,0 +1,37 @@
+# N64Recomp configuration for the C PATCHES that override game functions.
+#
+# Patches are C compiled to MIPS (see patches/Makefile -> patches.elf), then
+# recompiled in single-file mode and linked BEFORE the main output so same-named
+# functions take priority.
+#
+# Run with:  ./N64Recomp patches.toml   (after building patches/patches.elf)
+#
+# This is a LATER-phase step: the minimal first-boot path needs only
+# BeetleRecomp.toml. Patches require symbol TOMLs generated from the decomp
+# (see syms/ and the README).
+
+[input]
+elf_path = "patches/patches.elf"
+output_func_path = "RecompiledPatches"
+single_file_output = true
+use_absolute_symbols = true
+
+# Decomp symbol metadata so the recompiler can resolve relocations.
+# Generate these from the decomp's symbol_addrs (see scripts / README).
+func_reference_syms_file = "syms/beetleadventurerac.us.syms.toml"
+data_reference_syms_files = [
+    "syms/beetleadventurerac.us.datasyms.toml",
+    "patches/custom_syms.toml",
+]
+
+# Let the recompiler emit the patched binary (so it can fix MIPS32 relocs itself).
+output_binary_path = "patches/patches.bin"
+
+# clang emits many unpaired LO16s; silence those warnings.
+unpaired_lo16_warnings = false
+
+# Allow exporting functions/events for mods/runtime to call.
+allow_exports = true
+
+# Validate that patched symbols exist and non-patch functions aren't symbols.
+strict_patch_mode = true

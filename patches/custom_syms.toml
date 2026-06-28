@@ -1,0 +1,6 @@
+# Custom symbols defined by your patches, consumed by patches.toml's
+# data_reference_syms_files. Empty to start.
+#
+# [[symbol]]
+# name = "my_custom_global"
+# vram = 0x81000000

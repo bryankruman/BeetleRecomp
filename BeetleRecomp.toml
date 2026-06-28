@@ -1,0 +1,46 @@
+# N64Recomp configuration for Beetle Adventure Racing (USA).
+#
+# Run with:  ./N64Recomp BeetleRecomp.toml   (emits RecompiledFuncs/*.c)
+# Reference: https://github.com/N64Recomp/N64Recomp  +  Zelda64Recomp/us.rev1.toml
+
+[input]
+# VRAM entry point of the game binary.
+# Confirmed two ways: ROM header offset 0x8 == 0x80000400, and the splat `entry`
+# segment vram (linker_scripts/us/beetleadventurerac.ld: ".entry 0x80000400").
+entrypoint = 0x80000400
+
+# Symbol-rich ELF from the BAR decomp's matching build. Provision it with
+# scripts/fetch-elf.* (it streams build/beetleadventurerac.us.elf out of WSL).
+#
+# NOTE: the matching ELF is ~170 MB / 2492 sections (splat splits each module
+# into per-file sub-sections). Long-term, point this at a per-module "recomp.elf"
+# instead — see README -> Roadmap (decomp `make recomp` / recomp.ld).
+elf_path = "elf/beetleadventurerac.us.elf"
+
+# Per-function C output (one file per function). Build artifact; git-ignored.
+output_func_path = "RecompiledFuncs"
+
+# Relocatable overlay sections (BAR's ~130-module system). See overlays.us.txt and
+# scripts/gen-overlays.sh. Start empty (modules treated as static) for a first
+# experiment; this MUST be populated for the game to actually work.
+relocatable_sections_path = "overlays.us.txt"
+
+# Alternative to elf_path: a decompressed ROM + a symbols TOML.
+# rom_file_path     = "elf/beetleadventurerac.us.z64"
+# symbols_file_path = "syms/beetleadventurerac.us.syms.toml"
+
+[patches]
+# Functions to emit as empty stubs (e.g. raw RCP/hardware pokes the runtime handles
+# itself). Populate during bring-up as you discover them.
+stubs = [
+]
+
+# Symbols that look like functions but aren't (data mislabeled as code). Add as needed.
+ignored = [
+]
+
+# Single-instruction patches to the target binary, e.g. neutralizing a hardware write:
+# [[patches.instruction]]
+# func  = "SomeFunc"
+# vram  = 0x80001234
+# value = 0x00000000   # -> nop

@@ -1,0 +1,17 @@
+# Normalize line endings to LF across platforms (this repo is native-Git friendly).
+* text=auto eol=lf
+
+# Scripts
+*.sh  text eol=lf
+*.ps1 text eol=crlf
+
+# Binary (no EOL munging, no textual diff)
+*.z64 binary
+*.n64 binary
+*.v64 binary
+*.elf binary
+*.bin binary
+*.png binary
+*.ico binary
+*.ttf binary
+*.otf binary

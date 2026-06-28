@@ -1,0 +1,3 @@
+[submodule "lib/bar-decomp"]
+	path = lib/bar-decomp
+	url = https://github.com/bryankruman/BeetleDecomp
