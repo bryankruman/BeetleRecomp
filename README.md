@@ -41,7 +41,7 @@ the port. What the recomp uses from the decomp is:
 
 **Decomp matching progress does not change the game.** Because the decomp is *byte-matching*, a
 function written in C produces the exact same machine code as its raw-asm version — so recompiling
-it yields identical output. You never wait on matching progress. What *does* flow downstream from
+it yields identical output. Matching progress is therefore not a prerequisite for the port. What *does* flow downstream from
 decomp improvements is: **better symbol names**, **struct/types** (readability of generated code and
 patches), and — most importantly — **segmentation and reloc layout** (the per-module `recomp.ld`,
 see [Roadmap](#roadmap)).
@@ -56,19 +56,19 @@ the same commit so the ELF and headers agree.)
 > The submodule here is for *source reference* (headers/symbols); build the ELF in your WSL decomp
 > checkout and fetch it in.
 
-### Where your changes go (the modifier layer)
+### Where modifications go (the modifier layer)
 
-Your instinct is right: **never edit the decomp to change the game.** Keep it a faithful,
-byte-matching mirror of the original. Your modifications live in two recomp-owned layers:
+**Never edit the decomp to change the game.** Keep it a faithful, byte-matching mirror of the
+original. Modifications live in two recomp-owned layers:
 
 - **`patches/`** — C compiled to MIPS that **overrides** game functions by name (`RECOMP_PATCH`) or
-  **hooks** their entry/return (`RECOMP_HOOK`). This is your game-logic modifier layer: bug fixes,
+  **hooks** their entry/return (`RECOMP_HOOK`). This is the game-logic modifier layer: bug fixes,
   physics tweaks, widescreen, new features. Patches link *before* the recompiled output, so they win.
 - **`src/` runtime** — the native C++ host: rendering (RT64), input, audio, saves, config, resolution,
   and any new capabilities. This is the "interpreter / host" layer.
 - For distributable mods, the recomp ecosystem also has a **mod system** (RecompModTool / `.nrm`).
 
-The decomp stays a pure reconstruction of the original; everything you *add or change* lives here.
+The decomp stays a pure reconstruction of the original; all added or changed code lives here.
 
 ## Verified findings (2026-06-28)
 
