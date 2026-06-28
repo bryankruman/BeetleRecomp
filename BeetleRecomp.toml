@@ -9,20 +9,17 @@
 # segment vram (linker_scripts/us/beetleadventurerac.ld: ".entry 0x80000400").
 entrypoint = 0x80000400
 
-# Symbol-rich ELF from the BAR decomp's matching build. Provision it with
-# scripts/fetch-elf.* (it streams build/beetleadventurerac.us.elf out of WSL).
-#
-# NOTE: the matching ELF is ~170 MB / 2492 sections (splat splits each module
-# into per-file sub-sections). Long-term, point this at a per-module "recomp.elf"
-# instead — see README -> Roadmap (decomp `make recomp` / recomp.ld).
-elf_path = "elf/beetleadventurerac.us.elf"
+# Per-module relocatable ELF from the decomp's `make recomp` target: base game +
+# one relocatable section per module (.ai/.battle/... at 0x80800000+) + MIPS relocs.
+# Provision it with scripts/fetch-elf.* (streams it out of the WSL decomp checkout).
+# Build it first:  (WSL) cd ~/projects/bar-decomp && source .venv/bin/activate && make recomp
+elf_path = "elf/recomp.elf"
 
 # Per-function C output (one file per function). Build artifact; git-ignored.
 output_func_path = "RecompiledFuncs"
 
-# Relocatable overlay sections (BAR's ~130-module system). See overlays.us.txt and
-# scripts/gen-overlays.sh. Start empty (modules treated as static) for a first
-# experiment; this MUST be populated for the game to actually work.
+# Relocatable overlay sections: the 133 .<module> sections in recomp.elf, one per line
+# (extracted from recomp.elf; regenerate with scripts/gen-overlays.sh after a rebuild).
 relocatable_sections_path = "overlays.us.txt"
 
 # Alternative to elf_path: a decompressed ROM + a symbols TOML.

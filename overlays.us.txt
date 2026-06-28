@@ -1,24 +1,133 @@
-# Relocatable overlay sections for N64Recomp — one ELF section name per line.
-#
-# Beetle Adventure Racing loads ~130 relocatable code MODULES at runtime (ai, battle,
-# race, ..., uv*_rom — see the decomp's config/us/modules.yaml). Each module is a
-# relocatable unit and must be listed here so the recompiler emits LOOKUP_FUNC /
-# RELOC_HI16 / RELOC_LO16 for it instead of hard-coded calls/addresses.
-#
-# IMPORTANT: the decomp's *matching* ELF splits each module into many per-file
-# sub-sections (.UVAN_0, .UVBT_0, ...), which is NOT the per-module grouping wanted
-# here. Two ways forward:
-#
-#   1. (Quick, approximate) extract candidate section names from your current ELF:
-#          scripts/gen-overlays.sh elf/beetleadventurerac.us.elf overlays.us.txt
-#
-#   2. (Correct, preferred) build a per-module "recomp.elf" from the decomp — finish
-#      the `make recomp` target / write linker_scripts/us/recomp.ld so each module is
-#      ONE section — then point BeetleRecomp.toml `elf_path` at it and regenerate.
-#
-# This file is intentionally EMPTY for now: with no relocatable sections, N64Recomp
-# treats all modules as static. That is wrong for a real run but is the simplest
-# starting point for the very first recompile-and-boot experiment.
-#
-# (If the recompiler rejects comment lines in this file, delete them — keep only
-# bare section names.)
+.ai
+.aiedit
+.airec
+.battle
+.bubble
+.cam
+.caranim
+.caraudio
+.cbars
+.demo
+.dledit
+.env
+.envsnd
+.expl
+.filerom
+.fileux
+.filmroll
+.flag
+.game
+.gamegui
+.glare
+.intro
+.letter
+.level1
+.light
+.logo
+.med
+.menuslct
+.misc
+.motion
+.mult1
+.mult2
+.mult3
+.mult4
+.mult5
+.mult6
+.mult7
+.mult8
+.mult9
+.pause
+.piece
+.plyr
+.powerup
+.profgame
+.race
+.rain
+.replay
+.results
+.ripple
+.rumble
+.scene
+.scrn
+.selection
+.shadow
+.skid
+.smack
+.snd
+.sparks
+.splash
+.spray
+.tdata
+.ted
+.track1
+.track2
+.track3
+.track4
+.track5
+.track6
+.track7
+.triganim
+.txtview
+.ufo
+.ufogame
+.uvaudiomgr_rom
+.uvbill_rom
+.uvblit_rom
+.uvcback_rom
+.uvchannel_rom
+.uvcmidi_rom
+.uvcolor_rom
+.uvcont_rom
+.uvcontourld_rom
+.uvdbg_rom
+.uvdgeom_rom
+.uvdobj_rom
+.uvdsetld_rom
+.uvdyn_rom
+.uvear_rom
+.uvemitter_rom
+.uvenv_rom
+.uvenvld_rom
+.uvfmtx_rom
+.uvfont_rom
+.uvfontld_rom
+.uvfvec_rom
+.uvfx_rom
+.uvgeom_rom
+.uvgfxmgr_rom
+.uvgfxstate_rom
+.uvgrph_rom
+.uvgui_rom
+.uvimtx_rom
+.uvintersect_rom
+.uvisect_rom
+.uvjanim_rom
+.uvjanimld_rom
+.uvled_rom
+.uvlight_rom
+.uvmath_rom
+.uvmodel_rom
+.uvmodelld_rom
+.uvpfx_rom
+.uvpfxld_rom
+.uvquat_rom
+.uvquery_rom
+.uvsort_rom
+.uvsprt_rom
+.uvstring_rom
+.uvterra_rom
+.uvterrald_rom
+.uvtexanim_rom
+.uvtexture_rom
+.uvtextureld_rom
+.uvtexturexref_rom
+.uvtrackld_rom
+.uvtseq_rom
+.uvtseqld_rom
+.uvufileld_rom
+.uvvattr_rom
+.uvvolumeld_rom
+.victory
+.voltest
+.weapon

@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 
 DISTRO="${WSL_DISTRO:-Ubuntu-24.04}"
 DECOMP_DIR="${DECOMP_DIR:-/home/brysl/projects/bar-decomp}"
-ELF_REL="${ELF_REL:-build/beetleadventurerac.us.elf}"
+ELF_REL="${ELF_REL:-build/recomp.elf}"
 
 mkdir -p elf
 DEST="elf/$(basename "$ELF_REL")"

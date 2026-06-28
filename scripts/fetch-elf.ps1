@@ -2,7 +2,7 @@
 param(
   [string]$Distro    = "Ubuntu-24.04",
   [string]$DecompDir = "/home/brysl/projects/bar-decomp",
-  [string]$ElfRel    = "build/beetleadventurerac.us.elf"
+  [string]$ElfRel    = "build/recomp.elf"
 )
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
