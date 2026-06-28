@@ -45,6 +45,12 @@ set(RT64_STATIC TRUE)
 set(RT64_SDL_WINDOW_VULKAN TRUE)
 add_compile_definitions(HLSL_CPU)
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/rt64 ${CMAKE_BINARY_DIR}/rt64)
+# RT64 vendors SDL2 2.26.3, whose SDL_endian.h manually defines _m_prefetch (an old Clang-11
+# workaround). clang 17+ provides it as a builtin -> "definition of builtin function" error.
+# Defining SDL's own guard macro makes it skip that definition and use the compiler builtin.
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_definitions(rt64 PRIVATE __PRFCHWINTRIN_H)
+endif()
 
 # ---- UI libs (RmlUi + lunasvg). Gated OFF by default: RmlUi requires Freetype. On Windows,
 # add the lib/freetype-windows-binaries submodule + set FREETYPE_LIBRARY/FREETYPE_INCLUDE_DIRS
@@ -102,6 +108,7 @@ target_sources(RecompiledFuncs PRIVATE ${FUNC_C_SOURCES} ${FUNC_CXX_SOURCES})
 # ---------------------------------------------------------------------------
 add_executable(BeetleRecomp
     ${CMAKE_SOURCE_DIR}/src/main/main.cpp
+    ${CMAKE_SOURCE_DIR}/src/main/os_unimpl_stubs.cpp   # no-op stubs for ignored OS funcs BAR calls
     # TODO(BAR): add as authored (mirroring Zelda's src/main + src/game):
     #   src/main/rt64_render_context.cpp   (RT64 RendererContext subclass)
     #   src/main/register_overlays.cpp / register_patches.cpp
