@@ -113,13 +113,15 @@ add_executable(BeetleRecomp
     ${CMAKE_SOURCE_DIR}/src/main/overlay_bridge.cpp      # registers uv modules as overlays on load
     ${CMAKE_SOURCE_DIR}/src/main/hw_stubs.cpp            # native stubs for raw RCP-register libultra funcs
     ${CMAKE_SOURCE_DIR}/src/main/rt64_render_context.cpp # RT64-backed RendererContext subclass
+    ${CMAKE_SOURCE_DIR}/src/game/config.cpp              # host-owned settings persistence + high-FPS enable
     # TODO(BAR): add as authored (mirroring Zelda's src/main + src/game):
     #   src/main/register_patches.cpp
-    #   src/game/input.cpp / config.cpp
+    #   src/game/input.cpp
     #   rsp/aspMain.cpp                    (RSPRecomp output)
 )
 target_include_directories(BeetleRecomp PRIVATE
     ${RECOMP_INCLUDES}
+    ${CMAKE_SOURCE_DIR}/src                         # "game/config.hpp", etc.
     ${CMAKE_SOURCE_DIR}/RecompiledFuncs            # recomp_overlays.inl + funcs.h
     ${CMAKE_SOURCE_DIR}/lib/rt64/src
     # rt64_render_context.cpp includes RT64's internal headers, which pull in vendored contrib

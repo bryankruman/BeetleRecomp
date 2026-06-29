@@ -34,6 +34,8 @@
 #include "librecomp/rsp.hpp"                  // recomp::rsp::callbacks_t, RspUcodeFunc, OSTask
 #include "librecomp/overlays.hpp"             // overlay table (registration lives in register_overlays.cpp)
 
+#include "game/config.hpp"                    // bar::config — settings persistence + high-FPS enable
+
 #define SDL_MAIN_HANDLED                      // we provide our own main()/entry; don't let SDL hijack it
 #include <SDL.h>
 #include <SDL_syswm.h>                        // SDL_GetWindowWMInfo -> native HWND
@@ -237,8 +239,18 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // Config/save directory. TODO(BAR): use a proper per-user app folder, not cwd.
-    recomp::register_config_path(std::filesystem::current_path());
+    // Config/save directory: a real per-user folder (%LOCALAPPDATA%\BeetleRecomp on Windows;
+    // ~/.config/BeetleRecomp on Linux), or the exe dir when a portable.txt is present. librecomp
+    // writes saves / mod config here.
+    recomp::register_config_path(bar::config::get_app_config_directory());
+
+    // Load persisted graphics settings (or write defaults on first run) and push them into the
+    // runtime. This also enables RT64 high-FPS frame interpolation: the default config sets
+    // rr_option = Display, so presentation tracks the monitor refresh while the game/VI/audio
+    // clock stays locked at its native 60 Hz (identical game speed — see
+    // docs/SETTINGS_MENU_AND_HIGH_FPS.md). Must run before recomp::start() so the renderer reads
+    // it when it constructs the RT64 context.
+    bar::config::load_and_apply_graphics();
 
     // Teach librecomp about BAR (hash / entrypoint / save type).
     for (const auto& game : supported_games) {

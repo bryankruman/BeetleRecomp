@@ -101,11 +101,32 @@ See [BUILDING.md](../BUILDING.md).
   via `$<TARGET_PROPERTY:rt64,INCLUDE_DIRECTORIES>`, and `BEETLE_DEBUGINFO` (ON) for `/Z7`+`/DEBUG`
   symbols on the boot-path targets (RT64 stays Release).
 
+## Done this session (2026-06-29) — high-FPS interpolation + settings persistence
+See [SETTINGS_MENU_AND_HIGH_FPS.md](SETTINGS_MENU_AND_HIGH_FPS.md) for the full design.
+- **High-FPS (Phase 1) wired** in `src/main/rt64_render_context.cpp`:
+  - `get_display_framerate()` now returns RT64's real monitor rate (`app->appWindow->getRefreshRate()`,
+    fallback 60) so `RefreshRate::Display` tracks 144/165/etc. instead of being pinned to 60.
+  - `enable_instant_present()` now sets `enhancementConfig.presentation.mode = PresentEarly` +
+    `updateEnhancementConfig()` (was a no-op) so the game thread stops blocking on RDP completion.
+  - These let RT64 *interpolate* display frames; **game speed is unchanged** — the VI/audio clock is
+    `60 × speed_multiplier` with `speed_multiplier` a compile-time `1` the render path can't touch.
+- **Settings persistence (host-owned)** — new `src/game/config.{hpp,cpp}` (`bar::config`):
+  - Resolves a per-user dir (`%LOCALAPPDATA%\BeetleRecomp\`, or the exe dir if `portable.txt` exists;
+    `~/.config/BeetleRecomp` on Linux) and points `register_config_path()` at it (was cwd).
+  - Loads/saves `graphics.json` against ultramodern's `GraphicsConfig`; on first run writes defaults.
+  - `main()` now calls `load_and_apply_graphics()` before `recomp::start()`, which is what actually
+    turns interpolation **on**: the default `rr_option = Display` (every other field mirrors the prior
+    built-in behavior). Edit `graphics.json` (`"rr_option": "Original"|"Display"|"Manual"`,
+    `"rr_manual_value": 144`) to change it until the menu lands.
+- CMake: added `src/game/config.cpp` and `src/` to the include path.
+
 ## Still stubbed / not done
 - The 9 OS functions (`os_unimpl_stubs.cpp`) remain no-ops (threading / VI / SI / PI / timer).
 - Audio (RSP `aspMain` ucode) and input (SDL→N64) are stubs.
-- `enable_instant_present` is a no-op; `get_display_framerate` returns 60; `get_resolution_scale`
-  is minimal (these are fine for bring-up).
+- `get_resolution_scale` is minimal (fine for bring-up).
+- **Settings menu UI**: not built yet (Tier 1/2 per the design doc). Config is currently file-only
+  (`graphics.json`); the menu is the next deliverable. High-FPS artifact polish (extended-GBI
+  transform tagging) for the HUD/particles is a later, per-game effort.
 
 ## How to build + run + debug (Windows, headless)
 ```bash
