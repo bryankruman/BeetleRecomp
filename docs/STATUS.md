@@ -124,9 +124,29 @@ See [SETTINGS_MENU_AND_HIGH_FPS.md](SETTINGS_MENU_AND_HIGH_FPS.md) for the full 
 - The 9 OS functions (`os_unimpl_stubs.cpp`) remain no-ops (threading / VI / SI / PI / timer).
 - Audio (RSP `aspMain` ucode) and input (SDL→N64) are stubs.
 - `get_resolution_scale` is minimal (fine for bring-up).
-- **Settings menu UI**: not built yet (Tier 1/2 per the design doc). Config is currently file-only
-  (`graphics.json`); the menu is the next deliverable. High-FPS artifact polish (extended-GBI
-  transform tagging) for the HUD/particles is a later, per-game effort.
+- High-FPS artifact polish (extended-GBI transform tagging) for the HUD/particles is a later,
+  per-game effort (Phase 3 in the design doc).
+
+## Done this session (2026-06-29) — Tier-2 settings/launcher menu (RmlUi over RT64)
+Behind `-DBEETLE_ENABLE_UI=ON`. Ported from Zelda64Recompiled's `src/ui` (MIT), adapted to our
+pinned RT64 (`f0728a2`, plume RHI) and reduced to a documents-driven menu instead of Zelda's full
+`recompui` element/data-binding framework. See [SETTINGS_MENU_AND_HIGH_FPS.md](SETTINGS_MENU_AND_HIGH_FPS.md).
+- `src/ui/ui_renderer.{cpp,h}` — the RmlUi→RT64 render bridge (builds plume command lists; composites
+  the UI over the game frame inside an RT64 render hook). `RT64::Render*`→`plume::Render*`.
+- `src/ui/bar_ui.{cpp,h}` — bootstrap: RmlUi init via the RmlUi SDL backend (`SystemInterface_SDL` +
+  `RmlSDL` input), Freetype fonts, RT64 render-hook init/draw/deinit, queued SDL input, and a menu
+  controller driving `GraphicsConfig` (incl. the high-FPS refresh-rate / FPS target) + the librecomp
+  mod loader.
+- `src/ui/assets/{launcher,config}.rml` + LatoLatin font; `src/ui/shaders/Interface{VS,PS}.hlsl`.
+- `main.cpp`: launcher-first flow — hooks registered in `create_window`; SDL events fed to the menu
+  while it owns input; a coordinator thread waits for "Play" then `select_rom`/`start_game`, with a
+  safe auto-start fallback if the UI fails to init.
+
+> ⚠️ NOT build-verified in-session (no toolchain/ROM here) — expect compile iteration. **Two steps to
+> build it:** (1) add the Freetype submodule:
+> `git submodule add https://github.com/ubawurinna/freetype-windows-binaries.git lib/freetype-windows-binaries`
+> then (2) reconfigure with `-DBEETLE_ENABLE_UI=ON`. The most likely areas to need fixes: the plume
+> RHI call signatures in `ui_renderer.cpp`, the DXC shader-compile flags, and the Freetype CMake hookup.
 
 ## How to build + run + debug (Windows, headless)
 ```bash
