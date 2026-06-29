@@ -8,12 +8,15 @@ _Last updated: 2026-06-28_
   initializes, the SDL window opens, the ROM is recognized, libultra inits, the **uv module
   overlay bridge** registers modules as they load (57+ modules, `func_map` resolves with zero
   "Failed to find function" errors), and recompiled module code executes.
-- ⛔ **Blocked on module *data*-section relocation** — a module data reference
-  (`RELOC_LO16(374, …)` inside `func_uvtexture_rom_*`, funcs_26.c) reads a garbage address. The
-  bridge sets `section_addresses[]` for each module's CODE section (via `load_overlay_by_id`) but
-  not its `.bss` section, and this specific data ref needs runtime inspection. This is the deep
-  core of the "~130 relocatable modules" challenge (roadmap #1). See
-  [Next step](#next-step-module-data-section-relocation).
+- ✅ **Runs without crashing** — 78 modules register correctly (zero "Failed to find function"),
+  audio + VI work, RT64 presents at 60 Hz. The earlier crashes were a **wrong nameTag→overlay_id
+  table** (the `*_rom`/`*ld_rom` pairs were swapped); fixed from the authoritative
+  `lib/bar-decomp/tools/convPartialModule.py`. (The "recomp.ld exports-layout" theory was WRONG —
+  an artifact of comparing two swapped modules; recomp.ld is fine.)
+- ⛔ **Black screen** — the game runs audio and presents a *real but undrawn* framebuffer
+  (`0x80100280`), but its `OSSched` gfx client (`uvgfxmgr`) never submits an `M_GFXTASK`
+  (`send_dl` count = 0). The scheduler dispatch works (audio dispatches), so the gfx client isn't
+  producing display lists — a game-state/logic gate. See [Next step](#next-step-black-screen-no-gfx-tasks).
 
 ## What works
 The full static-recompilation pipeline compiles end to end:
@@ -124,36 +127,41 @@ ovlStartPtr)` and runs `uvDoModuleRelocs_orig`. Result: 57+ modules register, `f
 recompiled module code runs. (Also: VI null-mode race fixed via `g_bar_vi_ticked` gate; audio RSP
 task no-op-stubbed in `get_rsp_microcode`; AI-length hardware read stubbed in `hw_stubs.cpp`.)
 
-## Next step: module data-section relocation
-**Current crash:** `func_uvtexture_rom_00400164` (funcs_26.c:2940) reads a garbage address. The
-recomp.elf lays each module out as **two loadable sections** (from `readelf -S` via WSL):
-```
-[374] .uvtexture_rom      PROGBITS  88100000  ... WAX   <- text+rodata+data (the overlay section)
-[375] .rel.uvtexture_rom  REL                          <- reloc table (not loaded)
-[376] .uvtexture_rom.bss  NOBITS    88100d00  ... WA    <- bss
-```
-`init_overlays` only sets `section_addresses[index]` for **code** sections (overlays.cpp:288);
-`.bss` sections stay 0 (calloc'd), so `RELOC_*( .bss_index , … )` computes from base 0 → garbage.
-The bridge currently sets only the module's main (code) section via `load_overlay_by_id`.
+## Next step: black screen (no gfx tasks)
+Instrumented `send_dl`/`update_screen` in `rt64_render_context.cpp`. Findings from a live run:
+- `update_screen` runs at 60 Hz; VI origin moves from the dummy (`0x00700280`) to a **real game
+  framebuffer** (`0x00100280`, width 320) — so the game set up video and is presenting.
+- `send_dl` count = **0** — the game never submits an `M_GFXTASK`, so the presented framebuffer is
+  never drawn into → black. (The clean log shows no errors/stubs hit on the render path.)
+
+**Architecture (from the decomp):** BAR drives graphics through libultra's `OSSched` (`src/sched.c`).
+On each VI retrace the scheduler wakes its **clients**; `uvgfxmgr` (gfx) and `uvaudiomgr` (audio)
+build their tasks and `osSendMesg` them to the scheduler `cmdQ`, which dispatches via
+`osSpTaskStartGo`. **Audio dispatches (M_AUDTASK ran); gfx does not** — so the scheduler dispatch
+itself works, but the **gfx client (`uvgfxmgr`) isn't producing a display list**. Likely a
+game-state gate (nothing queued to render yet), not a crash/stub.
 
 **To do:**
-1. Also set `section_addresses[]` for each loaded module's `.bss` section (index = main + 2),
-   to `ovlStartPtr + textSize + rodataSize + dataSize` (sizes from `ModuleCommInfo`). Needs a
-   librecomp setter for `section_addresses[non-code-index]` (currently only `load_overlay` sets it,
-   and only for code sections) — add `recomp::overlays::set_section_address(idx, addr)` or extend
-   the section table to include `.bss` entries.
-2. The current crash targets section **374 (the main section, not bss)** — so also verify at runtime
-   that `load_overlay_by_id` actually set `section_addresses[374]` to `ovlStartPtr` for uvtexture,
-   and check the base global at `0x8002D9B4` (the other operand). Inspect with lldb:
-   `b -f funcs_26.c -l 2940`, then print `section_addresses[374]`, `ctx->r14`, `ctx->r15`.
-3. Proper long-term fix (roadmap #1, shared with BeetleDecomp): make the recomp.ld emit relocation
-   metadata such that the overlay system relocates the whole module (incl. bss) from one id.
+1. Find why `uvgfxmgr`'s client callback (`src/modules/uvgfxmgr_rom.c`, the one registered at
+   `_uvScAddClient` ~line 300; it builds `task.t.type = M_GFXTASK` ~431 and sends it ~455) doesn't
+   send a gfx task. Is its callback even called each retrace? Does it early-out on a game-state flag?
+2. Reliable thread inspection is the blocker: lldb *attach* stalls loading the 22 MB PDB in batch
+   mode. Options: build a small Debug config, use Visual Studio's debugger to pause + inspect the
+   scheduler/gfx-client thread, or add targeted prints in the scheduler retrace path.
+3. Confirm the scheduler is actually receiving VI **retrace** messages on its `interruptQ`/client
+   queues (it should — events.cpp:236 sends them; audio working implies yes).
 
-## Remaining roadmap (after data relocation)
+## Remaining roadmap (after the black screen)
 - **Input** (SDL → N64 controller) — then the title screen is actually playable.
 - **RSP audio** (`RSPRecomp` → real `aspMain`), wired into `get_rsp_microcode`.
-- Replace the 9 OS-func stubs with correct behavior (threading especially).
+- Replace the 9 OS-func stubs with correct behavior if any are reached.
 - Per-game F3DEX2 rendering quirks once frames are being submitted.
+
+## Tooling note: N64Recomp builds on Windows now
+`lib/N64Recomp` (already at `ffb39cd`) builds with clang-cl + CLion's cmake/ninja →
+`lib/N64Recomp/build-win/N64Recomp.exe` (pass `-DCMAKE_RC_COMPILER` to a Win SDK `rc.exe`). WSL is
+unusable for it (gcc 9.4, no cmake, sudo needs a password). Regen isn't needed for threading —
+N64Recomp's built-in symbol lists already defer libultra OS funcs to ultramodern.
 
 ## Key references
 - Git history: `f92cdb0` (fixup script), `890a87f` (build green), `cfec695` (overlays wired).
