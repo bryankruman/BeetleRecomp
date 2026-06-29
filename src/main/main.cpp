@@ -161,10 +161,30 @@ static void queue_samples(int16_t* /*samples*/, size_t /*count*/) {}
 static size_t get_frames_remaining() { return 0; }
 static void set_frequency(uint32_t /*freq*/) {}
 
-// Input (input::callbacks_t). TODO(BAR): SDL controller -> N64 buttons/stick; Controller Pak info.
+// Input (input::callbacks_t). Minimal: report controller 1 as connected with a neutral state so the
+// game gets past its "no controller" check (uvShowNoController). TODO(BAR): real SDL controller /
+// keyboard mapping -> N64 buttons + analog stick.
 static void input_poll() {}
-static bool input_get(int /*controller_num*/, uint16_t* /*buttons*/, float* /*x*/, float* /*y*/) { return false; }
+
+static bool input_get(int controller_num, uint16_t* buttons, float* x, float* y) {
+    if (controller_num != 0) {
+        return false;   // only port 1 is "connected" for now
+    }
+    if (buttons != nullptr) *buttons = 0;   // nothing pressed
+    if (x != nullptr)       *x = 0.0f;      // stick centered
+    if (y != nullptr)       *y = 0.0f;
+    return true;
+}
+
 static void input_set_rumble(int /*controller_num*/, bool /*rumble*/) {}
+
+static ultramodern::input::connected_device_info_t input_get_device_info(int controller_num) {
+    using namespace ultramodern::input;
+    if (controller_num == 0) {
+        return connected_device_info_t{ Device::Controller, Pak::None };
+    }
+    return connected_device_info_t{ Device::None, Pak::None };
+}
 
 // Error handling (error_handling::callbacks_t).
 static void message_box(const char* msg) { std::fprintf(stderr, "[BeetleRecomp] %s\n", msg); }
@@ -242,7 +262,7 @@ int main(int argc, char** argv) {
     input_callbacks.poll_input = input_poll;
     input_callbacks.get_input  = input_get;
     input_callbacks.set_rumble = input_set_rumble;
-    // TODO(BAR): input_callbacks.get_connected_device_info (report Controller Pak / rumble pak).
+    input_callbacks.get_connected_device_info = input_get_device_info;
 
     ultramodern::error_handling::callbacks_t error_handling_callbacks{};
     error_handling_callbacks.message_box = message_box;
