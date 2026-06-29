@@ -108,16 +108,21 @@ target_sources(RecompiledFuncs PRIVATE ${FUNC_C_SOURCES} ${FUNC_CXX_SOURCES})
 # ---------------------------------------------------------------------------
 add_executable(BeetleRecomp
     ${CMAKE_SOURCE_DIR}/src/main/main.cpp
-    ${CMAKE_SOURCE_DIR}/src/main/os_unimpl_stubs.cpp   # no-op stubs for ignored OS funcs BAR calls
+    ${CMAKE_SOURCE_DIR}/src/main/os_unimpl_stubs.cpp     # no-op stubs for ignored OS funcs BAR calls
+    ${CMAKE_SOURCE_DIR}/src/main/register_overlays.cpp   # wires recomp_overlays.inl into librecomp
+    ${CMAKE_SOURCE_DIR}/src/main/rt64_render_context.cpp # RT64-backed RendererContext subclass
     # TODO(BAR): add as authored (mirroring Zelda's src/main + src/game):
-    #   src/main/rt64_render_context.cpp   (RT64 RendererContext subclass)
-    #   src/main/register_overlays.cpp / register_patches.cpp
+    #   src/main/register_patches.cpp
     #   src/game/input.cpp / config.cpp
     #   rsp/aspMain.cpp                    (RSPRecomp output)
 )
 target_include_directories(BeetleRecomp PRIVATE
     ${RECOMP_INCLUDES}
+    ${CMAKE_SOURCE_DIR}/RecompiledFuncs            # recomp_overlays.inl + funcs.h
     ${CMAKE_SOURCE_DIR}/lib/rt64/src
+    # rt64_render_context.cpp includes RT64's internal headers, which pull in vendored contrib
+    # headers (hlslpp, plume, ...). Inherit RT64's full (private) include set so they resolve.
+    $<TARGET_PROPERTY:rt64,INCLUDE_DIRECTORIES>
     ${CMAKE_CURRENT_BINARY_DIR}
 )
 
@@ -174,6 +179,20 @@ target_link_libraries(BeetleRecomp PRIVATE
 )
 if (BEETLE_ENABLE_UI)
     target_link_libraries(BeetleRecomp PRIVATE RmlUi::Core RmlUi::Debugger lunasvg)
+endif()
+
+# ---- Bring-up crash diagnosis: embed debug info (/Z7) in the boot-path targets + emit a PDB.
+# RT64 is deliberately left at Release (no option change -> not rebuilt) since the early-boot
+# crash path is in librecomp / ultramodern / the recompiled code, not the renderer. Flip
+# BEETLE_DEBUGINFO OFF once bring-up settles. ----
+option(BEETLE_DEBUGINFO "Embed debug info in the boot-path targets for crash diagnosis" ON)
+if (BEETLE_DEBUGINFO AND MSVC)
+    foreach(dbgtgt RecompiledFuncs librecomp ultramodern BeetleRecomp)
+        if (TARGET ${dbgtgt})
+            target_compile_options(${dbgtgt} PRIVATE /Z7)
+        endif()
+    endforeach()
+    target_link_options(BeetleRecomp PRIVATE /DEBUG)
 endif()
 
 set_property(TARGET BeetleRecomp PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
