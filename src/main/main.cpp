@@ -119,6 +119,7 @@ extern std::atomic<bool> g_bar_vi_ticked;        // renderer presented a frame (
 
 // SDL window / gfx (gfx_callbacks_t). RT64 attaches to this window's native HWND.
 static SDL_Window* g_window = nullptr;
+static HWND g_bar_hwnd = nullptr;   // native window handle (for keyboard focus gating)
 
 static ultramodern::gfx_callbacks_t::gfx_data_t create_gfx() {
     SDL_SetMainReady();
@@ -144,6 +145,7 @@ static ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callba
     }
     // create_window runs on the same (main) thread that pumps update_gfx below, so the
     // window's owning thread id is this thread.
+    g_bar_hwnd = wm_info.info.win.window;
     return ultramodern::renderer::WindowHandle{ wm_info.info.win.window, GetCurrentThreadId() };
 }
 
@@ -168,7 +170,7 @@ static void input_poll() {}
 
 static bool input_get(int controller_num, uint16_t* buttons, float* x, float* y) {
     if (controller_num != 0) {
-        return false;   // only port 1 is "connected" for now
+        return false;   // only port 1 is "connected"
     }
     if (buttons != nullptr) *buttons = 0;   // nothing pressed
     if (x != nullptr)       *x = 0.0f;      // stick centered
@@ -184,6 +186,41 @@ static ultramodern::input::connected_device_info_t input_get_device_info(int con
         return connected_device_info_t{ Device::Controller, Pak::None };
     }
     return connected_device_info_t{ Device::None, Pak::None };
+}
+
+// Keyboard -> N64 controller (port 0). BAR reads the pad via the raw SI/PIF path, so
+// __osSiRawStartDma_recomp (os_unimpl_stubs.cpp) calls this to fill the read buffer. Uses Win32 async
+// key state, gated to when the game window is focused. Bindings (port 0):
+//   Analog stick: Arrows   A: X   B: Z   Start: Enter   Z-trigger: Shift   L: Q   R: W   C-buttons: I/J/K/L   D-pad: T/F/G/H
+extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y) {
+    if (stick_x) *stick_x = 0;
+    if (stick_y) *stick_y = 0;
+    if (port != 0) return 0;
+    if (g_bar_hwnd != nullptr && GetForegroundWindow() != g_bar_hwnd) return 0; // only when focused
+    auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    uint16_t b = 0;
+    if (down('X'))       b |= 0x8000; // CONT_A
+    if (down('Z'))       b |= 0x4000; // CONT_B
+    if (down(VK_SHIFT))  b |= 0x2000; // CONT_G (Z trigger)
+    if (down(VK_RETURN)) b |= 0x1000; // CONT_START
+    if (down('T'))       b |= 0x0800; // D-pad up
+    if (down('G'))       b |= 0x0400; // D-pad down
+    if (down('F'))       b |= 0x0200; // D-pad left
+    if (down('H'))       b |= 0x0100; // D-pad right
+    if (down('Q'))       b |= 0x0020; // CONT_L
+    if (down('W'))       b |= 0x0010; // CONT_R
+    if (down('I'))       b |= 0x0008; // C-up
+    if (down('K'))       b |= 0x0004; // C-down
+    if (down('J'))       b |= 0x0002; // C-left
+    if (down('L'))       b |= 0x0001; // C-right
+    int sx = 0, sy = 0;
+    if (down(VK_LEFT))  sx -= 80;
+    if (down(VK_RIGHT)) sx += 80;
+    if (down(VK_UP))    sy += 80;   // N64 stick: up is positive
+    if (down(VK_DOWN))  sy -= 80;
+    if (stick_x) *stick_x = (int8_t)sx;
+    if (stick_y) *stick_y = (int8_t)sy;
+    return b;
 }
 
 // Error handling (error_handling::callbacks_t).
