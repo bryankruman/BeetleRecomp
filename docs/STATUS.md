@@ -13,10 +13,11 @@ _Last updated: 2026-06-28_
   table** (the `*_rom`/`*ld_rom` pairs were swapped); fixed from the authoritative
   `lib/bar-decomp/tools/convPartialModule.py`. (The "recomp.ld exports-layout" theory was WRONG —
   an artifact of comparing two swapped modules; recomp.ld is fine.)
-- ⛔ **Black screen** — the game runs audio and presents a *real but undrawn* framebuffer
-  (`0x80100280`), but its `OSSched` gfx client (`uvgfxmgr`) never submits an `M_GFXTASK`
-  (`send_dl` count = 0). The scheduler dispatch works (audio dispatches), so the gfx client isn't
-  producing display lists — a game-state/logic gate. See [Next step](#next-step-black-screen-no-gfx-tasks).
+- ✅ **Minimal controller wired** — reports port 1 connected, so the game passes its controller
+  check (no longer drops into `uvShowNoController`). Real key/stick mapping still TODO.
+- ⛔ **Black screen** — `func_80000450` (game main) is running its main loop but the per-frame render
+  submits no `M_GFXTASK` (`send_dl` = 0), so the (real) framebuffer is never drawn. Not a
+  crash/stub. See [Next step](#next-step-black-screen-game-main-runs-but-submits-no-gfx).
 
 ## What works
 The full static-recompilation pipeline compiles end to end:
@@ -127,29 +128,33 @@ ovlStartPtr)` and runs `uvDoModuleRelocs_orig`. Result: 57+ modules register, `f
 recompiled module code runs. (Also: VI null-mode race fixed via `g_bar_vi_ticked` gate; audio RSP
 task no-op-stubbed in `get_rsp_microcode`; AI-length hardware read stubbed in `hw_stubs.cpp`.)
 
-## Next step: black screen (no gfx tasks)
-Instrumented `send_dl`/`update_screen` in `rt64_render_context.cpp`. Findings from a live run:
-- `update_screen` runs at 60 Hz; VI origin moves from the dummy (`0x00700280`) to a **real game
-  framebuffer** (`0x00100280`, width 320) — so the game set up video and is presenting.
-- `send_dl` count = **0** — the game never submits an `M_GFXTASK`, so the presented framebuffer is
-  never drawn into → black. (The clean log shows no errors/stubs hit on the render path.)
+## Next step: black screen (game main runs but submits no gfx)
+Narrowed via wrap-instrumentation (`fix-recompiled.sh`-style rename → native wrapper). Findings:
+- `update_screen` runs at 60 Hz; VI origin moves dummy (`0x00700280`) → real fb (`0x00100280`).
+- `send_dl` count = **0** — no `M_GFXTASK` ever submitted → the presented fb is never drawn → black.
+- **`uvShowNoController` is NOT entered** — the game passed its controller check
+  (`game_init.c:117 gUvContExports->unk8(0)`), thanks to the wired minimal controller.
+- **`func_80000450` (the game main, `game_init.c:23`) entered and never returned** — so it's running
+  its main loop `while (gUvContExports->unk4() != 0) { gGameExports->unk4(); … }` (game_init.c:133)
+  but the per-frame `gGameExports->unk4()` produces no display list. Game is alive (audio + VI run).
 
-**Architecture (from the decomp):** BAR drives graphics through libultra's `OSSched` (`src/sched.c`).
-On each VI retrace the scheduler wakes its **clients**; `uvgfxmgr` (gfx) and `uvaudiomgr` (audio)
-build their tasks and `osSendMesg` them to the scheduler `cmdQ`, which dispatches via
-`osSpTaskStartGo`. **Audio dispatches (M_AUDTASK ran); gfx does not** — so the scheduler dispatch
-itself works, but the **gfx client (`uvgfxmgr`) isn't producing a display list**. Likely a
-game-state gate (nothing queued to render yet), not a crash/stub.
+So the stall is inside the **game module's per-frame render** (`gGameExports->unk4`) or the loop
+condition (`gUvContExports->unk4`) — not a crash/stub/missing-func, and not the no-controller path.
 
-**To do:**
-1. Find why `uvgfxmgr`'s client callback (`src/modules/uvgfxmgr_rom.c`, the one registered at
-   `_uvScAddClient` ~line 300; it builds `task.t.type = M_GFXTASK` ~431 and sends it ~455) doesn't
-   send a gfx task. Is its callback even called each retrace? Does it early-out on a game-state flag?
-2. Reliable thread inspection is the blocker: lldb *attach* stalls loading the 22 MB PDB in batch
-   mode. Options: build a small Debug config, use Visual Studio's debugger to pause + inspect the
-   scheduler/gfx-client thread, or add targeted prints in the scheduler retrace path.
-3. Confirm the scheduler is actually receiving VI **retrace** messages on its `interruptQ`/client
-   queues (it should — events.cpp:236 sends them; audio working implies yes).
+**Blocker:** no headless debugger works here — lldb *attach* hangs after the attach breakpoint;
+`comsvcs.dll MiniDump full` produces a dump lldb rejects ("data is invalid") and won't make a
+standard (non-full) dump; no cdb/procdump installed. And `gGameExports->unk4`/`gUvContExports->unk4`
+are reached via exports structs filled in **undecompiled asm entrypoints**
+(`__entrypoint_func_{game,uvcont}_rom_400000.s`), so finding their recompiled `func_*` names to wrap
+is slow.
+
+**To do (pick one):**
+1. **Get one thread stack** — attach **Visual Studio** to `BeetleRecomp.exe`, Break All, inspect the
+   `Game …`/App thread (the one in `func_80000450`/`uvSetGameState`/an `osRecvMesg`). That pinpoints
+   the stall in minutes. (Native Windows debugger; no PDB hang.)
+2. **Keep instrumenting** — find the recompiled `func_game_*`/`func_uvcont_rom_*` that the exports
+   `unk4` fields point to (read the recompiled module entrypoints in `RecompiledFuncs/`), wrap them
+   to see whether the loop iterates and whether the frame fn runs/bails.
 
 ## Remaining roadmap (after the black screen)
 - **Input** (SDL → N64 controller) — then the title screen is actually playable.
