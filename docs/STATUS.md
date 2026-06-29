@@ -4,13 +4,16 @@ _Last updated: 2026-06-28_
 
 ## TL;DR
 - ✅ **Builds + links** → `build-cmake/BeetleRecomp.exe` (native Windows, clang-cl).
-- ✅ **Launches + boots into game code** (2026-06-28 night) — RT64 (D3D12) initializes, the SDL
-  window opens, the ROM is recognized, and the recompiled boot runs libultra init → the `App`
-  thread → `func_80000450` (main) → `uvSetGameState` → BAR's module loader.
-- ⛔ **Blocked on the uv module overlay bridge** — `uvLoadModuleCode` copies a relocatable module
-  into a heap buffer and jumps to its entry; librecomp's `func_map` has no entry there, so
-  `get_function(0x80042300)` aborts. This is the documented "~130 relocatable modules" challenge.
-- Next: **bridge BAR's module loader → librecomp overlay registration** (see [Next step](#next-step-the-uv-module-overlay-bridge)).
+- ✅ **Boots deep into the game** (2026-06-28 night) — RT64 (D3D12, confirmed on an RTX 3080)
+  initializes, the SDL window opens, the ROM is recognized, libultra inits, the **uv module
+  overlay bridge** registers modules as they load (57+ modules, `func_map` resolves with zero
+  "Failed to find function" errors), and recompiled module code executes.
+- ⛔ **Blocked on module *data*-section relocation** — a module data reference
+  (`RELOC_LO16(374, …)` inside `func_uvtexture_rom_*`, funcs_26.c) reads a garbage address. The
+  bridge sets `section_addresses[]` for each module's CODE section (via `load_overlay_by_id`) but
+  not its `.bss` section, and this specific data ref needs runtime inspection. This is the deep
+  core of the "~130 relocatable modules" challenge (roadmap #1). See
+  [Next step](#next-step-module-data-section-relocation).
 
 ## What works
 The full static-recompilation pipeline compiles end to end:
@@ -111,40 +114,42 @@ cd build-cmake && ./BeetleRecomp.exe >run.log 2>&1   # ROM path: argv[1], else h
 "/c/Program Files/LLVM/bin/lldb.exe" --batch -o run -o bt -o quit -- ./BeetleRecomp.exe
 ```
 
-## Next step: the uv module overlay bridge
-The exact failure (symbolized backtrace):
-```
-get_function(0x80042300)  -> not in func_map -> abort        (overlays.cpp:367)
-  uvLoadModuleCode  (decomp src/module.c:115)
-  uvAllocFile / uvLoadFile / _uvAllocModule / uvLoadModule    (BAR's "uv" module system)
-  uvSetGameState -> func_80000450 (main) -> Thread_App
-```
-`uvLoadModuleCode` (decomp `src/module.c`) does:
-```c
-headeredStartPtr = _uvMemAllocAlign16(exportsSize + blockSize + bssSize);  // heap buffer
-ovlStartPtr      = headeredStartPtr + exportsSize;
-_uvMediaCopy(ovlStartPtr, codeBlock, blockSize);   // copy module CODE into RAM
-uvDoModuleRelocs(ovlStartPtr, &info);              // relocate the raw bytes
-entryPointFunction = ovlStartPtr + info.entryPointOffset;
-entryPointFunction(headeredStartPtr);              // <- the LOOKUP_FUNC that fails
-```
-So BAR loads a relocatable module into a heap buffer and jumps in. The recompiled module
-functions live in `func_map` keyed by their recomp-ELF VRAM (`0x80800000+`), not the heap
-address — nothing registers them at `ovlStartPtr`.
+## ✅ DONE: the uv module overlay CODE bridge
+`src/main/overlay_bridge.cpp` owns the `uvDoModuleRelocs` symbol (the generated definition is
+renamed to `uvDoModuleRelocs_orig` by `fix-recompiled.sh`). On each module load it reads the
+4-char `nameTag` from `ModuleCommInfo` (a1+0x1C), maps it to the overlay id via a 133-entry
+`nameTag -> overlay_id` table (overlays.us.txt order; tags from the decomp's
+`tools/daisybox/src/bar_module_files.c`), then `unload_overlay_by_id` + `load_overlay_by_id(id,
+ovlStartPtr)` and runs `uvDoModuleRelocs_orig`. Result: 57+ modules register, `func_map` resolves,
+recompiled module code runs. (Also: VI null-mode race fixed via `g_bar_vi_ticked` gate; audio RSP
+task no-op-stubbed in `get_rsp_microcode`; AI-length hardware read stubbed in `hw_stubs.cpp`.)
 
-**The bridge:** when a module is loaded, register its recompiled section at `ovlStartPtr` via
-`recomp::overlays::load_overlay_by_id(overlay_id, ovlStartPtr)` (or `load_overlays(rom, ram,
-size)`). The work is the *mapping*: BAR module (`tag`/`fileId` in `uvGetModuleFileId`, or the
-CODE block's ROM offset) → recomp overlay index / section (`overlay_sections_by_index`,
-`get_vrom_to_section_map`). Mechanism options, cheapest first:
-1. A `RECOMP_HOOK`/`RECOMP_PATCH` on `uvLoadModuleCode` (return) or `uvDoModuleRelocs` that calls
-   the overlay-registration API with the load address — needs the patches MIPS toolchain
-   (`patches.toml`, `clang -target mips`, the commented `PatchesLib` in CMake).
-2. A native override of `uvLoadModuleCode` registered through librecomp.
-   Confirm how the module's ROM/section is identified — compare `info`/`fileId` against the recomp
-   ELF section `rom_addr`s in `recomp_overlays.inl`.
+## Next step: module data-section relocation
+**Current crash:** `func_uvtexture_rom_00400164` (funcs_26.c:2940) reads a garbage address. The
+recomp.elf lays each module out as **two loadable sections** (from `readelf -S` via WSL):
+```
+[374] .uvtexture_rom      PROGBITS  88100000  ... WAX   <- text+rodata+data (the overlay section)
+[375] .rel.uvtexture_rom  REL                          <- reloc table (not loaded)
+[376] .uvtexture_rom.bss  NOBITS    88100d00  ... WA    <- bss
+```
+`init_overlays` only sets `section_addresses[index]` for **code** sections (overlays.cpp:288);
+`.bss` sections stay 0 (calloc'd), so `RELOC_*( .bss_index , … )` computes from base 0 → garbage.
+The bridge currently sets only the module's main (code) section via `load_overlay_by_id`.
 
-## Remaining roadmap (after the bridge)
+**To do:**
+1. Also set `section_addresses[]` for each loaded module's `.bss` section (index = main + 2),
+   to `ovlStartPtr + textSize + rodataSize + dataSize` (sizes from `ModuleCommInfo`). Needs a
+   librecomp setter for `section_addresses[non-code-index]` (currently only `load_overlay` sets it,
+   and only for code sections) — add `recomp::overlays::set_section_address(idx, addr)` or extend
+   the section table to include `.bss` entries.
+2. The current crash targets section **374 (the main section, not bss)** — so also verify at runtime
+   that `load_overlay_by_id` actually set `section_addresses[374]` to `ovlStartPtr` for uvtexture,
+   and check the base global at `0x8002D9B4` (the other operand). Inspect with lldb:
+   `b -f funcs_26.c -l 2940`, then print `section_addresses[374]`, `ctx->r14`, `ctx->r15`.
+3. Proper long-term fix (roadmap #1, shared with BeetleDecomp): make the recomp.ld emit relocation
+   metadata such that the overlay system relocates the whole module (incl. bss) from one id.
+
+## Remaining roadmap (after data relocation)
 - **Input** (SDL → N64 controller) — then the title screen is actually playable.
 - **RSP audio** (`RSPRecomp` → real `aspMain`), wired into `get_rsp_microcode`.
 - Replace the 9 OS-func stubs with correct behavior (threading especially).

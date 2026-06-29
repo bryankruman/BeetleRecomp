@@ -20,6 +20,13 @@
 #include "ultramodern/config.hpp"
 #include "ultramodern/renderer_context.hpp"
 
+// Cross-TU signals consumed by main.cpp's deferred start_game().
+// g_bar_renderer_ready: RT64 finished setup. g_bar_vi_ticked: the renderer has presented at least
+// one frame (update_screen), which means the VI thread has ticked and seeded a dummy OSViMode — so
+// it's safe to start the game without racing the VI thread into a null-mode deref.
+std::atomic<bool> g_bar_renderer_ready{false};
+std::atomic<bool> g_bar_vi_ticked{false};
+
 namespace {
 
 // RT64's Core wants pointers to SP DMEM/IMEM and the RDP/MI registers. Driven in HLE mode through
@@ -226,6 +233,7 @@ void RT64Context::send_dl(const OSTask* task) {
 }
 
 void RT64Context::update_screen() {
+    g_bar_vi_ticked.store(true);   // signals main.cpp that the VI thread has ticked (dummy mode seeded)
     app->updateScreen();
 }
 
@@ -269,11 +277,6 @@ float RT64Context::get_resolution_scale() const {
 }
 
 } // namespace
-
-// Set true once RT64 has finished initializing successfully. main.cpp gates the deferred
-// start_game() on this: the VI thread (started just after this returns) only seeds a dummy
-// OSViMode while the game hasn't started, so the game must not start before the renderer is up.
-std::atomic<bool> g_bar_renderer_ready{false};
 
 // Factory wired into main.cpp's renderer_callbacks.create_render_context.
 std::unique_ptr<ultramodern::renderer::RendererContext>

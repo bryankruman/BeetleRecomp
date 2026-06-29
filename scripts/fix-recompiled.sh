@@ -14,7 +14,7 @@
 set -euo pipefail
 RF="$(cd "$(dirname "$0")/.." && pwd)/RecompiledFuncs"
 [ -d "$RF" ] || { echo "fix-recompiled: $RF not found (run N64Recomp first)"; exit 1; }
-before=$(grep -rhcE '^[[:space:]]*0 = ' "$RF"/*.c 2>/dev/null | awk '{s+=$1} END{print s+0}')
+before=$( { grep -rhcE '^[[:space:]]*0 = ' "$RF"/*.c 2>/dev/null || true; } | awk '{s+=$1} END{print s+0}')
 sed -i -E 's/^([[:space:]]*)0 = /\1(void)/' "$RF"/*.c
 echo "fix-recompiled: rewrote $before \$zero-load line(s) to (void)MEM_*(...)"
 
@@ -24,3 +24,23 @@ if [ -f "$inl" ]; then
     sed -i 's/\.type =[[:space:]]*}/.type = R_MIPS_NONE }/g' "$inl"
     echo "fix-recompiled: rewrote $reloc_before empty reloc .type field(s) to R_MIPS_NONE"
 fi
+
+# Overlay bridge: rename the generated uvDoModuleRelocs DEFINITION so src/main/overlay_bridge.cpp
+# can own the `uvDoModuleRelocs` symbol. Its wrapper registers the just-loaded relocatable module
+# with librecomp (load_overlay_by_id) so the module's recompiled functions resolve, then calls
+# uvDoModuleRelocs_orig. Only the RECOMP_FUNC definition is renamed; all call sites bind to the
+# wrapper. Idempotent (no-op once renamed).
+if grep -rlq 'RECOMP_FUNC void uvDoModuleRelocs(' "$RF"/*.c 2>/dev/null; then
+    sed -i 's/RECOMP_FUNC void uvDoModuleRelocs(/RECOMP_FUNC void uvDoModuleRelocs_orig(/' "$RF"/*.c
+    echo "fix-recompiled: renamed uvDoModuleRelocs definition -> uvDoModuleRelocs_orig (overlay bridge)"
+fi
+
+# Hardware-register stubs: libultra functions recompiled raw that poke RCP registers (AI/PI/SP),
+# which aren't memory-mapped in the recomp. Rename each generated definition so src/main/hw_stubs.cpp
+# can own the symbol with a safe stub. Add a name here AND a stub in hw_stubs.cpp together.
+for fn in func_8000E460; do
+    if grep -rlq "RECOMP_FUNC void ${fn}(" "$RF"/*.c 2>/dev/null; then
+        sed -i "s/RECOMP_FUNC void ${fn}(/RECOMP_FUNC void ${fn}__hwstub_orig(/" "$RF"/*.c
+        echo "fix-recompiled: stub-renamed ${fn} (raw hardware-register access)"
+    fi
+done

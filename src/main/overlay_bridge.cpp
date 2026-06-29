@@ -1,0 +1,97 @@
+// overlay_bridge.cpp — bridge BAR's "uv" module loader to librecomp overlay registration.
+//
+// BAR loads each relocatable module into a heap buffer and jumps to its entry point
+// (decomp src/module.c: uvLoadModuleCode -> uvDoModuleRelocs -> entryPointFunction(...)). In a
+// static recomp the module's recompiled functions live in func_map keyed by their recomp-ELF VRAM
+// (0x80800000 + id*0x100000), NOT the heap address — so the entry-point LOOKUP_FUNC failed with
+// "Failed to find function at 0x...".
+//
+// Fix: intercept uvDoModuleRelocs (called with a0 = ovlStartPtr, a1 = ModuleCommInfo*, right before
+// the entry jump) and register the module's section at ovlStartPtr via load_overlay_by_id() before
+// running the original relocation. scripts/fix-recompiled.sh renames the generated definition to
+// uvDoModuleRelocs_orig so this wrapper owns the `uvDoModuleRelocs` symbol that all callers bind to.
+//
+// The module is identified by its 4-char nameTag (ModuleCommInfo.nameTag, offset 0x1C). The
+// nameTag -> overlay_id table below is in overlays.us.txt order (overlay_id 0 = .ai ... 132 =
+// .weapon); tags come from the decomp's tools/daisybox/src/bar_module_files.c. overlay_id indexes
+// recomp's overlay_sections_by_index[] (see register_overlays.cpp / recomp_overlays.inl).
+#include <cstdio>
+#include <cstdint>
+
+#include "recomp.h"   // recomp_context, gpr, MEM_W
+
+// Generated module relocation routine, renamed by scripts/fix-recompiled.sh.
+extern "C" void uvDoModuleRelocs_orig(uint8_t* rdram, recomp_context* ctx);
+
+// librecomp overlay registration (extern "C" in librecomp/src/overlays.cpp; not in the public header).
+extern "C" void load_overlay_by_id(uint32_t id, uint32_t ram_addr);
+extern "C" void unload_overlay_by_id(uint32_t id);
+
+namespace {
+
+constexpr uint32_t tag4(const char (&s)[5]) {
+    return (uint32_t(uint8_t(s[0])) << 24) | (uint32_t(uint8_t(s[1])) << 16) |
+           (uint32_t(uint8_t(s[2])) << 8)  |  uint32_t(uint8_t(s[3]));
+}
+
+// overlay_id -> module nameTag, in overlays.us.txt order. 133 entries.
+constexpr uint32_t k_overlay_tag[] = {
+    tag4("aimd"), tag4("aied"), tag4("airc"), tag4("batl"), tag4("bubl"), tag4("camm"),
+    tag4("cara"), tag4("caud"), tag4("cbar"), tag4("demo"), tag4("dled"), tag4("envm"),
+    tag4("esnd"), tag4("expl"), tag4("filr"), tag4("filu"), tag4("frol"), tag4("flag"),
+    tag4("game"), tag4("ggui"), tag4("glar"), tag4("intr"), tag4("lttr"), tag4("lev1"),
+    tag4("lght"), tag4("logo"), tag4("medt"), tag4("menu"), tag4("misc"), tag4("motn"),
+    tag4("mp01"), tag4("mp02"), tag4("mp03"), tag4("mp04"), tag4("mp05"), tag4("mp06"),
+    tag4("mp07"), tag4("mp08"), tag4("mp09"), tag4("paus"), tag4("piec"), tag4("plyr"),
+    tag4("pwup"), tag4("prof"), tag4("race"), tag4("rain"), tag4("rply"), tag4("resu"),
+    tag4("ripl"), tag4("rumb"), tag4("scen"), tag4("scrn"), tag4("slct"), tag4("shad"),
+    tag4("skid"), tag4("smak"), tag4("sndm"), tag4("spar"), tag4("spla"), tag4("spry"),
+    tag4("tdta"), tag4("tedt"), tag4("tk01"), tag4("tk02"), tag4("tk03"), tag4("tk04"),
+    tag4("tk05"), tag4("tk06"), tag4("tk07"), tag4("trig"), tag4("txtv"), tag4("ufov"),
+    tag4("ufom"), tag4("AMGR"), tag4("BILL"), tag4("UVBT"), tag4("CBCK"), tag4("CHAN"),
+    tag4("MIDI"), tag4("COLR"), tag4("UVCT"), tag4("CONT"), tag4("UDBG"), tag4("DGEO"),
+    tag4("DOBJ"), tag4("UVDS"), tag4("udyn"), tag4("AEAR"), tag4("EMIT"), tag4("UVEN"),
+    tag4("UENV"), tag4("FMTX"), tag4("UVFT"), tag4("FONT"), tag4("FVEC"), tag4("FXFX"),
+    tag4("GEOM"), tag4("GMGR"), tag4("STAT"), tag4("grph"), tag4("ugui"), tag4("IMTX"),
+    tag4("ISCT"), tag4("isct"), tag4("UVAN"), tag4("JANM"), tag4("ULED"), tag4("LGHT"),
+    tag4("MATH"), tag4("UVMD"), tag4("MODL"), tag4("UVPX"), tag4("UPFX"), tag4("QUAT"),
+    tag4("QERY"), tag4("SORT"), tag4("SPRT"), tag4("STRG"), tag4("TERR"), tag4("TANM"),
+    tag4("UVTR"), tag4("UVTX"), tag4("TEXT"), tag4("UVTP"), tag4("UVTT"), tag4("TSEQ"),
+    tag4("UVTS"), tag4("UVRW"), tag4("VATR"), tag4("UVVL"), tag4("vict"), tag4("volt"),
+    tag4("wpon"),
+};
+constexpr int k_overlay_count = int(sizeof(k_overlay_tag) / sizeof(k_overlay_tag[0]));
+
+int overlay_id_for_tag(uint32_t tag) {
+    for (int i = 0; i < k_overlay_count; i++) {
+        if (k_overlay_tag[i] == tag) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+} // namespace
+
+extern "C" void uvDoModuleRelocs(uint8_t* rdram, recomp_context* ctx) {
+    const gpr ovl_start = ctx->r4;                       // a0: where the module CODE was loaded
+    const gpr info_addr = ctx->r5;                       // a1: ModuleCommInfo*
+    const uint32_t name_tag = (uint32_t)MEM_W(0x1C, info_addr);   // ModuleCommInfo.nameTag
+
+    const int overlay_id = overlay_id_for_tag(name_tag);
+    if (overlay_id >= 0) {
+        // unload first so a re-load (or address reuse) re-registers cleanly.
+        unload_overlay_by_id((uint32_t)overlay_id);
+        load_overlay_by_id((uint32_t)overlay_id, (uint32_t)ovl_start);
+        std::fprintf(stderr, "[BeetleRecomp] overlay '%c%c%c%c' (id %d) -> 0x%08X\n",
+            (char)(name_tag >> 24), (char)(name_tag >> 16), (char)(name_tag >> 8), (char)name_tag,
+            overlay_id, (uint32_t)ovl_start);
+    } else {
+        std::fprintf(stderr, "[BeetleRecomp] WARN: unknown module nameTag '%c%c%c%c' (0x%08X) @ 0x%08X — not registered\n",
+            (char)(name_tag >> 24), (char)(name_tag >> 16), (char)(name_tag >> 8), (char)name_tag,
+            name_tag, (uint32_t)ovl_start);
+    }
+
+    // Run the game's actual byte relocation (fixes data pointers the recompiled code reads).
+    uvDoModuleRelocs_orig(rdram, ctx);
+}

@@ -4,10 +4,11 @@ A work-in-progress **native PC port of _Beetle Adventure Racing!_ (N64, USA)** b
 **static recompilation** with the [N64Recomp][N64Recomp] toolchain — the same approach
 behind [Zelda 64: Recompiled](https://github.com/Zelda64Recomp/Zelda64Recomp).
 
-> **Status (2026-06-28): boots into game code.** RT64 (D3D12) initializes, the window opens, the
-> ROM is recognized, and the recompiled boot runs through libultra init → the main thread → BAR's
-> module loader. It is **not playable yet** — it stops at the **uv module overlay bridge** (the
-> ~130 relocatable modules), and audio/input are still stubs. See **[docs/STATUS.md](docs/STATUS.md)** to resume.
+> **Status (2026-06-28): boots deep into the game.** RT64 (D3D12) initializes, the window opens,
+> the ROM is recognized, libultra inits, and the **uv module overlay bridge** registers BAR's
+> relocatable modules as they load (57+) so recompiled module code runs. It is **not playable
+> yet** — it stops on module data-section relocation (the deep part of the ~130-module challenge),
+> and audio/input are still stubs. See **[docs/STATUS.md](docs/STATUS.md)** to resume.
 
 > **No game data is included.** You must supply your own legally-dumped USA ROM
 > (SHA-1 `e5ab4d226c08d22f68a2edcc48870203e67454b8`). No ROM, assets, or other copyrighted
