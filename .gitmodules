@@ -6,7 +6,7 @@
 	url = https://github.com/bryankruman/N64ModernRuntime.git
 [submodule "lib/rt64"]
 	path = lib/rt64
-	url = https://github.com/rt64/rt64.git
+	url = https://github.com/bryankruman/rt64.git
 [submodule "lib/RmlUi"]
 	path = lib/RmlUi
 	url = https://github.com/mikke89/RmlUi.git
