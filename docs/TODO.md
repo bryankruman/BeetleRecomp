@@ -14,7 +14,43 @@ previously scattered across [STATUS.md](STATUS.md) (the "Current WIP" + "Still s
 
 ---
 
-## Active priorities — requested 2026-06-30
+## Active priorities — requested 2026-06-30 (round 2)
+
+### R1. 🚧 Restart-game function in the pause menu
+Reboot the running game back to its boot/entrypoint without exiting the app. Needs game-lifecycle
+support (re-run the entrypoint / reset RDRAM, or relaunch the process). **Files:** `src/ui/...pause.rml`,
+`src/ui/bar_ui.cpp`, `src/main/main.cpp`, possibly `lib/N64ModernRuntime/librecomp`.
+
+### R2. 🚧 Pause menu "Main Menu" should close out the game
+Going back to the main menu from the pause menu should END the current game session (not overlay the
+launcher on the running game). **Files:** `src/ui/bar_ui.cpp`, `src/main/main.cpp`.
+
+### R3. 🚧 Pause menu should pause the ENTIRE simulation (emulator-style)
+A true freeze, not the current soft pause. The hard part: the overlay needs the renderer to keep
+presenting, but RT64 stops presenting once the game thread is frozen (verified). Likely approach:
+freeze the game's VI/AI advancement AND have the render context re-submit the last display list each
+frame so RT64 keeps rendering the frozen scene. **Files:** `src/main/rt64_render_context.cpp`,
+`lib/N64ModernRuntime/ultramodern/src/events.cpp`, `src/ui/bar_ui.cpp`.
+
+### R4. ⬜ Settings to enhance render resolution
+Expose internal render-resolution scaling (RT64 `resolutionMultiplier` / the `ds_option` supersample
+field) in the Settings menu — beyond the existing Original/2x/Auto. **Files:** `src/ui/...config.rml`,
+`src/ui/bar_ui.cpp`, `src/main/rt64_render_context.cpp`, `src/game/config.*`.
+
+### R5. ⬜ Setting to disable car LOD
+Disable level-of-detail swapping for cars (always render the high-detail model). Needs to find the
+car LOD selection in the decomp (`lib/bar-decomp` car/model modules) and a host flag (bar_config-style)
+or RDRAM poke / patch. **Files:** `lib/bar-decomp` (find LOD logic), `src/main/bar_config.cpp` or a cheat.
+
+### R6. 🚧 Fix the main-menu transition flash while KEEPING the animation
+The one-frame background flash on menu page-slides was "fixed" by disabling the transition animation;
+restore the animation and fix the flash properly (likely an RT64 framebuffer-as-texture reconstruction
+with no tracked target during the slide). **Files:** find the disable (fix-recompiled.sh rule /
+`lib/bar-decomp`), `lib/rt64`, possibly a `patches/` workaround.
+
+---
+
+## Active priorities — requested 2026-06-30 (round 1)
 
 These seven were raised together as the current focus.
 

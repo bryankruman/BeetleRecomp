@@ -47,6 +47,9 @@
 namespace fs = std::filesystem;
 using ultramodern::renderer::GraphicsConfig;
 
+// Defined in src/main/main.cpp — relaunches the executable (a fresh game) then quits this instance.
+void bar_restart_game();
+
 namespace {
 
 // ----------------------------------------------------------------------------------------
@@ -359,9 +362,9 @@ void wire_cheats_events() {
 void wire_pause_events() {
     if (g_pause_doc == nullptr) return;
     add_listener(g_pause_doc->GetElementById("resume"),   "click", [](Rml::Event&) { close_overlay(); });
+    add_listener(g_pause_doc->GetElementById("restart"),  "click", [](Rml::Event&) { bar_restart_game(); });
     add_listener(g_pause_doc->GetElementById("settings"), "click", [](Rml::Event&) { show_config(); });
     add_listener(g_pause_doc->GetElementById("cheats"),   "click", [](Rml::Event&) { show_cheats(); });
-    add_listener(g_pause_doc->GetElementById("mainmenu"), "click", [](Rml::Event&) { show_launcher(); });
     add_listener(g_pause_doc->GetElementById("quit"),     "click", [](Rml::Event&) { ultramodern::quit(); });
 }
 
@@ -462,6 +465,11 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
             }
         }
     }
+
+    // Emulator-style pause: freeze the simulation while the in-game pause menu (or a sub-page from it)
+    // is up. NOT while the boot-time launcher overlay is shown (pausing during boot wedges the game).
+    // The render context re-renders the last frame while paused so this hook keeps running.
+    ultramodern::set_paused(g_game_started.load() && g_menu_open.load() && g_active_root == MenuRoot::Pause);
 
     if (!g_menu_open.load()) {
         return;   // game is running and the menu is hidden: draw nothing over the frame

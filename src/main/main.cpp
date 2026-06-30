@@ -545,6 +545,27 @@ extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y
 // Error handling (error_handling::callbacks_t).
 static void message_box(const char* msg) { std::fprintf(stderr, "[BeetleRecomp] %s\n", msg); }
 
+// "Restart Game" (pause menu): the recompiled game can't be cleanly re-entered in-process, so restart
+// the whole process — relaunch the exe with the same arguments, then quit this instance. Declared in
+// src/ui/bar_ui.cpp. Non-static so the UI TU can link to it.
+void bar_restart_game() {
+#ifdef _WIN32
+    char exe[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string cmd = GetCommandLineA();   // relaunch with the same args (ROM path, etc.) + same cwd
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessA(exe, cmd.empty() ? nullptr : cmd.data(), nullptr, nullptr, FALSE, 0,
+                       nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } else {
+        std::fprintf(stderr, "[BeetleRecomp] restart: CreateProcess failed (%lu)\n", (unsigned long)GetLastError());
+    }
+#endif
+    ultramodern::quit();   // exit this instance (the fresh one takes over)
+}
+
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
 #ifdef _WIN32

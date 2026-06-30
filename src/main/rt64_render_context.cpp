@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 #ifndef HLSL_CPU
 #  define HLSL_CPU
@@ -151,7 +152,17 @@ public:
     float get_resolution_scale() const override;
 
 private:
+    void render_task(const OSTask* task);   // process one display list (shared by send_dl + paused re-render)
+
     std::unique_ptr<RT64::Application> app;
+
+    // Display lists cached so the in-game pause menu can re-render the frozen scene every frame (the
+    // game produces no new lists while paused, and RT64 only presents when it gets a new frame — so
+    // without this the overlay would freeze too). We keep a whole frame's worth of lists (a frame can
+    // be more than one gfx task). The data they point at lives in RDRAM, which is frozen while paused,
+    // so re-processing them reproduces the last frame.
+    std::vector<OSTask> m_frame_tasks;        // gfx tasks submitted for the in-progress frame
+    std::vector<OSTask> m_last_frame_tasks;   // the last COMPLETE frame's tasks, replayed while paused
 
     // MSAA + resolution are applied only via RT64's *validated* setup path; changing them live is
     // fragile and crashes: RT64's runtime updateMultisampling() skips the device sample-count check
@@ -246,14 +257,30 @@ RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::WindowHandle win
     std::fprintf(stderr, "[BeetleRecomp] RT64 initialized (graphics api %d)\n", static_cast<int>(chosen_api));
 }
 
-void RT64Context::send_dl(const OSTask* task) {
+void RT64Context::render_task(const OSTask* task) {
     app->state->rsp->reset();
     app->interpreter->loadUCodeGBI(task->t.ucode & 0x3FFFFFF, task->t.ucode_data & 0x3FFFFFF, true);
     app->processDisplayLists(app->core.RDRAM, task->t.data_ptr & 0x3FFFFFF, 0, true);
 }
 
+void RT64Context::send_dl(const OSTask* task) {
+    m_frame_tasks.push_back(*task);   // accumulate this frame's lists for the paused re-render path
+    render_task(task);
+}
+
 void RT64Context::update_screen() {
     g_bar_vi_ticked.store(true);   // signals main.cpp that the VI thread has ticked (dummy mode seeded)
+    if (ultramodern::is_paused()) {
+        // Emulator-style pause: the game submitted no new lists this frame (it's frozen), so replay the
+        // last complete frame so RT64 has a fresh image to present — keeps the menu overlay live.
+        for (const OSTask& t : m_last_frame_tasks) {
+            render_task(&t);
+        }
+    } else if (!m_frame_tasks.empty()) {
+        // A frame just completed for this VI scanout — remember its lists for the paused re-render.
+        m_last_frame_tasks.swap(m_frame_tasks);
+        m_frame_tasks.clear();
+    }
     app->updateScreen();
 }
 

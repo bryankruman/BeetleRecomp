@@ -49,9 +49,9 @@
         <h1>Paused</h1>
         <p class="subtitle">Esc or Resume to continue</p>
         <div id="resume" class="btn">Resume</div>
+        <div id="restart" class="btn">Restart Game</div>
         <div id="settings" class="btn">Settings</div>
         <div id="cheats" class="btn">Cheats</div>
-        <div id="mainmenu" class="btn">Main Menu</div>
         <div id="quit" class="btn danger">Quit Game</div>
     </div>
 </body>
