@@ -10,6 +10,9 @@
             height: 100%;
             background-color: #000000d0;
         }
+        /* RmlUi has no HTML UA stylesheet: structural elements default to display:inline. Force
+           block so width/margin (the centered card) and vertical stacking work. */
+        div, h1, h2, p, form { display: block; }
         #config_root {
             width: 560dp;
             margin: auto;
@@ -36,8 +39,10 @@
             border: 1dp #45454d;
             border-radius: 6dp;
             color: #f0f0f0;
+            tab-index: auto;   /* Tab moves between controls */
         }
-        input.range { width: 180dp; }
+        select:focus, input.text:focus { border-color: #f2c14e; }
+        input.range { width: 180dp; tab-index: auto; }
         .row.accent { background-color: #20242c; border: 1dp #2f6db0; border-radius: 8dp; padding: 10dp; }
         .row.accent .label { color: #6fb0ff; }
         #back {
@@ -49,8 +54,11 @@
             background-color: #2a2a30;
             border: 1dp #45454d;
             border-radius: 8dp;
+            tab-index: auto;
+            nav: auto;
         }
         #back:hover { border-color: #f2c14e; }
+        #back:focus { border-color: #f2c14e; background-color: #2f2f37; }
     </style>
 </head>
 <body>
@@ -71,7 +79,7 @@
                 <input id="rr_manual" class="range" type="range" min="30" max="240" step="1" value="144"/>
             </div>
             <div class="row">
-                <span class="label">Resolution</span>
+                <span class="label">Resolution<span class="sub">Applies on restart</span></span>
                 <select id="res_option">
                     <option value="Original">Original (native)</option>
                     <option value="Original2x">2x</option>
@@ -86,7 +94,7 @@
                 </select>
             </div>
             <div class="row">
-                <span class="label">Anti-aliasing</span>
+                <span class="label">Anti-aliasing<span class="sub">Applies on restart</span></span>
                 <select id="msaa_option">
                     <option value="None">None</option>
                     <option value="MSAA2X">MSAA 2x</option>

@@ -273,7 +273,7 @@ public:
         }
 
         copy_command_queue_ = device->createCommandQueue(plume::RenderCommandListType::COPY);
-        copy_command_list_ = copy_command_queue_->createCommandList(plume::RenderCommandListType::COPY);
+        copy_command_list_ = copy_command_queue_->createCommandList();
         copy_command_fence_ = device->createCommandFence();
     }
 

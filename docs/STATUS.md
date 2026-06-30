@@ -220,6 +220,10 @@ intro skip) · `BAR_AUTOPLAY="frames:hexbtn …"` (scripted input: A=8000 B=4000
 `BAR_FORCESTATE="frame:state …"` (force `gGameSettings->gameStateFlag`).
 
 ## Remaining roadmap (after the current polish items)
+
+> The forward-looking checklist now lives in **[TODO.md](TODO.md)** (consolidated todolist,
+> including the 7 priorities raised 2026-06-30). The summary below is kept for context.
+
 - **Polish items 1/3/4** above (legal-screen skip, menu-transition flash, track-map fps).
 - **High-FPS / RT64 interpolation** — enable it (branch `feature/settings-menu-and-high-fps`).
 - **Settings menu** — surface the `BAR_*` flags (intro skip, audio buffer, high-FPS) in an in-game menu.

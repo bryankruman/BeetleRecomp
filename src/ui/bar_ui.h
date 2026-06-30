@@ -44,6 +44,11 @@ bool consume_play_request(std::filesystem::path& out_rom);
 // Tell the UI the game has started so it hides the launcher and releases input to the game.
 void on_game_started();
 
+// Toggle the in-game pause menu during gameplay (bound to Esc / F1 / controller Back in main's SDL
+// loop). Opening it pauses the game simulation; closing resumes. No-op before the game has started.
+// Thread-safe: the actual document show/hide + pause happen on the render thread.
+void toggle_pause_menu();
+
 } // namespace bar_ui
 
 #endif // BAR_UI_H

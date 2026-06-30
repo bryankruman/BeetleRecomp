@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <locale>
@@ -41,6 +42,7 @@
 #include "ui_renderer.h"
 #include "bar_ui.h"
 #include "game/config.hpp"               // bar::config::save_graphics
+#include "main/bar_cheats.h"             // bar_cheats — BAR cheat toggles
 
 namespace fs = std::filesystem;
 using ultramodern::renderer::GraphicsConfig;
@@ -59,13 +61,22 @@ std::unique_ptr<SystemInterface_SDL> g_system_interface;
 Rml::Context* g_context = nullptr;
 Rml::ElementDocument* g_launcher_doc = nullptr;
 Rml::ElementDocument* g_config_doc = nullptr;
+Rml::ElementDocument* g_cheats_doc = nullptr;
+Rml::ElementDocument* g_pause_doc = nullptr;
+
+// Which "root" menu is active, so a sub-page's Back returns to the right place: the launcher
+// (pre-game) or the in-game pause menu. Touched only on the render thread (all show_*/Back run there).
+enum class MenuRoot { Launcher, Pause };
+MenuRoot g_active_root = MenuRoot::Launcher;
 
 GraphicsConfig g_working_config;   // the config the menu edits; pushed to ultramodern on change
 
 std::atomic<bool> g_ui_ready{false};        // documents loaded; menu functional
-std::atomic<bool> g_menu_open{false};       // launcher/config currently shown + capturing input
+std::atomic<bool> g_menu_open{false};       // launcher/pause/config/cheats currently shown + capturing input
 std::atomic<bool> g_play_requested{false};  // user activated "Play"
 std::atomic<bool> g_play_consumed{false};   // coordinator already took the request
+std::atomic<bool> g_game_started{false};        // the recompiled game is running (enables the in-game pause menu)
+std::atomic<bool> g_pause_toggle_pending{false};  // Esc/F1 pressed; the render thread should toggle the pause overlay
 
 moodycamel::ConcurrentQueue<SDL_Event> g_event_queue;
 
@@ -211,42 +222,147 @@ void populate_mod_list() {
     });
 }
 
+void hide_all_docs() {
+    if (g_launcher_doc) g_launcher_doc->Hide();
+    if (g_config_doc)   g_config_doc->Hide();
+    if (g_cheats_doc)   g_cheats_doc->Hide();
+    if (g_pause_doc)    g_pause_doc->Hide();
+}
+
+// Close the whole overlay and release input back to the game (draw_hook unpauses the sim once the
+// menu is no longer open).
+void close_overlay() {
+    hide_all_docs();
+    g_menu_open.store(false);
+}
+
 void show_launcher() {
-    if (g_config_doc) g_config_doc->Hide();
-    if (g_launcher_doc) g_launcher_doc->Show();
+    hide_all_docs();
+    g_active_root = MenuRoot::Launcher;
+    if (g_launcher_doc) {
+        g_launcher_doc->Show();
+        if (auto* e = g_launcher_doc->GetElementById("play")) e->Focus(true);   // keyboard: start on Play
+    }
+    g_menu_open.store(true);
+}
+
+void show_pause() {
+    hide_all_docs();
+    g_active_root = MenuRoot::Pause;
+    if (g_pause_doc) {
+        g_pause_doc->Show();
+        if (auto* e = g_pause_doc->GetElementById("resume")) e->Focus(true);    // keyboard: start on Resume
+    }
     g_menu_open.store(true);
 }
 
 void show_config() {
-    if (g_launcher_doc) g_launcher_doc->Hide();
+    hide_all_docs();
     if (g_config_doc) {
         config_to_controls();
         g_config_doc->Show();
+        if (auto* e = g_config_doc->GetElementById("rr_option")) e->Focus(true);
     }
     g_menu_open.store(true);
+}
+
+void show_cheats() {
+    hide_all_docs();
+    if (g_cheats_doc) {
+        g_cheats_doc->Show();
+        Rml::Element* list = g_cheats_doc->GetElementById("cheat_list");
+        Rml::Element* first = (list != nullptr && list->GetNumChildren() > 0) ? list->GetChild(0)
+                                                                              : g_cheats_doc->GetElementById("back");
+        if (first != nullptr) first->Focus(true);   // keyboard: start on the first cheat
+    }
+    g_menu_open.store(true);
+}
+
+// Return from a sub-page (Settings/Cheats) to whichever root opened it.
+void go_back() {
+    if (g_active_root == MenuRoot::Pause) show_pause();
+    else                                  show_launcher();
 }
 
 void wire_launcher_events() {
     if (g_launcher_doc == nullptr) return;
     add_listener(g_launcher_doc->GetElementById("play"), "click", [](Rml::Event&) {
-        g_play_requested.store(true);
-        if (auto* btn = (g_launcher_doc ? g_launcher_doc->GetElementById("play") : nullptr)) {
-            btn->SetInnerRML("Starting...");
-            btn->SetClass("disabled", true);
-        }
+        // The game is already running behind the menu (RT64 only drives the menu's render+input hook
+        // while the game produces frames, so the menu must overlay the live game). "Play" just hides
+        // the overlay to reveal/enter the game; Esc/F1 bring up the pause menu.
+        close_overlay();
     });
     add_listener(g_launcher_doc->GetElementById("settings"), "click", [](Rml::Event&) { show_config(); });
+    add_listener(g_launcher_doc->GetElementById("cheats"), "click", [](Rml::Event&) { show_cheats(); });
     add_listener(g_launcher_doc->GetElementById("quit"), "click", [](Rml::Event&) { ultramodern::quit(); });
     populate_mod_list();
 }
 
 void wire_config_events() {
     if (g_config_doc == nullptr) return;
-    add_listener(g_config_doc->GetElementById("back"), "click", [](Rml::Event&) { show_launcher(); });
+    add_listener(g_config_doc->GetElementById("back"), "click", [](Rml::Event&) { go_back(); });
     // One delegated change handler on the form: any control change re-reads + applies + saves.
     Rml::Element* form = g_config_doc->GetElementById("graphics_form");
     add_listener(form != nullptr ? form : g_config_doc->GetElementById("config_root"), "change",
                  [](Rml::Event&) { controls_to_config_and_apply(); });
+}
+
+// Build the cheat checkbox rows from bar_cheats' table (once), with a delegated change handler that
+// maps each toggle back to its cheat id. Mirrors populate_mod_list().
+void populate_cheats() {
+    Rml::Element* list = (g_cheats_doc != nullptr) ? g_cheats_doc->GetElementById("cheat_list") : nullptr;
+    if (list == nullptr) return;
+
+    Rml::String rml;
+    for (int i = 0; i < (int)bar_cheats::Id::Count; i++) {
+        const bar_cheats::Info& inf = bar_cheats::info((bar_cheats::Id)i);
+        const bool enabled = bar_cheats::get((bar_cheats::Id)i);
+        rml += "<div class=\"cheat-row";
+        rml += enabled ? " on" : "";
+        rml += "\" data-cheat-id=\"";
+        rml += inf.id;
+        rml += "\"><span class=\"cheat-check\"><span class=\"tick\"></span></span><span class=\"cheat-name\">";
+        rml += inf.label;
+        rml += "</span><span class=\"cheat-sub\">";
+        rml += inf.hint;
+        rml += "</span></div>";
+    }
+    list->SetInnerRML(rml);
+
+    // Delegated click handler: a click anywhere in a row toggles that cheat. The target may be a
+    // child span, so walk up to the ancestor carrying data-cheat-id.
+    add_listener(list, "click", [](Rml::Event& ev) {
+        Rml::Element* el = ev.GetTargetElement();
+        while (el != nullptr && el->GetAttribute<Rml::String>("data-cheat-id", Rml::String()).empty()) {
+            el = el->GetParentNode();
+        }
+        if (el == nullptr) return;
+        const Rml::String cheat_id = el->GetAttribute<Rml::String>("data-cheat-id", Rml::String());
+        for (int i = 0; i < (int)bar_cheats::Id::Count; i++) {
+            if (cheat_id == bar_cheats::info((bar_cheats::Id)i).id) {
+                const bool now = !bar_cheats::get((bar_cheats::Id)i);
+                bar_cheats::set((bar_cheats::Id)i, now);
+                bar_cheats::save();
+                el->SetClass("on", now);
+                break;
+            }
+        }
+    });
+}
+
+void wire_cheats_events() {
+    if (g_cheats_doc == nullptr) return;
+    add_listener(g_cheats_doc->GetElementById("back"), "click", [](Rml::Event&) { go_back(); });
+    populate_cheats();
+}
+
+void wire_pause_events() {
+    if (g_pause_doc == nullptr) return;
+    add_listener(g_pause_doc->GetElementById("resume"),   "click", [](Rml::Event&) { close_overlay(); });
+    add_listener(g_pause_doc->GetElementById("settings"), "click", [](Rml::Event&) { show_config(); });
+    add_listener(g_pause_doc->GetElementById("cheats"),   "click", [](Rml::Event&) { show_cheats(); });
+    add_listener(g_pause_doc->GetElementById("mainmenu"), "click", [](Rml::Event&) { show_launcher(); });
+    add_listener(g_pause_doc->GetElementById("quit"),     "click", [](Rml::Event&) { ultramodern::quit(); });
 }
 
 // ----------------------------------------------------------------------------------------
@@ -287,14 +403,32 @@ void init_hook(plume::RenderInterface* interface, plume::RenderDevice* device) {
 
     g_launcher_doc = g_context->LoadDocument(asset_path("launcher.rml").string());
     g_config_doc   = g_context->LoadDocument(asset_path("config.rml").string());
+    g_cheats_doc   = g_context->LoadDocument(asset_path("cheats.rml").string());
+    g_pause_doc    = g_context->LoadDocument(asset_path("pause.rml").string());
     if (g_launcher_doc == nullptr) {
         std::fprintf(stderr, "[BeetleRecomp][ui] failed to load launcher.rml; menu disabled\n");
         return;
     }
+    if (g_config_doc == nullptr) std::fprintf(stderr, "[BeetleRecomp][ui] warning: config.rml not loaded\n");
+    if (g_cheats_doc == nullptr) std::fprintf(stderr, "[BeetleRecomp][ui] warning: cheats.rml not loaded\n");
+    if (g_pause_doc  == nullptr) std::fprintf(stderr, "[BeetleRecomp][ui] warning: pause.rml not loaded\n");
 
     wire_launcher_events();
     wire_config_events();
-    show_launcher();
+    wire_cheats_events();
+    wire_pause_events();
+    // Initial overlay page. BAR_SKIP_LAUNCHER starts with the menu hidden (headless / BAR_FORCESTATE
+    // runs); BAR_UI_PAGE=cheats|settings opens straight to that page (UI dev aid).
+    const char* start_page = std::getenv("BAR_UI_PAGE");
+    if (std::getenv("BAR_SKIP_LAUNCHER") != nullptr) {
+        g_menu_open.store(false);
+        if (g_launcher_doc) g_launcher_doc->Hide();
+        if (g_config_doc) g_config_doc->Hide();
+        if (g_cheats_doc) g_cheats_doc->Hide();
+    }
+    else if (start_page != nullptr && std::string(start_page) == "cheats")   show_cheats();
+    else if (start_page != nullptr && std::string(start_page) == "settings") show_config();
+    else                                                                     show_launcher();
 
     g_ui_ready.store(true);
     std::fprintf(stderr, "[BeetleRecomp][ui] launcher ready\n");
@@ -305,11 +439,27 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
         return;
     }
 
-    // Drain queued SDL input into the context (only while the menu owns input).
+    // Esc/F1 (main thread) requested an in-game pause-menu toggle; perform the document show/hide here
+    // on the render thread, where every other RmlUi document mutation happens. Open -> close (resume);
+    // closed -> show the pause menu.
+    if (g_pause_toggle_pending.exchange(false) && g_game_started.load()) {
+        if (g_menu_open.load()) close_overlay();
+        else                    show_pause();
+    }
+
+    // Drain queued SDL input into the context (only while the menu owns input). RmlUi handles Tab
+    // (tab-index) and arrow keys (the `nav` RCSS property) for focus movement itself; we add Enter /
+    // Space to activate the focused element (our buttons/rows are <div>s, which RmlUi doesn't auto-click).
     SDL_Event ev;
     while (g_event_queue.try_dequeue(ev)) {
         if (g_menu_open.load()) {
             RmlSDL::InputEventHandler(g_context, g_window, ev);
+            // Activate the focused element on Enter / Space (our buttons/rows are <div>s; RmlUi handles
+            // Tab + arrow-key focus movement itself via tab-index / the `nav` property, but not activation).
+            if (ev.type == SDL_KEYDOWN &&
+                (ev.key.keysym.sym == SDLK_RETURN || ev.key.keysym.sym == SDLK_KP_ENTER || ev.key.keysym.sym == SDLK_SPACE)) {
+                if (Rml::Element* focused = g_context->GetFocusElement()) focused->Click();
+            }
         }
     }
 
@@ -332,6 +482,8 @@ void deinit_hook() {
     g_menu_open.store(false);
     g_launcher_doc = nullptr;
     g_config_doc = nullptr;
+    g_cheats_doc = nullptr;
+    g_pause_doc = nullptr;
     g_context = nullptr;
     g_listeners.clear();
     Rml::Shutdown();
@@ -365,9 +517,18 @@ bool consume_play_request(fs::path& out_rom) {
 }
 
 void on_game_started() {
-    g_menu_open.store(false);
-    if (g_launcher_doc) g_launcher_doc->Hide();
-    if (g_config_doc) g_config_doc->Hide();
+    // The game is now producing frames, so the menu overlay is live + interactive. Keep the launcher
+    // shown over the (booting) game until the user clicks Play; just record that the game has started
+    // (this enables the F1 in-game toggle).
+    g_game_started.store(true);
+}
+
+void toggle_pause_menu() {
+    // Bound to Esc / F1 / controller Back. Only meaningful once the game is running (pre-game the
+    // launcher is already shown). The render thread (draw_hook) performs the actual show/hide — and the
+    // pause/resume of the simulation — so RmlUi documents are only touched there.
+    if (!g_game_started.load() || !g_ui_ready.load()) return;
+    g_pause_toggle_pending.store(true);
 }
 
 } // namespace bar_ui

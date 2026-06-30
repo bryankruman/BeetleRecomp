@@ -19,6 +19,8 @@
 #include <ultramodern/ultramodern.hpp>
 #include <cstdlib>
 
+#include "main/bar_cheats.h"   // bar_cheats::apply_frame (host-side RDRAM cheat pokes)
+
 // Keyboard -> N64 pad mapping lives in main.cpp (it owns the Win32 window / focus).
 extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y);
 
@@ -68,6 +70,10 @@ extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
             p = (e && e != p) ? e : p + 1;
             if ((long)fc == fr) { MEM_W(0X8, GS) = (int32_t)st; }
         } } }
+    // Cheats menu: poke the game's RDRAM for any enabled BAR cheats. This hook fires ~once per
+    // controller poll (per frame) in both the menus and a race, the right cadence for the
+    // "every frame" cheat writes (unlocks, debug-options flags). No-op when nothing is enabled.
+    bar_cheats::apply_frame(rdram);
     if (direction == 0 /* OS_READ */ && valid_pifram) {
         // The PIF RAM holds one joybus command block per controller (8 bytes for the status-query
         // and button-read commands BAR uses for the menu). Branch on the command byte (offset 3) so

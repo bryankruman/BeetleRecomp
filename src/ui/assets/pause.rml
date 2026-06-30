@@ -1,0 +1,58 @@
+<rml>
+<head>
+    <title>Paused</title>
+    <style>
+        body {
+            font-family: LatoLatin;
+            font-size: 18dp;
+            color: #e8e8e8;
+            width: 100%;
+            height: 100%;
+            background-color: #000000c8;   /* dim the frozen game behind, but keep it visible */
+        }
+        /* RmlUi has no HTML UA stylesheet: structural elements default to display:inline. */
+        div, h1, h2, p { display: block; }
+        #panel {
+            width: 460dp;
+            margin: auto;
+            margin-top: 120dp;
+            padding: 32dp;
+            background-color: #1b1b1ef2;
+            border: 1dp #3a3a40;
+            border-radius: 12dp;
+            text-align: center;
+        }
+        h1 { font-size: 28dp; color: #f2c14e; margin-bottom: 6dp; }
+        .subtitle { color: #9a9a9a; font-size: 13dp; margin-bottom: 24dp; }
+        .btn {
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+            padding: 12dp;
+            margin-bottom: 12dp;
+            background-color: #2a2a30;
+            border: 1dp #45454d;
+            border-radius: 8dp;
+            color: #f0f0f0;
+            text-align: center;
+            tab-index: auto;
+            nav: auto;
+        }
+        .btn:hover  { background-color: #37373f; border-color: #f2c14e; }
+        .btn:focus  { background-color: #37373f; border-color: #f2c14e; }
+        .btn:active { background-color: #f2c14e; color: #1b1b1e; }
+        .btn.danger:hover, .btn.danger:focus { border-color: #d05b5b; }
+    </style>
+</head>
+<body>
+    <div id="panel">
+        <h1>Paused</h1>
+        <p class="subtitle">Esc or Resume to continue</p>
+        <div id="resume" class="btn">Resume</div>
+        <div id="settings" class="btn">Settings</div>
+        <div id="cheats" class="btn">Cheats</div>
+        <div id="mainmenu" class="btn">Main Menu</div>
+        <div id="quit" class="btn danger">Quit Game</div>
+    </div>
+</body>
+</rml>

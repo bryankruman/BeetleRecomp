@@ -35,9 +35,10 @@
 #include "librecomp/overlays.hpp"             // overlay table (registration lives in register_overlays.cpp)
 
 #include "game/config.hpp"                    // bar::config — settings persistence + high-FPS enable
+#include "main/bar_cheats.h"                  // bar_cheats — BAR cheat toggles (host-side RDRAM pokes)
 
 #ifdef BEETLE_ENABLE_UI
-#include "ui/bar_ui.h"                        // bar_ui — RmlUi launcher + settings menu (Tier 2)
+#include "ui/bar_ui.h"                        // bar_ui — RmlUi launcher + settings + cheats menu (Tier 2)
 #endif
 
 // The ROM the launcher's "Play" button loads (also the auto-start ROM when the UI is disabled).
@@ -142,6 +143,46 @@ extern std::atomic<bool> g_bar_vi_ticked;        // renderer presented a frame (
 // SDL window / gfx (gfx_callbacks_t). RT64 attaches to this window's native HWND.
 static SDL_Window* g_window = nullptr;
 static HWND g_bar_hwnd = nullptr;   // native window handle (for keyboard focus gating)
+static SDL_GameController* g_gamepad = nullptr;   // first connected SDL controller; touched ONLY on the main thread
+static std::atomic<uint32_t> g_pad_state{0};      // packed pad snapshot: btn(bits0-15) | sx(16-23) | sy(24-31)
+
+// Sample the connected SDL game controller into g_pad_state. MAIN THREAD ONLY (update_gfx) — keeping
+// all SDL controller access + the g_gamepad handle on one thread avoids a disconnect-vs-read race with
+// the game/SI threads that call bar_poll_gamepad. Mapping: A->A B->B Start->Start L/R shoulders->L/R
+// LT->Z D-pad->D-pad right-stick->C-buttons left-stick->analog(±80). Rebind UI/profiles = TODO (item 6b).
+static void bar_sample_gamepad() {
+    SDL_GameController* gc = g_gamepad;
+    if (gc == nullptr || !SDL_GameControllerGetAttached(gc)) { g_pad_state.store(0, std::memory_order_relaxed); return; }
+    auto bdown = [gc](SDL_GameControllerButton b) { return SDL_GameControllerGetButton(gc, b) != 0; };
+    uint16_t b = 0;
+    if (bdown(SDL_CONTROLLER_BUTTON_A))             b |= 0x8000; // CONT_A
+    if (bdown(SDL_CONTROLLER_BUTTON_B))             b |= 0x4000; // CONT_B
+    if (bdown(SDL_CONTROLLER_BUTTON_START))         b |= 0x1000; // CONT_START
+    if (bdown(SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  b |= 0x0020; // CONT_L
+    if (bdown(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) b |= 0x0010; // CONT_R
+    if (bdown(SDL_CONTROLLER_BUTTON_DPAD_UP))       b |= 0x0800;
+    if (bdown(SDL_CONTROLLER_BUTTON_DPAD_DOWN))     b |= 0x0400;
+    if (bdown(SDL_CONTROLLER_BUTTON_DPAD_LEFT))     b |= 0x0200;
+    if (bdown(SDL_CONTROLLER_BUTTON_DPAD_RIGHT))    b |= 0x0100;
+    if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT)  > 12000) b |= 0x2000; // Z trigger
+    if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 12000) b |= 0x0010; // also R
+    const int rx = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX);
+    const int ry = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY);
+    constexpr int kCDz = 16000;                  // C-buttons from the right analog stick
+    if (ry < -kCDz) b |= 0x0008;                 // C-up
+    if (ry >  kCDz) b |= 0x0004;                 // C-down
+    if (rx < -kCDz) b |= 0x0002;                 // C-left
+    if (rx >  kCDz) b |= 0x0001;                 // C-right
+    const int lx = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
+    const int ly = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
+    constexpr int kDz = 8000;                    // left stick -> analog (±80), with a deadzone
+    int nx = (lx > kDz || lx < -kDz) ? lx * 80 / 32767 : 0;
+    int ny = (ly > kDz || ly < -kDz) ? -(ly * 80 / 32767) : 0;   // SDL Y down=+, N64 stick up=+
+    if (nx >  80) nx =  80; else if (nx < -80) nx = -80;
+    if (ny >  80) ny =  80; else if (ny < -80) ny = -80;
+    g_pad_state.store((uint32_t)b | ((uint32_t)(uint8_t)(int8_t)nx << 16) | ((uint32_t)(uint8_t)(int8_t)ny << 24),
+                      std::memory_order_relaxed);
+}
 
 static ultramodern::gfx_callbacks_t::gfx_data_t create_gfx() {
     SDL_SetMainReady();
@@ -184,15 +225,75 @@ static void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t /*data*/) {
     while (SDL_PollEvent(&event)) {
         if (event.type == SDL_QUIT) {
             ultramodern::quit();
+            continue;
+        }
+        // Game controller hotplug. SDL queues a DEVICEADDED for controllers already present at init,
+        // so this also picks up a controller plugged in before launch. We drive one controller (port 0).
+        if (event.type == SDL_CONTROLLERDEVICEADDED) {
+            if (g_gamepad == nullptr) {
+                g_gamepad = SDL_GameControllerOpen(event.cdevice.which);
+                if (g_gamepad != nullptr)
+                    std::fprintf(stderr, "[BeetleRecomp] gamepad connected: %s\n", SDL_GameControllerName(g_gamepad));
+            }
+            continue;
+        }
+        if (event.type == SDL_CONTROLLERDEVICEREMOVED) {
+            if (g_gamepad != nullptr &&
+                event.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_gamepad))) {
+                SDL_GameControllerClose(g_gamepad);
+                g_gamepad = nullptr;
+                std::fprintf(stderr, "[BeetleRecomp] gamepad disconnected\n");
+            }
+            continue;
         }
 #ifdef BEETLE_ENABLE_UI
-        // While the launcher/settings menu owns input, forward events to RmlUi (drained on the
-        // render thread). Once the game starts, the menu hides and input goes to the game.
+        // Esc / F1 toggle the in-game pause menu (pauses the simulation; no effect pre-game — the
+        // launcher is already up). The game never reads these keys (game input is GetAsyncKeyState /
+        // controller based), so we consume them here.
+        if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
+            (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_F1)) {
+            bar_ui::toggle_pause_menu();
+            continue;
+        }
+        // Controller Back/View/Select button also toggles the pause menu (N64 pads have no such
+        // button, so it never conflicts with game input).
+        if (event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
+            bar_ui::toggle_pause_menu();
+            continue;
+        }
+        // Controller navigation of the menu: translate buttons to the keyboard nav the menu already
+        // handles (D-pad -> arrows = move focus; A -> Enter = activate). Synthesize a key event and feed
+        // it through the same path. Only while the menu owns input.
+        if (bar_ui::menu_capturing_input() && event.type == SDL_CONTROLLERBUTTONDOWN) {
+            SDL_Keycode key = 0;
+            switch (event.cbutton.button) {
+                case SDL_CONTROLLER_BUTTON_DPAD_UP:    key = SDLK_UP;     break;
+                case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  key = SDLK_DOWN;   break;
+                case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  key = SDLK_LEFT;   break;
+                case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: key = SDLK_RIGHT;  break;
+                case SDL_CONTROLLER_BUTTON_A:          key = SDLK_RETURN; break;
+                default: break;
+            }
+            if (key != 0) {
+                SDL_Event k{};
+                k.type = SDL_KEYDOWN;
+                k.key.type = SDL_KEYDOWN;
+                k.key.state = SDL_PRESSED;
+                k.key.repeat = 0;
+                k.key.keysym.sym = key;
+                k.key.keysym.scancode = SDL_GetScancodeFromKey(key);
+                bar_ui::handle_sdl_event(k);
+            }
+            continue;
+        }
+        // While the launcher/settings/cheats menu owns input, forward events to RmlUi (drained on
+        // the render thread). Once the game starts, the menu hides and input goes to the game.
         if (bar_ui::menu_capturing_input()) {
             bar_ui::handle_sdl_event(event);
         }
 #endif
     }
+    bar_sample_gamepad();   // refresh the controller snapshot on this (main) thread
 }
 
 // Audio (audio_callbacks_t) — SDL2 queued-audio backend.
@@ -305,9 +406,9 @@ static void set_frequency(uint32_t freq) {
     if (freq != 0 && freq != g_dev_freq) bar_open_audio(freq);
 }
 
-// Input (input::callbacks_t). Minimal: report controller 1 as connected with a neutral state so the
-// game gets past its "no controller" check (uvShowNoController). TODO(BAR): real SDL controller /
-// keyboard mapping -> N64 buttons + analog stick.
+// Input (input::callbacks_t). Port 0 is reported connected; the live pad state comes from
+// bar_poll_keyboard (keyboard + SDL game controller, see bar_poll_gamepad). TODO(BAR): a rebind UI
+// (item 6b) + per-controller profiles.
 static void input_poll() {
 }
 
@@ -391,12 +492,28 @@ static uint16_t bar_autoplay_poll(const char* script, int8_t* stick_x, int8_t* s
     return btn;
 }
 
+// Fold the latest controller snapshot (sampled on the main thread by bar_sample_gamepad) into the pad
+// state: OR the buttons, and use the controller's left stick only if the keyboard left it neutral.
+static void bar_poll_gamepad(uint16_t* btn, int* sx, int* sy) {
+    const uint32_t s = g_pad_state.load(std::memory_order_relaxed);
+    *btn |= (uint16_t)(s & 0xFFFF);
+    if (*sx == 0 && *sy == 0) {
+        *sx = (int)(int8_t)((s >> 16) & 0xFF);
+        *sy = (int)(int8_t)((s >> 24) & 0xFF);
+    }
+}
+
 extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y) {
     if (stick_x) *stick_x = 0;
     if (stick_y) *stick_y = 0;
     if (port != 0) return 0;
     static const char* autoplay = std::getenv("BAR_AUTOPLAY");
     if (autoplay && *autoplay) return bar_autoplay_poll(autoplay, stick_x, stick_y);
+#ifdef BEETLE_ENABLE_UI
+    // While the cheats/settings overlay is open, freeze game input so menu navigation (arrows/enter)
+    // doesn't also drive the car.
+    if (bar_ui::menu_capturing_input()) return 0;
+#endif
     if (g_bar_hwnd != nullptr && GetForegroundWindow() != g_bar_hwnd) return 0; // only when focused
     auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
     uint16_t b = 0;
@@ -419,6 +536,7 @@ extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y
     if (down(VK_RIGHT)) sx += 80;
     if (down(VK_UP))    sy += 80;   // N64 stick: up is positive
     if (down(VK_DOWN))  sy -= 80;
+    bar_poll_gamepad(&b, &sx, &sy);   // fold in an SDL game controller if one is connected
     if (stick_x) *stick_x = (int8_t)sx;
     if (stick_y) *stick_y = (int8_t)sy;
     return b;
@@ -460,6 +578,10 @@ int main(int argc, char** argv) {
     // it when it constructs the RT64 context.
     bar::config::load_and_apply_graphics();
 
+    // Load persisted cheat toggles (applied per-frame from the SI hook once the game runs; also
+    // editable live via the in-game cheats menu — F1).
+    bar_cheats::load();
+
     // Teach librecomp about BAR (hash / entrypoint / save type).
     for (const auto& game : supported_games) {
         recomp::register_game(game);
@@ -489,23 +611,11 @@ int main(int argc, char** argv) {
         }
 
         std::filesystem::path rom = g_default_rom_path;
-#ifdef BEETLE_ENABLE_UI
-        // Give the launcher a moment to come up. If it does, wait for the user to press "Play";
-        // if the UI failed to initialize (missing assets, etc.), fall through and auto-start so we
-        // never leave a dead window.
-        bool menu_up = false;
-        for (int i = 0; i < 300 && !menu_up; i++) {
-            menu_up = bar_ui::menu_capturing_input();
-            std::this_thread::sleep_for(10ms);
-        }
-        if (menu_up) {
-            std::filesystem::path picked;
-            while (!bar_ui::consume_play_request(picked)) {
-                std::this_thread::sleep_for(30ms);
-            }
-            rom = picked;
-        }
-#endif
+        // Start the game right away — do NOT wait for "Play". The launcher/settings/cheats menu is an
+        // OVERLAY drawn over the running game: RT64 only drives the UI's render+input render-hook while
+        // the game is producing frames, so the menu cannot be interactive before the game starts. The
+        // launcher stays shown over the (booting) game until the user clicks Play (which hides it);
+        // F1 reopens the menu in-game. BAR_SKIP_LAUNCHER starts with the overlay hidden (headless).
 
         recomp::RomValidationError rom_err = recomp::select_rom(rom, game_id);
         if (rom_err != recomp::RomValidationError::Good) {
@@ -515,7 +625,7 @@ int main(int argc, char** argv) {
         }
         recomp::start_game(game_id);
 #ifdef BEETLE_ENABLE_UI
-        bar_ui::on_game_started();   // hide the launcher and release input to the game
+        bar_ui::on_game_started();   // mark game started (enables F1); the launcher stays as an overlay
 #endif
     }).detach();
 

@@ -152,6 +152,17 @@ public:
 
 private:
     std::unique_ptr<RT64::Application> app;
+
+    // MSAA + resolution are applied only via RT64's *validated* setup path; changing them live is
+    // fragile and crashes: RT64's runtime updateMultisampling() skips the device sample-count check
+    // that setup does (rt64_application.cpp:336-342 vs :527), and live render-target reallocation is
+    // brittle. We snapshot the live RT64 values after setup and re-assert them on every runtime config
+    // update so those two settings never change until the next launch — the chosen values still persist
+    // to graphics.json (the menu saves them) and take effect on restart through the safe setup path.
+    RT64::UserConfiguration::Antialiasing m_live_aa{};
+    RT64::UserConfiguration::Resolution   m_live_resolution{};
+    double m_live_res_mult  = 1.0;
+    int    m_live_down_mult = 1;
 };
 
 RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::WindowHandle window_handle, bool debug) {
@@ -223,6 +234,15 @@ RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::WindowHandle win
     }
 
     app->setFullScreen(cur.wm_option == ultramodern::renderer::WindowMode::Fullscreen);
+
+    // Snapshot the render-target settings RT64 actually configured (setup may have downgraded MSAA to
+    // None if the device doesn't support the requested sample count — line ~340). These are re-asserted
+    // on every runtime config change so MSAA/resolution only change across a restart (see members).
+    m_live_aa         = app->userConfig.antialiasing;
+    m_live_resolution = app->userConfig.resolution;
+    m_live_res_mult   = app->userConfig.resolutionMultiplier;
+    m_live_down_mult  = app->userConfig.downsampleMultiplier;
+
     std::fprintf(stderr, "[BeetleRecomp] RT64 initialized (graphics api %d)\n", static_cast<int>(chosen_api));
 }
 
@@ -252,10 +272,15 @@ bool RT64Context::update_config(const ultramodern::renderer::GraphicsConfig& old
         app->setFullScreen(new_config.wm_option == ultramodern::renderer::WindowMode::Fullscreen);
     }
     set_application_user_config(app.get(), new_config);
+    // Defer MSAA + resolution to the next launch (see the m_live_* members): re-assert the live
+    // render-target settings so they stay exactly as RT64 created them, and do NOT call the
+    // crash-prone runtime updateMultisampling() / live resolution reallocation. Every other setting
+    // (refresh rate, aspect ratio, HUD ratio, window mode, HDR) still applies live below.
+    app->userConfig.antialiasing         = m_live_aa;
+    app->userConfig.resolution           = m_live_resolution;
+    app->userConfig.resolutionMultiplier = m_live_res_mult;
+    app->userConfig.downsampleMultiplier = m_live_down_mult;
     app->updateUserConfig(true);
-    if (new_config.msaa_option != old_config.msaa_option) {
-        app->updateMultisampling();
-    }
     return true;
 }
 

@@ -22,11 +22,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Tier-2 settings/launcher menu (src/ui, RmlUi over RT64). OFF by default so the core port still
-# configures without the Freetype submodule; turn on with -DBEETLE_ENABLE_UI=ON after adding it:
-#   git submodule add https://github.com/ubawurinna/freetype-windows-binaries.git lib/freetype-windows-binaries
-# The core port (recompiled code + runtime + RT64) builds with it OFF.
-option(BEETLE_ENABLE_UI "Build the RmlUi settings/launcher menu (requires the Freetype submodule)" OFF)
+# Tier-2 settings/launcher/cheats menu (src/ui, RmlUi over RT64). ON by default: the launcher +
+# settings + BAR cheats menu ship in the standard build. It depends on the lib/freetype-windows-binaries
+# submodule (vendored); turn the menu OFF with -DBEETLE_ENABLE_UI=OFF to build the bare core port
+# (recompiled code + runtime + RT64) without RmlUi/Freetype.
+option(BEETLE_ENABLE_UI "Build the RmlUi settings/launcher/cheats menu (requires the Freetype submodule)" ON)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-everything /W4")
@@ -70,9 +70,19 @@ if (BEETLE_ENABLE_UI)
                 "BEETLE_ENABLE_UI=ON but lib/freetype-windows-binaries is missing. Add it with:\n"
                 "  git submodule add https://github.com/ubawurinna/freetype-windows-binaries.git lib/freetype-windows-binaries")
         endif()
+        # The prebuilt-binaries repo's static-lib dir is VS-version-stamped (vs2015-2022/win64, vs2026/x64,
+        # ...) and changes over time — glob for the x64 static lib instead of hardcoding the version path.
+        file(GLOB_RECURSE BAR_FT_LIBS
+            "${BAR_FT_DIR}/release static/*/x64/freetype.lib"
+            "${BAR_FT_DIR}/release static/*/win64/freetype.lib")
+        if (NOT BAR_FT_LIBS)
+            message(FATAL_ERROR "freetype.lib not found under '${BAR_FT_DIR}/release static/*/x64' — check the submodule layout")
+        endif()
+        list(GET BAR_FT_LIBS 0 BAR_FT_LIB)
+        message(STATUS "BeetleRecomp: using Freetype ${BAR_FT_LIB}")
         add_library(Freetype::Freetype STATIC IMPORTED)
         set_target_properties(Freetype::Freetype PROPERTIES
-            IMPORTED_LOCATION "${BAR_FT_DIR}/release static/vs2015-2022/win64/freetype.lib"
+            IMPORTED_LOCATION "${BAR_FT_LIB}"
             INTERFACE_INCLUDE_DIRECTORIES "${BAR_FT_DIR}/include")
     endif()
 
@@ -81,7 +91,8 @@ if (BEETLE_ENABLE_UI)
     add_subdirectory(${CMAKE_SOURCE_DIR}/lib/lunasvg)
     set(RMLUI_SVG_PLUGIN ON CACHE BOOL "" FORCE)
     set(RMLUI_TESTS_ENABLED OFF CACHE BOOL "" FORCE)
-    set(RMLUI_BACKEND "none" CACHE STRING "" FORCE)   # we compile only the SDL platform shim ourselves
+    set(RMLUI_SAMPLES OFF CACHE BOOL "" FORCE)        # no RmlUi samples/backend — we render via our RT64 bridge
+    set(RMLUI_BACKEND "auto" CACHE STRING "" FORCE)   # unused when samples are off, but must be a valid value
     add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RmlUi)
     target_compile_definitions(rmlui_core PRIVATE LUNASVG_BUILD_STATIC)
 endif()
@@ -135,6 +146,7 @@ add_executable(BeetleRecomp
     ${CMAKE_SOURCE_DIR}/src/main/hw_stubs.cpp            # native stubs for raw RCP-register libultra funcs
     ${CMAKE_SOURCE_DIR}/src/main/rt64_render_context.cpp # RT64-backed RendererContext subclass
     ${CMAKE_SOURCE_DIR}/src/main/bar_config.cpp          # feature/settings flags (fast-boot, etc.)
+    ${CMAKE_SOURCE_DIR}/src/main/bar_cheats.cpp          # BAR-specific cheats (host-side RDRAM pokes)
     ${CMAKE_SOURCE_DIR}/src/main/bar_preempt.cpp         # cooperative audio-thread preemption (no-underrun)
     ${CMAKE_SOURCE_DIR}/src/main/bar_crash.cpp           # symbolized crash backtrace (debug aid)
     ${CMAKE_SOURCE_DIR}/src/game/config.cpp              # host-owned settings persistence + high-FPS enable
