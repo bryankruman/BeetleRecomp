@@ -260,13 +260,32 @@ bool RT64Context::update_config(const ultramodern::renderer::GraphicsConfig& old
 }
 
 void RT64Context::enable_instant_present() {
-    // TODO(BAR): present-early low-latency mode (enhancementConfig.presentation). Not needed for
-    // bring-up; normal presentation is used.
+    // Present each frame as early as RT64 can produce it, decoupling the game thread from
+    // RDP-completion latency. ultramodern's gfx thread calls this once per session, right after
+    // the game starts (events.cpp gfx_thread_func). Without it the game thread can block waiting
+    // on the renderer, coupling render time back into frame production (stutter/latency — not
+    // game speed). RT64 reads the enhancement config through the shared queue resources, so push
+    // the change with updateEnhancementConfig().
+    if (app != nullptr) {
+        app->enhancementConfig.presentation.mode =
+            RT64::EnhancementConfiguration::Presentation::Mode::PresentEarly;
+        app->updateEnhancementConfig();
+    }
 }
 
 uint32_t RT64Context::get_display_framerate() const {
-    // TODO(BAR): query RT64's actual swapchain refresh rate. 60 (NTSC) is a safe pacing default.
-    return 60;
+    // Report the real monitor / swap-chain refresh rate so RefreshRate::Display tracks the
+    // display (144/165/etc.). This feeds ultramodern's display_refresh_rate (events.cpp), which
+    // get_target_framerate() uses as RT64's frame-interpolation target. RT64 populates
+    // appWindow->refreshRate during setup and refreshes it on window moves, so reading the cached
+    // value is cheap and thread-safe even though this is called every VI tick.
+    if (app != nullptr && app->appWindow != nullptr) {
+        uint32_t rate = app->appWindow->getRefreshRate();
+        if (rate != 0) {
+            return rate;
+        }
+    }
+    return 60;   // NTSC fallback until the real rate is known
 }
 
 float RT64Context::get_resolution_scale() const {

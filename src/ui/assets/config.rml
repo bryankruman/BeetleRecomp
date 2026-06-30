@@ -1,0 +1,125 @@
+<rml>
+<head>
+    <title>Settings</title>
+    <style>
+        body {
+            font-family: LatoLatin;
+            font-size: 18dp;
+            color: #e8e8e8;
+            width: 100%;
+            height: 100%;
+            background-color: #000000d0;
+        }
+        #config_root {
+            width: 560dp;
+            margin: auto;
+            margin-top: 80dp;
+            padding: 32dp;
+            background-color: #1b1b1ef0;
+            border: 1dp #3a3a40;
+            border-radius: 12dp;
+        }
+        h1 { font-size: 26dp; color: #f2c14e; margin-bottom: 4dp; }
+        .hint { color: #9a9a9a; font-size: 13dp; margin-bottom: 20dp; }
+        .row {
+            display: flex;
+            align-items: center;
+            padding: 10dp 0;
+            border-bottom: 1dp #2c2c30;
+        }
+        .row .label { flex: 1; color: #d8d8d8; }
+        .row .label .sub { display: block; color: #8a8a8a; font-size: 12dp; }
+        select, input.text {
+            width: 200dp;
+            padding: 6dp 8dp;
+            background-color: #2a2a30;
+            border: 1dp #45454d;
+            border-radius: 6dp;
+            color: #f0f0f0;
+        }
+        input.range { width: 180dp; }
+        .row.accent { background-color: #20242c; border: 1dp #2f6db0; border-radius: 8dp; padding: 10dp; }
+        .row.accent .label { color: #6fb0ff; }
+        #back {
+            display: block;
+            width: 160dp;
+            margin-top: 24dp;
+            padding: 10dp;
+            text-align: center;
+            background-color: #2a2a30;
+            border: 1dp #45454d;
+            border-radius: 8dp;
+        }
+        #back:hover { border-color: #f2c14e; }
+    </style>
+</head>
+<body>
+    <div id="config_root">
+        <h1>Graphics</h1>
+        <p class="hint">High refresh rate is interpolated by the renderer — game speed stays identical.</p>
+        <form id="graphics_form">
+            <div class="row accent">
+                <span class="label">Refresh rate<span class="sub">Frame interpolation target</span></span>
+                <select id="rr_option">
+                    <option value="Original">Original (game rate)</option>
+                    <option value="Display">Match display</option>
+                    <option value="Manual">Manual</option>
+                </select>
+            </div>
+            <div class="row">
+                <span class="label">Manual FPS target<span class="sub">Used when refresh rate is Manual</span></span>
+                <input id="rr_manual" class="range" type="range" min="30" max="240" step="1" value="144"/>
+            </div>
+            <div class="row">
+                <span class="label">Resolution</span>
+                <select id="res_option">
+                    <option value="Original">Original (native)</option>
+                    <option value="Original2x">2x</option>
+                    <option value="Auto">Auto (window scale)</option>
+                </select>
+            </div>
+            <div class="row">
+                <span class="label">Window mode</span>
+                <select id="wm_option">
+                    <option value="Windowed">Windowed</option>
+                    <option value="Fullscreen">Fullscreen</option>
+                </select>
+            </div>
+            <div class="row">
+                <span class="label">Anti-aliasing</span>
+                <select id="msaa_option">
+                    <option value="None">None</option>
+                    <option value="MSAA2X">MSAA 2x</option>
+                    <option value="MSAA4X">MSAA 4x</option>
+                    <option value="MSAA8X">MSAA 8x</option>
+                </select>
+            </div>
+            <div class="row">
+                <span class="label">Aspect ratio</span>
+                <select id="ar_option">
+                    <option value="Original">Original</option>
+                    <option value="Expand">Expand</option>
+                    <option value="Manual">Manual</option>
+                </select>
+            </div>
+            <div class="row">
+                <span class="label">HUD ratio</span>
+                <select id="hr_option">
+                    <option value="Original">Original</option>
+                    <option value="Clamp16x9">Clamp 16:9</option>
+                    <option value="Full">Full</option>
+                </select>
+            </div>
+            <div class="row">
+                <span class="label">High-precision framebuffer</span>
+                <select id="hpfb_option">
+                    <option value="Auto">Auto</option>
+                    <option value="On">On</option>
+                    <option value="Off">Off</option>
+                </select>
+            </div>
+        </form>
+        <div id="back">Back</div>
+    </div>
+</body>
+</rml>

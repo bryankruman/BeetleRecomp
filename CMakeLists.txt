@@ -22,9 +22,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# RmlUi menu UI is OFF by default for now (it needs Freetype — see BUILDING.md). The core
-# port (recompiled code + runtime + RT64) builds without it. Enable with -DBEETLE_ENABLE_UI=ON.
-option(BEETLE_ENABLE_UI "Build the RmlUi menu UI (requires Freetype)" OFF)
+# Tier-2 settings/launcher menu (src/ui, RmlUi over RT64). OFF by default so the core port still
+# configures without the Freetype submodule; turn on with -DBEETLE_ENABLE_UI=ON after adding it:
+#   git submodule add https://github.com/ubawurinna/freetype-windows-binaries.git lib/freetype-windows-binaries
+# The core port (recompiled code + runtime + RT64) builds with it OFF.
+option(BEETLE_ENABLE_UI "Build the RmlUi settings/launcher menu (requires the Freetype submodule)" OFF)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-everything /W4")
@@ -52,15 +54,34 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_definitions(rt64 PRIVATE __PRFCHWINTRIN_H)
 endif()
 
-# ---- UI libs (RmlUi + lunasvg). Gated OFF by default: RmlUi requires Freetype. On Windows,
-# add the lib/freetype-windows-binaries submodule + set FREETYPE_LIBRARY/FREETYPE_INCLUDE_DIRS
-# before this block, then configure with -DBEETLE_ENABLE_UI=ON. ----
+# ---- UI libs (RmlUi + lunasvg + Freetype). The Tier-2 settings/launcher menu (src/ui) is built
+# when -DBEETLE_ENABLE_UI=ON. RmlUi needs Freetype: on Windows we point it at the prebuilt
+# lib/freetype-windows-binaries submodule (add it once with:
+#   git submodule add https://github.com/ubawurinna/freetype-windows-binaries.git lib/freetype-windows-binaries
+# ); on Linux/macOS the system Freetype is found. ----
 if (BEETLE_ENABLE_UI)
+    # Satisfy RmlUi's find_package("Freetype") + Freetype::Freetype requirement. On Windows the
+    # standard FindFreetype can't locate the prebuilt binaries' spaced path, so create the imported
+    # target ourselves before RmlUi's dependency scan runs.
+    if (WIN32 AND NOT TARGET Freetype::Freetype)
+        set(BAR_FT_DIR "${CMAKE_SOURCE_DIR}/lib/freetype-windows-binaries")
+        if (NOT EXISTS "${BAR_FT_DIR}/include/ft2build.h")
+            message(FATAL_ERROR
+                "BEETLE_ENABLE_UI=ON but lib/freetype-windows-binaries is missing. Add it with:\n"
+                "  git submodule add https://github.com/ubawurinna/freetype-windows-binaries.git lib/freetype-windows-binaries")
+        endif()
+        add_library(Freetype::Freetype STATIC IMPORTED)
+        set_target_properties(Freetype::Freetype PROPERTIES
+            IMPORTED_LOCATION "${BAR_FT_DIR}/release static/vs2015-2022/win64/freetype.lib"
+            INTERFACE_INCLUDE_DIRECTORIES "${BAR_FT_DIR}/include")
+    endif()
+
     set(BUILD_SHARED_LIBS OFF)
     set(LUNASVG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     add_subdirectory(${CMAKE_SOURCE_DIR}/lib/lunasvg)
     set(RMLUI_SVG_PLUGIN ON CACHE BOOL "" FORCE)
     set(RMLUI_TESTS_ENABLED OFF CACHE BOOL "" FORCE)
+    set(RMLUI_BACKEND "none" CACHE STRING "" FORCE)   # we compile only the SDL platform shim ourselves
     add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RmlUi)
     target_compile_definitions(rmlui_core PRIVATE LUNASVG_BUILD_STATIC)
 endif()
@@ -116,13 +137,15 @@ add_executable(BeetleRecomp
     ${CMAKE_SOURCE_DIR}/src/main/bar_config.cpp          # feature/settings flags (fast-boot, etc.)
     ${CMAKE_SOURCE_DIR}/src/main/bar_preempt.cpp         # cooperative audio-thread preemption (no-underrun)
     ${CMAKE_SOURCE_DIR}/src/main/bar_crash.cpp           # symbolized crash backtrace (debug aid)
+    ${CMAKE_SOURCE_DIR}/src/game/config.cpp              # host-owned settings persistence + high-FPS enable
     ${CMAKE_SOURCE_DIR}/rsp/aspMain.cpp                  # RSPRecomp output: BAR audio ucode (M_AUDTASK)
     # TODO(BAR): add as authored (mirroring Zelda's src/main + src/game):
     #   src/main/register_patches.cpp
-    #   src/game/input.cpp / config.cpp
+    #   src/game/input.cpp
 )
 target_include_directories(BeetleRecomp PRIVATE
     ${RECOMP_INCLUDES}
+    ${CMAKE_SOURCE_DIR}/src                         # "game/config.hpp", etc.
     ${CMAKE_SOURCE_DIR}/RecompiledFuncs            # recomp_overlays.inl + funcs.h
     ${CMAKE_SOURCE_DIR}/lib/rt64/src
     # rt64_render_context.cpp includes RT64's internal headers, which pull in vendored contrib
@@ -182,8 +205,51 @@ target_link_libraries(BeetleRecomp PRIVATE
     ultramodern
     rt64
 )
+# ---------------------------------------------------------------------------
+# Tier-2 settings/launcher menu (src/ui) — RmlUi rendered through RT64.
+# ---------------------------------------------------------------------------
 if (BEETLE_ENABLE_UI)
+    target_sources(BeetleRecomp PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/ui/ui_renderer.cpp                  # RmlUi -> RT64 (plume) render bridge
+        ${CMAKE_SOURCE_DIR}/src/ui/bar_ui.cpp                       # bootstrap + render hooks + menu controller
+        ${CMAKE_SOURCE_DIR}/lib/RmlUi/Backends/RmlUi_Platform_SDL.cpp  # SystemInterface_SDL + SDL->RmlUi input
+    )
+    target_compile_definitions(BeetleRecomp PRIVATE
+        BEETLE_ENABLE_UI
+        RMLUI_SDL_VERSION_MAJOR=2          # the SDL platform backend targets SDL2
+    )
+    target_include_directories(BeetleRecomp PRIVATE
+        ${CMAKE_SOURCE_DIR}/lib/RmlUi/Include
+        ${CMAKE_SOURCE_DIR}/lib/RmlUi/Backends
+        ${CMAKE_SOURCE_DIR}/lib/rt64/src/rhi              # rt64_render_hooks.h
+        ${CMAKE_SOURCE_DIR}/lib/rt64/src/render           # rt64_texture_cache.h
+        ${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/plume    # plume_render_interface_builders.h
+        ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/thirdparty/concurrentqueue
+        ${CMAKE_BINARY_DIR}/shaders                        # generated Interface{VS,PS}.hlsl.{dxil,spirv}.h
+    )
     target_link_libraries(BeetleRecomp PRIVATE RmlUi::Core RmlUi::Debugger lunasvg)
+
+    # ---- DXC options (RT64 doesn't export these to the parent scope) for build_*_shader() ----
+    set(DXC_COMMON_OPTS "-I${CMAKE_SOURCE_DIR}/src/ui/shaders")
+    set(DXC_DXIL_OPTS "-Wno-ignored-attributes")
+    set(DXC_SPV_OPTS "-spirv" "-fspv-target-env=vulkan1.0" "-fvk-use-dx-layout")
+    set(DXC_PS_OPTS "${DXC_COMMON_OPTS}" "-E" "PSMain" "-T" "ps_6_0")
+    set(DXC_VS_OPTS "${DXC_COMMON_OPTS}" "-E" "VSMain" "-T" "vs_6_0" "-fvk-invert-y")
+    if (WIN32)
+        set(DXC "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc.exe")
+    elseif (CMAKE_SYSTEM_NAME MATCHES "Linux")
+        set(DXC "LD_LIBRARY_PATH=${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/x64" "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc-linux")
+    endif()
+    # Compile the RmlUi interface shaders into C blobs the render bridge #includes. Output lands in
+    # ${CMAKE_BINARY_DIR}/shaders/ (matching the include dir + the InterfaceVS/PS blob names).
+    build_vertex_shader(BeetleRecomp "src/ui/shaders/InterfaceVS.hlsl" "shaders/InterfaceVS.hlsl")
+    build_pixel_shader(BeetleRecomp  "src/ui/shaders/InterfacePS.hlsl" "shaders/InterfacePS.hlsl")
+
+    # ---- Ship the UI assets (documents, stylesheet, fonts) next to the exe under assets/ui/ ----
+    add_custom_command(TARGET BeetleRecomp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:BeetleRecomp>/assets/ui"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/src/ui/assets" "$<TARGET_FILE_DIR:BeetleRecomp>/assets/ui")
 endif()
 
 # ---- Bring-up crash diagnosis: embed debug info (/Z7) in the boot-path targets + emit a PDB.

@@ -34,6 +34,16 @@
 #include "librecomp/rsp.hpp"                  // recomp::rsp::callbacks_t, RspUcodeFunc, OSTask
 #include "librecomp/overlays.hpp"             // overlay table (registration lives in register_overlays.cpp)
 
+#include "game/config.hpp"                    // bar::config — settings persistence + high-FPS enable
+
+#ifdef BEETLE_ENABLE_UI
+#include "ui/bar_ui.h"                        // bar_ui — RmlUi launcher + settings menu (Tier 2)
+#endif
+
+// The ROM the launcher's "Play" button loads (also the auto-start ROM when the UI is disabled).
+// Set in main() before recomp::start() so the create_window callback can hand it to bar_ui.
+static std::filesystem::path g_default_rom_path;
+
 #define SDL_MAIN_HANDLED                      // we provide our own main()/entry; don't let SDL hijack it
 #include <SDL.h>
 #include <SDL_syswm.h>                        // SDL_GetWindowWMInfo -> native HWND
@@ -158,6 +168,14 @@ static ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callba
     // create_window runs on the same (main) thread that pumps update_gfx below, so the
     // window's owning thread id is this thread.
     g_bar_hwnd = wm_info.info.win.window;
+
+#ifdef BEETLE_ENABLE_UI
+    // Register the RmlUi render hooks now, before the gfx thread constructs RT64 (recomp::start
+    // calls create_window on this thread *before* spawning the gfx thread that runs
+    // create_render_context → app->setup, which is when RT64 fires the UI init hook).
+    bar_ui::install(g_window, g_default_rom_path);
+#endif
+
     return ultramodern::renderer::WindowHandle{ wm_info.info.win.window, GetCurrentThreadId() };
 }
 
@@ -167,6 +185,13 @@ static void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t /*data*/) {
         if (event.type == SDL_QUIT) {
             ultramodern::quit();
         }
+#ifdef BEETLE_ENABLE_UI
+        // While the launcher/settings menu owns input, forward events to RmlUi (drained on the
+        // render thread). Once the game starts, the menu hides and input goes to the game.
+        if (bar_ui::menu_capturing_input()) {
+            bar_ui::handle_sdl_event(event);
+        }
+#endif
     }
 }
 
@@ -422,8 +447,18 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // Config/save directory. TODO(BAR): use a proper per-user app folder, not cwd.
-    recomp::register_config_path(std::filesystem::current_path());
+    // Config/save directory: a real per-user folder (%LOCALAPPDATA%\BeetleRecomp on Windows;
+    // ~/.config/BeetleRecomp on Linux), or the exe dir when a portable.txt is present. librecomp
+    // writes saves / mod config here.
+    recomp::register_config_path(bar::config::get_app_config_directory());
+
+    // Load persisted graphics settings (or write defaults on first run) and push them into the
+    // runtime. This also enables RT64 high-FPS frame interpolation: the default config sets
+    // rr_option = Display, so presentation tracks the monitor refresh while the game/VI/audio
+    // clock stays locked at its native 60 Hz (identical game speed — see
+    // docs/SETTINGS_MENU_AND_HIGH_FPS.md). Must run before recomp::start() so the renderer reads
+    // it when it constructs the RT64 context.
+    bar::config::load_and_apply_graphics();
 
     // Teach librecomp about BAR (hash / entrypoint / save type).
     for (const auto& game : supported_games) {
@@ -434,33 +469,54 @@ int main(int argc, char** argv) {
     bar_register_overlays();
     // TODO(BAR): bar::register_patches(); once patches exist.
 
-    // ---- Pick + validate the ROM, then start the game (no menu UI yet) ----
-    // The game thread blocks in wait_for_game_started() until start_game() runs; with no UI to
-    // pick a ROM, we do it here. create_render_context() runs inside preinit *before*
-    // wait_for_game_started(), so starting the game now does not race renderer init.
-    std::filesystem::path rom_path = (argc > 1)
+    // ---- ROM source ----
+    // The launcher's "Play" button loads this ROM; with the UI disabled it's the auto-start ROM.
+    g_default_rom_path = (argc > 1)
         ? std::filesystem::path(argv[1])
-        : std::filesystem::path("C:/Users/Bryan/Downloads/Beetle Adventure Racing (USA).z64"); // TODO(BAR): real ROM picker
+        : std::filesystem::path("C:/Users/Bryan/Downloads/Beetle Adventure Racing (USA).z64"); // TODO(BAR): native ROM picker
 
     std::u8string game_id = supported_games[0].game_id;
-    recomp::RomValidationError rom_err = recomp::select_rom(rom_path, game_id);
-    if (rom_err != recomp::RomValidationError::Good) {
-        message_box(("Could not load ROM \"" + rom_path.string() + "\" (validation error "
-                     + std::to_string(static_cast<int>(rom_err)) + ")").c_str());
-        return EXIT_FAILURE;
-    }
-    // Start the game once the renderer is up. The VI thread only seeds a dummy OSViMode while
-    // !is_game_started() (ultramodern events.cpp); starting before its first tick makes update_vi()
-    // dereference a null mode. recomp::start() below blocks running the event loop, so defer this to
-    // a detached thread that waits for the renderer-ready signal plus a margin for the first VI tick.
-    std::thread([game_id]() {
-        // Wait until the renderer has presented at least one frame (g_bar_vi_ticked), which means the
-        // VI thread has ticked and seeded a dummy OSViMode. Starting before that races the VI thread
-        // into a null-mode deref. Cap the wait (~5s) so we never hang if presentation stalls.
+
+    // Coordinator: the game thread blocks in wait_for_game_started() until start_game() runs. The VI
+    // thread only seeds a dummy OSViMode while !is_game_started(); starting before its first tick
+    // makes update_vi() deref a null mode — so we wait for g_bar_vi_ticked (renderer presented a
+    // frame, which also means the launcher can draw over it). recomp::start() below blocks the main
+    // thread, so this runs on a detached thread.
+    std::thread([game_id]() mutable {   // mutable: recomp::select_rom takes a non-const std::u8string&
+        using namespace std::chrono_literals;
         for (int i = 0; i < 500 && !g_bar_vi_ticked.load(); i++) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(10ms);
+        }
+
+        std::filesystem::path rom = g_default_rom_path;
+#ifdef BEETLE_ENABLE_UI
+        // Give the launcher a moment to come up. If it does, wait for the user to press "Play";
+        // if the UI failed to initialize (missing assets, etc.), fall through and auto-start so we
+        // never leave a dead window.
+        bool menu_up = false;
+        for (int i = 0; i < 300 && !menu_up; i++) {
+            menu_up = bar_ui::menu_capturing_input();
+            std::this_thread::sleep_for(10ms);
+        }
+        if (menu_up) {
+            std::filesystem::path picked;
+            while (!bar_ui::consume_play_request(picked)) {
+                std::this_thread::sleep_for(30ms);
+            }
+            rom = picked;
+        }
+#endif
+
+        recomp::RomValidationError rom_err = recomp::select_rom(rom, game_id);
+        if (rom_err != recomp::RomValidationError::Good) {
+            message_box(("Could not load ROM \"" + rom.string() + "\" (validation error "
+                         + std::to_string(static_cast<int>(rom_err)) + ")").c_str());
+            return;
         }
         recomp::start_game(game_id);
+#ifdef BEETLE_ENABLE_UI
+        bar_ui::on_game_started();   // hide the launcher and release input to the game
+#endif
     }).detach();
 
     // ---- Assemble callbacks (field names verified against the vendored headers) ----

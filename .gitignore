@@ -40,3 +40,4 @@ CMakeUserPresets.json
 *.user
 .DS_Store
 Thumbs.db
+.z64ref/

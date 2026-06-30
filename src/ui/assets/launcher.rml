@@ -1,0 +1,65 @@
+<rml>
+<head>
+    <title>Beetle Adventure Racing</title>
+    <style>
+        body {
+            font-family: LatoLatin;
+            font-size: 18dp;
+            color: #e8e8e8;
+            width: 100%;
+            height: 100%;
+            background-color: #000000c0;
+        }
+        #panel {
+            width: 460dp;
+            margin: auto;
+            margin-top: 120dp;
+            padding: 32dp;
+            background-color: #1b1b1ef0;
+            border: 1dp #3a3a40;
+            border-radius: 12dp;
+            text-align: center;
+        }
+        h1 {
+            font-size: 30dp;
+            color: #f2c14e;
+            margin-bottom: 8dp;
+        }
+        .subtitle { color: #9a9a9a; font-size: 14dp; margin-bottom: 28dp; }
+        .btn {
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+            padding: 12dp;
+            margin-bottom: 12dp;
+            background-color: #2a2a30;
+            border: 1dp #45454d;
+            border-radius: 8dp;
+            color: #f0f0f0;
+            text-align: center;
+        }
+        .btn:hover { background-color: #37373f; border-color: #f2c14e; }
+        .btn:active { background-color: #f2c14e; color: #1b1b1e; }
+        .btn.disabled { color: #777; border-color: #333; }
+        #mods { margin-top: 24dp; text-align: left; }
+        #mods h2 { font-size: 16dp; color: #cfcfcf; margin-bottom: 8dp; }
+        #mod_list { max-height: 160dp; overflow-y: auto; }
+        .mod-row { display: flex; padding: 6dp 2dp; border-bottom: 1dp #2c2c30; }
+        .mod-name { flex: 1; }
+        .mod-empty { color: #888; font-size: 13dp; }
+    </style>
+</head>
+<body>
+    <div id="panel">
+        <h1>Beetle Adventure Racing</h1>
+        <p class="subtitle">Recompiled · PC port</p>
+        <div id="play" class="btn">Play</div>
+        <div id="settings" class="btn">Settings</div>
+        <div id="quit" class="btn">Quit</div>
+        <div id="mods">
+            <h2>Mods</h2>
+            <div id="mod_list"><p class="mod-empty">No mods installed.</p></div>
+        </div>
+    </div>
+</body>
+</rml>
