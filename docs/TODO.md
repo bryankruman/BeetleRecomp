@@ -16,21 +16,19 @@ previously scattered across [STATUS.md](STATUS.md) (the "Current WIP" + "Still s
 
 ## Active priorities — requested 2026-06-30 (round 2)
 
-### R1. 🚧 Restart-game function in the pause menu
-Reboot the running game back to its boot/entrypoint without exiting the app. Needs game-lifecycle
-support (re-run the entrypoint / reset RDRAM, or relaunch the process). **Files:** `src/ui/...pause.rml`,
-`src/ui/bar_ui.cpp`, `src/main/main.cpp`, possibly `lib/N64ModernRuntime/librecomp`.
+### R1. ✅ Restart-game function in the pause menu — DONE 2026-06-30 (c480a2f)
+`bar_restart_game()` (main.cpp) relaunches the exe with the same args (CreateProcess + GetCommandLineA)
+then quits — the recompiled game can't be cleanly re-entered in-process. Pause menu "Restart Game".
 
-### R2. 🚧 Pause menu "Main Menu" should close out the game
-Going back to the main menu from the pause menu should END the current game session (not overlay the
-launcher on the running game). **Files:** `src/ui/bar_ui.cpp`, `src/main/main.cpp`.
+### R2. ✅ Pause menu "Main Menu" closes the game — DONE 2026-06-30 (c480a2f)
+There is no non-running main menu under the overlay model, so the close-out action is "Quit Game"
+(`ultramodern::quit()`), which replaced "Main Menu" in the pause menu.
 
-### R3. 🚧 Pause menu should pause the ENTIRE simulation (emulator-style)
-A true freeze, not the current soft pause. The hard part: the overlay needs the renderer to keep
-presenting, but RT64 stops presenting once the game thread is frozen (verified). Likely approach:
-freeze the game's VI/AI advancement AND have the render context re-submit the last display list each
-frame so RT64 keeps rendering the frozen scene. **Files:** `src/main/rt64_render_context.cpp`,
-`lib/N64ModernRuntime/ultramodern/src/events.cpp`, `src/ui/bar_ui.cpp`.
+### R3. ✅ Emulator-style true pause — DONE 2026-06-30 (c480a2f, runtime 5d7b382)
+Freeze the sim (gate VI/AI in `vi_thread_func`) AND re-submit the last frame's display lists each
+frame in the render context so RT64 keeps presenting the frozen scene → the overlay stays live.
+Heartbeat-verified: pause freezes the sim with draw_hook still ~60fps; resume continues; no crash.
+See memory `menu-and-high-fps-research` for the technique.
 
 ### R4. ⬜ Settings to enhance render resolution
 Expose internal render-resolution scaling (RT64 `resolutionMultiplier` / the `ds_option` supersample
@@ -43,10 +41,16 @@ car LOD selection in the decomp (`lib/bar-decomp` car/model modules) and a host 
 or RDRAM poke / patch. **Files:** `lib/bar-decomp` (find LOD logic), `src/main/bar_config.cpp` or a cheat.
 
 ### R6. 🚧 Fix the main-menu transition flash while KEEPING the animation
-The one-frame background flash on menu page-slides was "fixed" by disabling the transition animation;
-restore the animation and fix the flash properly (likely an RT64 framebuffer-as-texture reconstruction
-with no tracked target during the slide). **Files:** find the disable (fix-recompiled.sh rule /
-`lib/bar-decomp`), `lib/rt64`, possibly a `patches/` workaround.
+**Investigated 2026-06-30:** the animation is NOT disabled anywhere — no `NOFILMROLL`/film-roll flag,
+no fix-recompiled rule, no committed change, no env var. The `filmroll` module
+(`lib/bar-decomp/src/modules/filmroll.c`, GLOBAL_ASM) and the selection slide
+(`func_selection_00418800`) are present and active. So the perceived "disabled animation" is the
+STATUS-3 **flash** making the slide look broken/cut — not an actual disable. The flash is an RT64 HLE
+framebuffer issue (the slide samples a just-written FB with no tracked RT64 target → 1-frame flash).
+**Next (needs runtime tracing):** capture the slide in RenderDoc / RT64 debug to confirm which FB
+address is mis-reconstructed during `func_selection_00418800`, then an RT64-side fix in the framebuffer
+renderer (`lib/rt64/src/render/`) to clear/skip the reconstructed tile when there's no tracked target.
+Requires the machine for frame capture; see STATUS.md item 3.
 
 ---
 
