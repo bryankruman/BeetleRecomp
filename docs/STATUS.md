@@ -1,23 +1,93 @@
 # Project Status & Resume Guide
 
-_Last updated: 2026-06-28_
+_Last updated: 2026-06-30_
 
 ## TL;DR
-- ✅ **Builds + links** → `build-cmake/BeetleRecomp.exe` (native Windows, clang-cl).
-- ✅ **Boots deep into the game** (2026-06-28 night) — RT64 (D3D12, confirmed on an RTX 3080)
-  initializes, the SDL window opens, the ROM is recognized, libultra inits, the **uv module
-  overlay bridge** registers modules as they load (57+ modules, `func_map` resolves with zero
-  "Failed to find function" errors), and recompiled module code executes.
-- ✅ **Runs without crashing** — 78 modules register correctly (zero "Failed to find function"),
-  audio + VI work, RT64 presents at 60 Hz. The earlier crashes were a **wrong nameTag→overlay_id
-  table** (the `*_rom`/`*ld_rom` pairs were swapped); fixed from the authoritative
-  `lib/bar-decomp/tools/convPartialModule.py`. (The "recomp.ld exports-layout" theory was WRONG —
-  an artifact of comparing two swapped modules; recomp.ld is fine.)
-- ✅ **Minimal controller wired** — reports port 1 connected, so the game passes its controller
-  check (no longer drops into `uvShowNoController`). Real key/stick mapping still TODO.
-- ⛔ **Black screen** — `func_80000450` (game main) is running its main loop but the per-frame render
-  submits no `M_GFXTASK` (`send_dl` = 0), so the (real) framebuffer is never drawn. Not a
-  crash/stub. See [Next step](#next-step-black-screen-game-main-runs-but-submits-no-gfx).
+- ✅ **Builds + links + runs** → `build-cmake/BeetleRecomp.exe` (native Windows, clang-cl, RT64/D3D12).
+- ✅ **Plays** — boots through the intros/menus into races, **renders at 60 fps**, **keyboard input**
+  works, and **audio plays**. The boot/menu pipeline (uv module overlay bridge, 78 modules, zero
+  "Failed to find function"), VI, SI, RSP gfx + audio tasks all run.
+- ✅ **Black screen FIXED** — it was a controller/SI `osRecvMesg` deadlock, not a gfx problem. Renders
+  60 fps now. (Commit `b92a2cc`.)
+- ✅ **Menu 60 fps** — was ~10 fps from an SI-queue requeue busy-spin; `requeue_si=false` (main.cpp:507).
+- ✅ **Audio working** — RSP `aspMain` ucode wired; correct PCM transform (no-byteswap + channel-swap);
+  latency + transition-crackle fixed (see WIP item 2 below).
+- ✅ **Coventry Cove crash FIXED** — heap OOM; heap cap extended 4 MB → 8 MB (`fix-recompiled.sh` rule A).
+- 🚧 **Current focus: polish.** Four items raised 2026-06-30 — see **[Current WIP](#current-wip--polish-items-2026-06-30)**.
+  Audio (item 2) is done; legal-screen skip, menu-transition flash, and track-map fps remain.
+
+## Current WIP — polish items (2026-06-30)
+
+Four issues were raised together; each was investigated with a verified multi-agent workflow. Status:
+
+### 1. Legal/logo screen skip — 🚧 TODO (attract part done)
+**Goal:** make the boot legal screens (Licensed by Nintendo, Electronic Arts, trademark/legal) **and**
+the attract cinematics skippable by pressing **A / B / or Start** — *except* the first controller-pak /
+"continue without saving" prompt, which must stay non-skippable.
+- ✅ **Attract cinematics** already skip on A/B/Start: the game skips on START/A in
+  `func_intro_004005CC`; we inject a B-button check after the `0x81D00618` input read
+  (`fix-recompiled.sh` **rule D**, gated by `bar_intro_skip()` in `src/main/bar_config.cpp`).
+- ❌ **Legal/logo screens NOT skippable yet.** They are driven by **un-decompiled boot assembly** whose
+  per-frame handler hasn't been pinned down (`func_selection_004000E4`'s sub-handler is null during boot;
+  the `logo` UVBT module didn't load in the boot trace; the legal text is likely uvFont-rendered by an
+  un-found handler on a `uvClkGetSec` timer). The workflow agent for this item **failed** (hit the
+  structured-output retry cap), so there is no lead yet.
+- **Next:** recreate the in-process stack sampler (see memory `debug-build-run-loop`) to catch the active
+  `func_*` during the EA/Nintendo screen, **or** instrument the 'game' module per-frame dispatch
+  (`gGameExports->unk4`) to find the boot-screen driver, then add an A/B/Start check to its timer-advance.
+  Keep the controller-pak prompt non-skippable.
+
+### 2. Audio latency + clipping — ✅ DONE
+- **Ever-growing latency** (audio played seconds behind the game): `osAiGetLength()` (`func_8000E460`,
+  `src/main/hw_stubs.cpp`) was hard-stubbed to `0`, so the audio manager always thought the AI buffer was
+  empty and synthesized the **max** samples every frame, flooding the unbounded SDL queue. **Fixed:** it
+  now returns `ultramodern::get_remaining_audio_bytes()`. Queue is bounded; latency is small + constant.
+- **Transition crackle** (underrun on every menu/state change): `func_uvcmidi_rom_00400940` stops the MIDI
+  sequence player then **spins up to its 2.0 s timeout** waiting for the player to report stopped — but the
+  player state only advances when the audio thread runs, which the cooperative scheduler couldn't do mid-
+  spin. So it burned the full 2 s, starving audio. **Fixed:** inject `yield_self_1ms` into that loop
+  (`fix-recompiled.sh` **rule E**).
+- **General audio-thread starvation** during long game-thread compute (no preemption in the cooperative
+  scheduler): **cooperative preemption** — a ~500 Hz host timer (`src/main/bar_preempt.cpp`) raises a
+  "yield" flag; a one-line poll injected at every recompiled-function prologue (`fix-recompiled.sh`
+  **rule F**) yields the App thread to the audio manager via `yield_self_1ms`. Gated to the **low-priority
+  App thread only** (`ultramodern::this_thread_priority() < 100`) — yielding on the audio/scheduler threads
+  themselves silenced audio and crashed; the priority gate fixes that. N64-correct; stable.
+- **Buffer floor:** `buffer_offset_frames` default **2.5** (`ultramodern/src/audio.cpp`); ~1 VI (1.0) is too
+  thin for glitch-free *desktop* audio (host OS + SDL device-callback jitter dip the queue regardless of the
+  game-side fixes). Live-tunable with **`BAR_AUDIO_BUFFER`** (e.g. `=1.8`) to trade latency vs crackle.
+- _Possible future latency win (untried): shrink the SDL device buffer (`want.samples`, currently 1024 ≈
+  46 ms) in `bar_open_audio` — a separate latency lever from the queue offset._
+
+### 3. Menu page-transition background flash — 🚧 TODO (workflow fix REFUTED)
+**Symptom:** a one-frame flash in the background each time the menu slides to the next page.
+- ⚠️ The workflow's proposed fix is **wrong — do NOT ship it.** Both adversarial reviewers refuted it: it
+  rests on `func_selection_00418800` reading a UvGfxMgr export struct at `0x80025C74`, but that address is
+  `gGameGuiExports` (the real gfx-mgr struct is `0x80025C08`). The recommended `func_uvgfxmgr_rom_00400F58`
+  edit is outside the transition path and would risk a regression.
+- **Directionally likely (unproven):** RT64 is HLE and reconstructs framebuffer-as-texture by RDRAM address;
+  a 1-frame flash when the slide samples a just-written FB with **no tracked RT64 target yet** is a plausible
+  class of bug.
+- **Next:** re-decode `func_selection_00418800` (`funcs_5.c:2226-2312`) against the **real** callees
+  (`gUvGuiExports->+0x70/74/78` = `uvgui_rom`; `gGameGuiExports->+0x14` = gamegui) to find which RDRAM
+  address is captured as the slide source; capture (RT64 debug / RenderDoc) whether the slide's first frame
+  samples an FB address with no tracked target. If so, the low-risk fix is RT64-side: in
+  `lib/rt64/.../rt64_framebuffer_manager.cpp`, clear the reconstructed tile to transparent when there is
+  genuinely no tracked target for the requested address (never when one exists — preserve real FB feedback).
+
+### 4. Track-map preview animates choppy/low-fps — 🚧 TODO (needs one live trace)
+**Symptom:** the spinning 3D track-map preview on the map-select screen animates at a low/glitchy frame rate
+while the rest of the menu is smooth 60 fps.
+- **Proven negatives (do not re-litigate):** it is **not** the whole-frame divider (`D_8001F7C0`,
+  `funcs_45.c`), **not** renderer interpolation (off — `RefreshRate::Original`), and the time base
+  `func_uvgfxmgr_rom_00401004()` is correct. The map-update site is in `selection.c` (100% GLOBAL_ASM),
+  so the positive cause can't be read statically. Do NOT touch `speed_multiplier` / the VI clock.
+- **Next (one decisive live experiment):** log per VI frame — (a) the map rotation angle, (b)
+  `func_uvgfxmgr_rom_00401004()` real sec/frame, (c) a present-cadence timestamp; also read
+  `D_uvgfxmgr_rom_00402480`. Classify → **Fix A** scale the per-tick step by real delta (idiom at
+  `uvtseq_rom.c:243`, most likely), **Fix B** ungate an every-N update, **Fix C** drive the keyframe phase
+  continuously, or it's a gfx-completion present-cadence stall. The fix lands in `RecompiledFuncs/` → it
+  **must** be encoded as an address-keyed `fix-recompiled.sh` rule.
 
 ## What works
 The full static-recompilation pipeline compiles end to end:
@@ -102,10 +172,14 @@ See [BUILDING.md](../BUILDING.md).
   symbols on the boot-path targets (RT64 stays Release).
 
 ## Still stubbed / not done
-- The 9 OS functions (`os_unimpl_stubs.cpp`) remain no-ops (threading / VI / SI / PI / timer).
-- Audio (RSP `aspMain` ucode) and input (SDL→N64) are stubs.
-- `enable_instant_present` is a no-op; `get_display_framerate` returns 60; `get_resolution_scale`
-  is minimal (these are fine for bring-up).
+- Most `os_unimpl_stubs.cpp` functions stay no-ops, but **`__osSiRawStartDma` now has real behavior**
+  (posts the SI completion + writes a controller-read response into PIF RAM — this is what unblocked input
+  and the black screen). Others (`__osViSwapContext`, `__osTimerInterrupt`, PI/thread-queue) remain no-ops.
+- **Input:** keyboard → N64 pad is wired (`bar_poll_keyboard`); real gamepad mapping + a rebind UI are TODO.
+- **High-FPS / interpolation:** `enable_instant_present` is still a no-op and `get_display_framerate`
+  returns 60 — RT64 frame interpolation is not yet enabled. Design + a partial implementation live on branch
+  `feature/settings-menu-and-high-fps`; see [SETTINGS_MENU_AND_HIGH_FPS.md](SETTINGS_MENU_AND_HIGH_FPS.md).
+- **Settings menu:** none yet (env-var flags only — `BAR_*`); the in-game menu is on the feature branch.
 
 ## How to build + run + debug (Windows, headless)
 ```bash
@@ -125,42 +199,32 @@ renamed to `uvDoModuleRelocs_orig` by `fix-recompiled.sh`). On each module load 
 `nameTag -> overlay_id` table (overlays.us.txt order; tags from the decomp's
 `tools/daisybox/src/bar_module_files.c`), then `unload_overlay_by_id` + `load_overlay_by_id(id,
 ovlStartPtr)` and runs `uvDoModuleRelocs_orig`. Result: 57+ modules register, `func_map` resolves,
-recompiled module code runs. (Also: VI null-mode race fixed via `g_bar_vi_ticked` gate; audio RSP
-task no-op-stubbed in `get_rsp_microcode`; AI-length hardware read stubbed in `hw_stubs.cpp`.)
+recompiled module code runs. (Also: VI null-mode race fixed via `g_bar_vi_ticked` gate. The RSP audio
+task `aspMain` is now wired in `get_rsp_microcode` — no longer stubbed; and `hw_stubs.cpp`'s AI-length read
+now returns the real queued length, not 0 — see WIP item 2.)
 
-## Next step: black screen (game main runs but submits no gfx)
-Narrowed via wrap-instrumentation (`fix-recompiled.sh`-style rename → native wrapper). Findings:
-- `update_screen` runs at 60 Hz; VI origin moves dummy (`0x00700280`) → real fb (`0x00100280`).
-- `send_dl` count = **0** — no `M_GFXTASK` ever submitted → the presented fb is never drawn → black.
-- **`uvShowNoController` is NOT entered** — the game passed its controller check
-  (`game_init.c:117 gUvContExports->unk8(0)`), thanks to the wired minimal controller.
-- **`func_80000450` (the game main, `game_init.c:23`) entered and never returned** — so it's running
-  its main loop `while (gUvContExports->unk4() != 0) { gGameExports->unk4(); … }` (game_init.c:133)
-  but the per-frame `gGameExports->unk4()` produces no display list. Game is alive (audio + VI run).
+## ✅ RESOLVED: black screen (was a controller/SI deadlock, not gfx)
+The "no `M_GFXTASK` submitted" symptom was downstream of a **controller (SI) `osRecvMesg` deadlock**:
+BAR drives the controller through the low-level libultra path (`__osSiRawStartDma`), which our runtime
+stubbed — so the game blocked forever waiting for an SI-complete event and never reached its render. **Fix**
+(`src/main/os_unimpl_stubs.cpp`, commit `b92a2cc`): `__osSiRawStartDma_recomp` posts the SI completion
+(`ultramodern::send_si_message()`) and writes a real controller-read response into PIF RAM. Also forced
+`__osMaxControllers` to 4 (`fix-recompiled.sh` rule B) so a `READ_BUTTON` command is actually packed. The
+game now renders at 60 fps and reads keyboard input.
 
-So the stall is inside the **game module's per-frame render** (`gGameExports->unk4`) or the loop
-condition (`gUvContExports->unk4`) — not a crash/stub/missing-func, and not the no-controller path.
+## Common diagnostic env flags
+`BAR_FPS` (fps counter) · `BAR_NO_AUDIO` (disable audio) · `BAR_AUDIO_DBG` (queue min/max + underrun + peak/
+clip) · `BAR_AUDIO_BUFFER=<vi>` (audio buffer depth, default 2.5) · `BAR_AUDIO_XFORM` / `BAR_AUDIO_CAPTURE`
+(PCM transform / capture) · `BAR_DEBUG_OVERLAYS` (log module loads) · `BAR_NO_INTRO_SKIP` (disable A/B/Start
+intro skip) · `BAR_AUTOPLAY="frames:hexbtn …"` (scripted input: A=8000 B=4000 START=1000 UP=0800) ·
+`BAR_FORCESTATE="frame:state …"` (force `gGameSettings->gameStateFlag`).
 
-**Blocker:** no headless debugger works here — lldb *attach* hangs after the attach breakpoint;
-`comsvcs.dll MiniDump full` produces a dump lldb rejects ("data is invalid") and won't make a
-standard (non-full) dump; no cdb/procdump installed. And `gGameExports->unk4`/`gUvContExports->unk4`
-are reached via exports structs filled in **undecompiled asm entrypoints**
-(`__entrypoint_func_{game,uvcont}_rom_400000.s`), so finding their recompiled `func_*` names to wrap
-is slow.
-
-**To do (pick one):**
-1. **Get one thread stack** — attach **Visual Studio** to `BeetleRecomp.exe`, Break All, inspect the
-   `Game …`/App thread (the one in `func_80000450`/`uvSetGameState`/an `osRecvMesg`). That pinpoints
-   the stall in minutes. (Native Windows debugger; no PDB hang.)
-2. **Keep instrumenting** — find the recompiled `func_game_*`/`func_uvcont_rom_*` that the exports
-   `unk4` fields point to (read the recompiled module entrypoints in `RecompiledFuncs/`), wrap them
-   to see whether the loop iterates and whether the frame fn runs/bails.
-
-## Remaining roadmap (after the black screen)
-- **Input** (SDL → N64 controller) — then the title screen is actually playable.
-- **RSP audio** (`RSPRecomp` → real `aspMain`), wired into `get_rsp_microcode`.
-- Replace the 9 OS-func stubs with correct behavior if any are reached.
-- Per-game F3DEX2 rendering quirks once frames are being submitted.
+## Remaining roadmap (after the current polish items)
+- **Polish items 1/3/4** above (legal-screen skip, menu-transition flash, track-map fps).
+- **High-FPS / RT64 interpolation** — enable it (branch `feature/settings-menu-and-high-fps`).
+- **Settings menu** — surface the `BAR_*` flags (intro skip, audio buffer, high-FPS) in an in-game menu.
+- **Real gamepad input** + a rebind UI (keyboard works today).
+- Per-game F3DEX2 rendering quirks as they surface.
 
 ## Tooling note: N64Recomp builds on Windows now
 `lib/N64Recomp` (already at `ffb39cd`) builds with clang-cl + CLion's cmake/ninja →

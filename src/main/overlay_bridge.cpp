@@ -18,6 +18,7 @@
 // overlays.us.txt. overlay_id indexes recomp's overlay_sections_by_index[] (recomp_overlays.inl).
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>   // std::getenv (BAR_DEBUG_OVERLAYS gate)
 
 #include "recomp.h"   // recomp_context, gpr, MEM_W
 
@@ -86,9 +87,14 @@ extern "C" void uvDoModuleRelocs(uint8_t* rdram, recomp_context* ctx) {
         // function resolution). unload first so a re-load / address reuse re-registers cleanly.
         unload_overlay_by_id((uint32_t)overlay_id);
         load_overlay_by_id((uint32_t)overlay_id, (uint32_t)ovl_start);
-        std::fprintf(stderr, "[BeetleRecomp] overlay '%c%c%c%c' (id %d) -> 0x%08X\n",
-            (char)(name_tag >> 24), (char)(name_tag >> 16), (char)(name_tag >> 8), (char)name_tag,
-            overlay_id, (uint32_t)ovl_start);
+        // Overlays stream continuously during a race; this per-load log is a perf/spam drag, so gate
+        // it behind BAR_DEBUG_OVERLAYS (off by default). The unknown-tag WARN below stays unconditional.
+        static const bool dbg_overlays = std::getenv("BAR_DEBUG_OVERLAYS") != nullptr;
+        if (dbg_overlays) {
+            std::fprintf(stderr, "[BeetleRecomp] overlay '%c%c%c%c' (id %d) -> 0x%08X\n",
+                (char)(name_tag >> 24), (char)(name_tag >> 16), (char)(name_tag >> 8), (char)name_tag,
+                overlay_id, (uint32_t)ovl_start);
+        }
     } else {
         std::fprintf(stderr, "[BeetleRecomp] WARN: unknown module nameTag '%c%c%c%c' (0x%08X) @ 0x%08X — not registered\n",
             (char)(name_tag >> 24), (char)(name_tag >> 16), (char)(name_tag >> 8), (char)name_tag,

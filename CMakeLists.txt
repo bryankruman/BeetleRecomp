@@ -113,10 +113,13 @@ add_executable(BeetleRecomp
     ${CMAKE_SOURCE_DIR}/src/main/overlay_bridge.cpp      # registers uv modules as overlays on load
     ${CMAKE_SOURCE_DIR}/src/main/hw_stubs.cpp            # native stubs for raw RCP-register libultra funcs
     ${CMAKE_SOURCE_DIR}/src/main/rt64_render_context.cpp # RT64-backed RendererContext subclass
+    ${CMAKE_SOURCE_DIR}/src/main/bar_config.cpp          # feature/settings flags (fast-boot, etc.)
+    ${CMAKE_SOURCE_DIR}/src/main/bar_preempt.cpp         # cooperative audio-thread preemption (no-underrun)
+    ${CMAKE_SOURCE_DIR}/src/main/bar_crash.cpp           # symbolized crash backtrace (debug aid)
+    ${CMAKE_SOURCE_DIR}/rsp/aspMain.cpp                  # RSPRecomp output: BAR audio ucode (M_AUDTASK)
     # TODO(BAR): add as authored (mirroring Zelda's src/main + src/game):
     #   src/main/register_patches.cpp
     #   src/game/input.cpp / config.cpp
-    #   rsp/aspMain.cpp                    (RSPRecomp output)
 )
 target_include_directories(BeetleRecomp PRIVATE
     ${RECOMP_INCLUDES}
@@ -156,7 +159,7 @@ if (WIN32)
     set_target_properties(BeetleRecomp PROPERTIES
         LINK_FLAGS_DEBUG          "/SUBSYSTEM:CONSOLE"
         LINK_FLAGS_RELEASE        "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
-    target_link_libraries(BeetleRecomp PRIVATE SDL2 Winmm.lib)
+    target_link_libraries(BeetleRecomp PRIVATE SDL2 Winmm.lib Dbghelp.lib)   # Winmm: timeBeginPeriod; Dbghelp: crash backtrace
     # TODO(BAR): app icon -> target_sources(BeetleRecomp PRIVATE icons/app.rc)
 endif()
 

@@ -227,13 +227,6 @@ RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::WindowHandle win
 }
 
 void RT64Context::send_dl(const OSTask* task) {
-    static uint64_t s_dl_count = 0;
-    if (s_dl_count < 3 || (s_dl_count % 120) == 0) {
-        std::fprintf(stderr, "[BeetleRecomp] send_dl #%llu ucode=0x%X data=0x%X size=0x%X\n",
-            (unsigned long long)s_dl_count, (unsigned)task->t.ucode, (unsigned)task->t.data_ptr,
-            (unsigned)task->t.data_size);
-    }
-    s_dl_count++;
     app->state->rsp->reset();
     app->interpreter->loadUCodeGBI(task->t.ucode & 0x3FFFFFF, task->t.ucode_data & 0x3FFFFFF, true);
     app->processDisplayLists(app->core.RDRAM, task->t.data_ptr & 0x3FFFFFF, 0, true);
@@ -241,13 +234,6 @@ void RT64Context::send_dl(const OSTask* task) {
 
 void RT64Context::update_screen() {
     g_bar_vi_ticked.store(true);   // signals main.cpp that the VI thread has ticked (dummy mode seeded)
-    static uint64_t s_screen_count = 0;
-    if (s_screen_count < 3 || (s_screen_count % 120) == 0) {
-        ultramodern::renderer::ViRegs* vi = ultramodern::renderer::get_vi_regs();
-        std::fprintf(stderr, "[BeetleRecomp] update_screen #%llu vi_origin=0x%08X vi_width=%u\n",
-            (unsigned long long)s_screen_count, vi->VI_ORIGIN_REG, vi->VI_WIDTH_REG);
-    }
-    s_screen_count++;
     app->updateScreen();
 }
 
