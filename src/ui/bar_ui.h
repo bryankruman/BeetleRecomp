@@ -18,11 +18,25 @@
 #define BAR_UI_H
 
 #include <filesystem>
+#include <string>
+#include <vector>
 
 struct SDL_Window;
 union SDL_Event;
 
 namespace bar_ui {
+
+// A connected controller as surfaced to the Controls dialog's device dropdown. main() (which owns the
+// SDL controller handles) publishes the current list via publish_gamepads(); the render thread reads a
+// mutex-protected copy when repopulating the dialog. Only copied name/guid strings cross the thread
+// boundary — never an SDL_GameController* handle.
+struct UiGamepad { std::string guid; std::string name; };
+void publish_gamepads(const std::vector<UiGamepad>& list);
+
+// True while the Controls dialog is waiting for the user to press a key/button to (re)assign a bind.
+// main()'s SDL loop consults this to forward RAW controller events (not the menu-nav synthesis) during
+// capture, so a D-pad/A press is recorded as a bind rather than moving menu focus.
+bool rebind_listening();
 
 // Register the RT64 render hooks and remember the window + the ROM the launcher's "Play" should
 // load. Call once, before recomp::start(). Safe even if UI asset files are missing (the hooks just

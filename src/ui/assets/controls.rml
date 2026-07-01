@@ -1,0 +1,233 @@
+<rml>
+<head>
+    <title>Controls</title>
+    <style>
+        body {
+            font-family: LatoLatin;
+            font-size: 18dp;
+            color: #e8e8e8;
+            width: 100%;
+            height: 100%;
+            background-color: #000000d0;
+        }
+        /* RmlUi ships no HTML UA stylesheet: structural elements default to display:inline. Force
+           block so width/margin and vertical stacking work (same as config.rml). */
+        div, h1, h2, p, form { display: block; }
+        #controls_root {
+            width: 640dp;
+            margin: auto;
+            margin-top: 40dp;
+            padding: 28dp;
+            background-color: #1b1b1ef0;
+            border: 1dp #3a3a40;
+            border-radius: 12dp;
+        }
+        h1 { font-size: 26dp; color: #f2c14e; margin-bottom: 4dp; }
+        .hint { color: #9a9a9a; font-size: 13dp; margin-bottom: 14dp; }
+        /* Scrollable body so all four ports fit any window (same pattern as config.rml). */
+        #ports_scroll {
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+            max-height: 460dp;
+            overflow-y: auto;
+            padding-right: 6dp;
+        }
+        scrollbarvertical { width: 12dp; margin-left: 4dp; }
+        scrollbarvertical sliderbar { background-color: #4a4a52; border-radius: 6dp; min-height: 40dp; }
+        scrollbarvertical sliderbar:hover { background-color: #6a6a74; }
+        scrollbarvertical sliderbar:active { background-color: #f2c14e; }
+        scrollbarvertical sliderarrowdec, scrollbarvertical sliderarrowinc { height: 0; }
+
+        .port-card {
+            border: 1dp #3a3a40;
+            border-radius: 10dp;
+            padding: 14dp;
+            margin-bottom: 14dp;
+            background-color: #202024;
+        }
+        .port-head { display: flex; align-items: center; margin-bottom: 6dp; }
+        .port-title { flex: 1; font-size: 18dp; color: #f2c14e; }
+        /* Plugged-in pill toggle (cheats-style: C++ flips the .on class). */
+        .plug-toggle {
+            width: 92dp;
+            padding: 6dp 0;
+            text-align: center;
+            background-color: #2a2a30;
+            border: 1dp #45454d;
+            border-radius: 6dp;
+            color: #b0b0b0;
+            tab-index: auto;
+            nav: auto;
+        }
+        .plug-toggle:focus { border-color: #f2c14e; }
+        .plug-toggle.on { background-color: #244d2a; border-color: #3f9d52; color: #cfeccf; }
+
+        /* A whole card dims when unplugged, signalling its controls are inert. */
+        .port-card.unplugged .port-body { color: #6a6a6a; }
+
+        .row {
+            display: flex;
+            align-items: center;
+            width: 100%;
+            box-sizing: border-box;
+            padding: 7dp 0;
+            border-bottom: 1dp #2c2c30;
+        }
+        .row .label { flex: 1; color: #d8d8d8; }
+        select {
+            width: 220dp;
+            padding: 6dp 8dp;
+            background-color: #2a2a30;
+            border: 1dp #45454d;
+            border-radius: 6dp;
+            color: #f0f0f0;
+            tab-index: auto;
+        }
+        select:focus { border-color: #f2c14e; }
+        .profile-row .label { flex: 1; }
+        .profile-row select { width: 150dp; }
+        .btn-small {
+            width: 66dp;
+            margin-left: 8dp;
+            padding: 6dp 0;
+            text-align: center;
+            background-color: #2a2a30;
+            border: 1dp #45454d;
+            border-radius: 6dp;
+            color: #f0f0f0;
+            tab-index: auto;
+            nav: auto;
+        }
+        .btn-small:hover, .btn-small:focus { border-color: #f2c14e; }
+
+        .bind-list { margin-top: 6dp; }
+        .bind-row {
+            display: flex;
+            align-items: center;
+            padding: 5dp 2dp;
+            border-bottom: 1dp #26262a;
+            tab-index: auto;
+            nav: auto;
+        }
+        .bind-row:focus { background-color: #2a2a32; }
+        .bind-row .bind-label { flex: 1; color: #cfcfcf; font-size: 15dp; }
+        .bind-row .bind-value {
+            width: 200dp;
+            padding: 5dp 8dp;
+            text-align: center;
+            background-color: #2a2a30;
+            border: 1dp #45454d;
+            border-radius: 6dp;
+            color: #d8d8d8;
+            font-size: 14dp;
+        }
+        .bind-row.listening .bind-value { border-color: #f2c14e; color: #f2c14e; background-color: #34301f; }
+
+        #back {
+            display: block;
+            width: 160dp;
+            margin-top: 18dp;
+            padding: 10dp;
+            text-align: center;
+            background-color: #2a2a30;
+            border: 1dp #45454d;
+            border-radius: 8dp;
+            tab-index: auto;
+            nav: auto;
+        }
+        #back:hover, #back:focus { border-color: #f2c14e; background-color: #2f2f37; }
+    </style>
+</head>
+<body>
+    <div id="controls_root">
+        <h1>Controls</h1>
+        <p class="hint">A device drives at most one port. Click a bind row, then press a key or button to set it. Esc cancels.</p>
+        <div id="ports_scroll">
+            <!-- Four port cards. Device / Profile option lists and the bind rows are filled by C++
+                 (populate_controls); the Pak options are static. -->
+            <div class="port-card" id="port_0" data-port="0">
+                <div class="port-head">
+                    <span class="port-title">Controller Port 1</span>
+                    <div class="plug-toggle" data-role="plug" data-port="0">Unplugged</div>
+                </div>
+                <div class="port-body">
+                    <div class="row"><span class="label">Device</span>
+                        <select data-role="device" data-port="0"></select></div>
+                    <div class="row"><span class="label">Accessory pak</span>
+                        <select data-role="pak" data-port="0">
+                            <option value="None">None</option>
+                            <option value="ControllerPak">Controller Pak</option>
+                            <option value="RumblePak">Rumble Pak</option>
+                        </select></div>
+                    <div class="row profile-row"><span class="label">Bindings profile</span>
+                        <select data-role="profile" data-port="0"></select>
+                        <div class="btn-small" data-role="save_profile" data-port="0">Save</div></div>
+                    <div class="bind-list" data-role="binds" data-port="0"></div>
+                </div>
+            </div>
+            <div class="port-card" id="port_1" data-port="1">
+                <div class="port-head">
+                    <span class="port-title">Controller Port 2</span>
+                    <div class="plug-toggle" data-role="plug" data-port="1">Unplugged</div>
+                </div>
+                <div class="port-body">
+                    <div class="row"><span class="label">Device</span>
+                        <select data-role="device" data-port="1"></select></div>
+                    <div class="row"><span class="label">Accessory pak</span>
+                        <select data-role="pak" data-port="1">
+                            <option value="None">None</option>
+                            <option value="ControllerPak">Controller Pak</option>
+                            <option value="RumblePak">Rumble Pak</option>
+                        </select></div>
+                    <div class="row profile-row"><span class="label">Bindings profile</span>
+                        <select data-role="profile" data-port="1"></select>
+                        <div class="btn-small" data-role="save_profile" data-port="1">Save</div></div>
+                    <div class="bind-list" data-role="binds" data-port="1"></div>
+                </div>
+            </div>
+            <div class="port-card" id="port_2" data-port="2">
+                <div class="port-head">
+                    <span class="port-title">Controller Port 3</span>
+                    <div class="plug-toggle" data-role="plug" data-port="2">Unplugged</div>
+                </div>
+                <div class="port-body">
+                    <div class="row"><span class="label">Device</span>
+                        <select data-role="device" data-port="2"></select></div>
+                    <div class="row"><span class="label">Accessory pak</span>
+                        <select data-role="pak" data-port="2">
+                            <option value="None">None</option>
+                            <option value="ControllerPak">Controller Pak</option>
+                            <option value="RumblePak">Rumble Pak</option>
+                        </select></div>
+                    <div class="row profile-row"><span class="label">Bindings profile</span>
+                        <select data-role="profile" data-port="2"></select>
+                        <div class="btn-small" data-role="save_profile" data-port="2">Save</div></div>
+                    <div class="bind-list" data-role="binds" data-port="2"></div>
+                </div>
+            </div>
+            <div class="port-card" id="port_3" data-port="3">
+                <div class="port-head">
+                    <span class="port-title">Controller Port 4</span>
+                    <div class="plug-toggle" data-role="plug" data-port="3">Unplugged</div>
+                </div>
+                <div class="port-body">
+                    <div class="row"><span class="label">Device</span>
+                        <select data-role="device" data-port="3"></select></div>
+                    <div class="row"><span class="label">Accessory pak</span>
+                        <select data-role="pak" data-port="3">
+                            <option value="None">None</option>
+                            <option value="ControllerPak">Controller Pak</option>
+                            <option value="RumblePak">Rumble Pak</option>
+                        </select></div>
+                    <div class="row profile-row"><span class="label">Bindings profile</span>
+                        <select data-role="profile" data-port="3"></select>
+                        <div class="btn-small" data-role="save_profile" data-port="3">Save</div></div>
+                    <div class="bind-list" data-role="binds" data-port="3"></div>
+                </div>
+            </div>
+        </div>
+        <div id="back">Back</div>
+    </div>
+</body>
+</rml>

@@ -149,11 +149,12 @@ add_executable(BeetleRecomp
     ${CMAKE_SOURCE_DIR}/src/main/bar_cheats.cpp          # BAR-specific cheats (host-side RDRAM pokes)
     ${CMAKE_SOURCE_DIR}/src/main/bar_preempt.cpp         # cooperative audio-thread preemption (no-underrun)
     ${CMAKE_SOURCE_DIR}/src/main/bar_crash.cpp           # symbolized crash backtrace (debug aid)
+    ${CMAKE_SOURCE_DIR}/src/main/bar_input.cpp           # live 4-port runtime input path (device/keymap/rumble/pak)
     ${CMAKE_SOURCE_DIR}/src/game/config.cpp              # host-owned settings persistence + high-FPS enable
+    ${CMAKE_SOURCE_DIR}/src/game/input_config.cpp        # 4-port controller settings model + input.json persistence
     ${CMAKE_SOURCE_DIR}/rsp/aspMain.cpp                  # RSPRecomp output: BAR audio ucode (M_AUDTASK)
     # TODO(BAR): add as authored (mirroring Zelda's src/main + src/game):
     #   src/main/register_patches.cpp
-    #   src/game/input.cpp
 )
 target_include_directories(BeetleRecomp PRIVATE
     ${RECOMP_INCLUDES}

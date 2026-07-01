@@ -51,6 +51,7 @@
         <div id="resume" class="btn">Resume</div>
         <div id="restart" class="btn">Restart Game</div>
         <div id="settings" class="btn">Settings</div>
+        <div id="controls" class="btn">Controls</div>
         <div id="cheats" class="btn">Cheats</div>
         <div id="quit" class="btn danger">Quit Game</div>
     </div>

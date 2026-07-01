@@ -61,6 +61,7 @@
         <p class="subtitle">Recompiled · PC port</p>
         <div id="play" class="btn">Play</div>
         <div id="settings" class="btn">Settings</div>
+        <div id="controls" class="btn">Controls</div>
         <div id="cheats" class="btn">Cheats</div>
         <div id="quit" class="btn">Quit</div>
         <div id="mods">

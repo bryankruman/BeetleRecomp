@@ -23,8 +23,9 @@
 #include <cstring>  // BAR_BURST_ON_ROLL: memcpy/strchr/strcmp for the burst-capture spec parse
 
 #include "main/bar_cheats.h"   // bar_cheats::apply_frame (host-side RDRAM cheat pokes)
+#include "main/bar_input.hpp"  // bar::input::{port_connected, port_pak} (per-port SI responses)
 
-// Keyboard -> N64 pad mapping lives in main.cpp (it owns the Win32 window / focus).
+// Per-port input resolution lives in main.cpp / bar_input (they own the Win32 window / focus + SDL).
 extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y);
 
 // R6 diagnostic (env-gated BAR_DBG_SLIDE): trace the menu page-transition slide. Called from the
@@ -83,6 +84,80 @@ BAR_OS_STUB(__osViSwapContext_recomp)
 BAR_OS_STUB(__osTimerInterrupt_recomp)
 BAR_OS_STUB(__osSiGetAccess_recomp)
 BAR_OS_STUB(__osSiRelAccess_recomp)
+
+// ----------------------------------------------------------------------------------------
+// Controller-accessory (pak) joybus emulation. BAR reads/writes its Controller Pak saves and drives
+// the Rumble Pak over the SAME low-level __osSiRawStartDma path as button reads, via READ_PAK (cmd 2)
+// and WRITE_PAK (cmd 3). We answer those here: mempak data blocks are backed by bar::input's 32 KiB
+// per-port store; the accessory-detect (block 0x400) and rumble (block 0x600) regions implement the
+// standard motor-init handshake so a Rumble Pak is detected and its motor toggles. Wire format + CRC
+// are ported from lib/bar-decomp tools/ultralib/src/io/{crc.c,contramread.c,contramwrite.c,motor.c}.
+//
+// A pak command is a SINGLE-channel transaction: `channel` filler bytes (0x00) then one
+// __OSContRamReadFormat block (dummy,txsize,rxsize,cmd, address@4 (BE u16), data[32]@6, datacrc@0x26).
+// Blocks: CONT_BLOCK_DETECT = 0xC000/0x20... 0x8000/0x20 = 0x400; CONT_BLOCK_RUMBLE = 0xC000/0x20 = 0x600.
+namespace {
+constexpr int kBlockDetect = 0x400;   // 0x8000 >> 5
+constexpr int kBlockRumble = 0x600;   // 0xC000 >> 5
+
+// __osContDataCrc, ported verbatim from crc.c (2.0I / BUILD_VERSION < VERSION_J branch).
+uint8_t pak_data_crc(const uint8_t* data) {
+    uint8_t temp = 0, temp2;
+    for (int i = 0; i <= 32; i++) {
+        for (int j = 7; j > -1; j--) {
+            temp2 = (temp & 0x80) ? 0x85 : 0;
+            temp <<= 1;
+            if (i != 32) temp |= ((data[i] & (1 << j)) ? 1 : 0);
+            temp ^= temp2;
+        }
+    }
+    return temp;
+}
+
+// Per-port RAM-echo cell for a Controller Pak's accessory-detect / bank-select region (block 0x400):
+// __osPfsSelectBank writes the bank byte here and reads it back, and the mempak detect is RAM-like.
+uint8_t g_detect_cell[4][32] = {};
+}
+
+// Handle a single READ_PAK/WRITE_PAK block for `port` at PIF format base `fb` (sign-extended). Uses the
+// MEM_* macros, so it must be called with `rdram` in scope (from __osSiRawStartDma_recomp).
+static void bar_handle_pak(uint8_t* rdram, int64_t fb, int port, unsigned cmd) {
+    const unsigned addr  = ((unsigned)(uint8_t)MEM_BU(4, fb) << 8) | (uint8_t)MEM_BU(5, fb);
+    const int      block = (int)(addr >> 5);
+    const bool     is_write = (cmd == 3);
+    const bar::input_config::PakType pak = bar::input::port_pak(port);
+
+    uint8_t data[32];
+    if (is_write) {
+        for (int i = 0; i < 32; i++) data[i] = (uint8_t)MEM_BU(6 + i, fb);   // bytes the game is writing
+    } else {
+        for (int i = 0; i < 32; i++) data[i] = 0;                            // default read response
+    }
+
+    if (pak == bar::input_config::PakType::RumblePak) {
+        if (block == kBlockDetect) {
+            if (!is_write) { for (int i = 0; i < 32; i++) data[i] = 0x80; }   // rumble-pak identify
+        } else if (block == kBlockRumble) {
+            if (is_write) bar::input::set_rumble(port, data[0] != 0);         // 0x01.. = motor on, 0x00 = off
+        }
+    } else if (pak == bar::input_config::PakType::ControllerPak) {
+        if (block == kBlockDetect) {
+            if (is_write) std::memcpy(g_detect_cell[port], data, 32);         // bank-select / detect echo
+            else          std::memcpy(data, g_detect_cell[port], 32);
+        } else if (block < kBlockDetect) {
+            if (is_write) bar::input::mempak_write(port, block, data);        // 32 KiB save store
+            else          bar::input::mempak_read(port, block, data);
+        }
+        // blocks between the pak data area and the accessory region: leave zero (out of range).
+    }
+
+    if (!is_write) {
+        for (int i = 0; i < 32; i++) MEM_B(6 + i, fb) = (int8_t)data[i];      // READ_PAK returns 32 data bytes
+    }
+    // Both READ_PAK and WRITE_PAK echo the data CRC (the game verifies it). rxsize (fb+2) already carries
+    // no channel-error bits, so leave it.
+    MEM_B(0x26, fb) = (int8_t)pak_data_crc(data);
+}
 
 // __osSiRawStartDma: BAR drives the controller (SI/PIF) bus directly through the low-level libultra
 // path — osContStartReadData() does __osPackReadData() (which fills the PIF RAM with button=0xFFFF
@@ -159,28 +234,57 @@ extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
         // uint32_t 0x800321F0 zero-extends and underflows that subtraction to a +4 GiB out-of-bounds
         // offset -> access violation. Use a sign-extended gpr-style value, exactly like ctx->rN.
         const int64_t pifram_se = (int32_t)ctx->r5;
-        for (int i = 0; i < 4; i++) {
-            const int64_t blk = pifram_se + (int64_t)(i * 8);
-            const unsigned cmd = (unsigned)MEM_BU(3, blk);   // CONT_CMD_* the game packed
-            if (cmd != 0 && cmd != 1) continue;              // not status/button -> leave as-is
-            if (i != 0) {                                    // ports 1-3: no controller connected
-                MEM_B(2, blk) = (int8_t)0x80;                // rxsize: CHNL NO_RESPONSE error
-                continue;
+
+        // First, detect a single-channel pak command (READ_PAK cmd 2 / WRITE_PAK cmd 3). These use a
+        // different PIF layout than the button/status poll: `channel` filler bytes (0x00) then ONE
+        // __OSContRamReadFormat block at offset `channel`. Identify it by the (cmd, txsize, rxsize)
+        // triple + all-zero leading filler, then service the pak (mempak / rumble) and skip the button
+        // loop (a pak transaction carries no button blocks).
+        int pak_ch = -1; unsigned pak_cmd = 0;
+        for (int ch = 0; ch < 4; ch++) {
+            const int64_t fb = pifram_se + ch;
+            const unsigned c  = (unsigned)MEM_BU(3, fb);
+            const unsigned tx = (unsigned)MEM_BU(1, fb);
+            const unsigned rx = (unsigned)MEM_BU(2, fb);
+            if ((c == 2 && tx == 3 && rx == 33) || (c == 3 && tx == 35 && rx == 1)) {
+                bool filler_ok = true;
+                for (int k = 0; k < ch; k++) if ((unsigned)MEM_BU(0, pifram_se + k) != 0x00) { filler_ok = false; break; }
+                if (filler_ok) { pak_ch = ch; pak_cmd = c; break; }
             }
-            if (cmd == 0) {                  // CONT_CMD_REQUEST_STATUS (controller detect)
-                MEM_B(2, blk) = 0x03;        // rxsize=3, no channel error
-                MEM_B(4, blk) = 0x05;        // typeh  -> type = typel<<8|typeh = 0x0005 (CONT_TYPE_NORMAL)
-                MEM_B(5, blk) = 0x00;        // typel
-                MEM_B(6, blk) = 0x00;        // status: no Controller Pak
-                MEM_B(7, blk) = 0x00;
-            } else {                         // CONT_CMD_READ_BUTTON
-                int8_t sx = 0, sy = 0;
-                const uint16_t button = bar_poll_keyboard(0, &sx, &sy);
-                MEM_B(2, blk) = 0x04;        // rxsize=4, no channel error
-                MEM_B(4, blk) = (int8_t)(uint8_t)(button >> 8);
-                MEM_B(5, blk) = (int8_t)(uint8_t)(button & 0xFF);
-                MEM_B(6, blk) = sx;
-                MEM_B(7, blk) = sy;
+        }
+
+        if (pak_ch >= 0) {
+            if (bar::input::port_pak(pak_ch) != bar::input_config::PakType::None) {
+                bar_handle_pak(rdram, pifram_se + pak_ch, pak_ch, pak_cmd);
+            }
+        } else {
+            // The button/status poll packs one 8-byte block per port (all four, cmd 0/1). Answer each port
+            // from its live config (bar::input): a port with a device assigned is "connected" and reports
+            // CONT_TYPE_NORMAL + a pak-present status bit; an unplugged/unassigned port replies NO_RESPONSE.
+            for (int i = 0; i < 4; i++) {
+                const int64_t blk = pifram_se + (int64_t)(i * 8);
+                const unsigned cmd = (unsigned)MEM_BU(3, blk);   // CONT_CMD_* the game packed
+                if (cmd != 0 && cmd != 1) continue;              // not status/button -> leave as-is
+                if (!bar::input::port_connected(i)) {            // unplugged / no device assigned
+                    MEM_B(2, blk) = (int8_t)0x80;                // rxsize: CHNL NO_RESPONSE error
+                    continue;
+                }
+                if (cmd == 0) {                  // CONT_CMD_REQUEST_STATUS (controller detect)
+                    const bool has_pak = bar::input::port_pak(i) != bar::input_config::PakType::None;
+                    MEM_B(2, blk) = 0x03;        // rxsize=3, no channel error
+                    MEM_B(4, blk) = 0x05;        // typeh  -> type = typel<<8|typeh = 0x0005 (CONT_TYPE_NORMAL)
+                    MEM_B(5, blk) = 0x00;        // typel
+                    MEM_B(6, blk) = has_pak ? (int8_t)0x01 : (int8_t)0x00;  // status: CONT_CARD_ON (pak present)
+                    MEM_B(7, blk) = 0x00;
+                } else {                         // CONT_CMD_READ_BUTTON
+                    int8_t sx = 0, sy = 0;
+                    const uint16_t button = bar_poll_keyboard(i, &sx, &sy);
+                    MEM_B(2, blk) = 0x04;        // rxsize=4, no channel error
+                    MEM_B(4, blk) = (int8_t)(uint8_t)(button >> 8);
+                    MEM_B(5, blk) = (int8_t)(uint8_t)(button & 0xFF);
+                    MEM_B(6, blk) = sx;
+                    MEM_B(7, blk) = sy;
+                }
             }
         }
     }

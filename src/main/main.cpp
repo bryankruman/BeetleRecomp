@@ -35,7 +35,9 @@
 #include "librecomp/overlays.hpp"             // overlay table (registration lives in register_overlays.cpp)
 
 #include "game/config.hpp"                    // bar::config — settings persistence + high-FPS enable
+#include "game/input_config.hpp"              // bar::input_config — 4-port controller settings (input.json)
 #include "main/bar_cheats.h"                  // bar_cheats — BAR cheat toggles (host-side RDRAM pokes)
+#include "main/bar_input.hpp"                 // bar::input — live 4-port runtime input path
 
 #ifdef BEETLE_ENABLE_UI
 #include "ui/bar_ui.h"                        // bar_ui — RmlUi launcher + settings + cheats menu (Tier 2)
@@ -143,46 +145,22 @@ extern std::atomic<bool> g_bar_vi_ticked;        // renderer presented a frame (
 // SDL window / gfx (gfx_callbacks_t). RT64 attaches to this window's native HWND.
 static SDL_Window* g_window = nullptr;
 static HWND g_bar_hwnd = nullptr;   // native window handle (for keyboard focus gating)
-static SDL_GameController* g_gamepad = nullptr;   // first connected SDL controller; touched ONLY on the main thread
-static std::atomic<uint32_t> g_pad_state{0};      // packed pad snapshot: btn(bits0-15) | sx(16-23) | sy(24-31)
 
-// Sample the connected SDL game controller into g_pad_state. MAIN THREAD ONLY (update_gfx) — keeping
-// all SDL controller access + the g_gamepad handle on one thread avoids a disconnect-vs-read race with
-// the game/SI threads that call bar_poll_gamepad. Mapping: A->A B->B Start->Start L/R shoulders->L/R
-// LT->Z D-pad->D-pad right-stick->C-buttons left-stick->analog(±80). Rebind UI/profiles = TODO (item 6b).
-static void bar_sample_gamepad() {
-    SDL_GameController* gc = g_gamepad;
-    if (gc == nullptr || !SDL_GameControllerGetAttached(gc)) { g_pad_state.store(0, std::memory_order_relaxed); return; }
-    auto bdown = [gc](SDL_GameControllerButton b) { return SDL_GameControllerGetButton(gc, b) != 0; };
-    uint16_t b = 0;
-    if (bdown(SDL_CONTROLLER_BUTTON_A))             b |= 0x8000; // CONT_A
-    if (bdown(SDL_CONTROLLER_BUTTON_B))             b |= 0x4000; // CONT_B
-    if (bdown(SDL_CONTROLLER_BUTTON_START))         b |= 0x1000; // CONT_START
-    if (bdown(SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  b |= 0x0020; // CONT_L
-    if (bdown(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) b |= 0x0010; // CONT_R
-    if (bdown(SDL_CONTROLLER_BUTTON_DPAD_UP))       b |= 0x0800;
-    if (bdown(SDL_CONTROLLER_BUTTON_DPAD_DOWN))     b |= 0x0400;
-    if (bdown(SDL_CONTROLLER_BUTTON_DPAD_LEFT))     b |= 0x0200;
-    if (bdown(SDL_CONTROLLER_BUTTON_DPAD_RIGHT))    b |= 0x0100;
-    if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT)  > 12000) b |= 0x2000; // Z trigger
-    if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 12000) b |= 0x0010; // also R
-    const int rx = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX);
-    const int ry = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY);
-    constexpr int kCDz = 16000;                  // C-buttons from the right analog stick
-    if (ry < -kCDz) b |= 0x0008;                 // C-up
-    if (ry >  kCDz) b |= 0x0004;                 // C-down
-    if (rx < -kCDz) b |= 0x0002;                 // C-left
-    if (rx >  kCDz) b |= 0x0001;                 // C-right
-    const int lx = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
-    const int ly = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
-    constexpr int kDz = 8000;                    // left stick -> analog (±80), with a deadzone
-    int nx = (lx > kDz || lx < -kDz) ? lx * 80 / 32767 : 0;
-    int ny = (ly > kDz || ly < -kDz) ? -(ly * 80 / 32767) : 0;   // SDL Y down=+, N64 stick up=+
-    if (nx >  80) nx =  80; else if (nx < -80) nx = -80;
-    if (ny >  80) ny =  80; else if (ny < -80) ny = -80;
-    g_pad_state.store((uint32_t)b | ((uint32_t)(uint8_t)(int8_t)nx << 16) | ((uint32_t)(uint8_t)(int8_t)ny << 24),
-                      std::memory_order_relaxed);
+// Controller state now lives in bar::input (src/main/bar_input.cpp): it owns the open SDL_GameController
+// handles (still MAIN THREAD ONLY, via on_controller_added/removed below), samples every assigned pad
+// once per frame (bar::input::sample_all_ports), and resolves each of the 4 N64 ports from its
+// per-port device + rebindable bindings (bar::input::resolve_port). update_gfx drives the SDL side.
+
+#ifdef BEETLE_ENABLE_UI
+// Publish the current controller list to the Controls dialog's device dropdown (defined in bar_ui).
+static void bar_publish_devices() {
+    std::vector<bar_ui::UiGamepad> list;
+    for (const auto& d : bar::input::enumerate_devices()) {
+        list.push_back(bar_ui::UiGamepad{ d.guid, d.name });
+    }
+    bar_ui::publish_gamepads(list);
 }
+#endif
 
 static ultramodern::gfx_callbacks_t::gfx_data_t create_gfx() {
     SDL_SetMainReady();
@@ -193,8 +171,18 @@ static ultramodern::gfx_callbacks_t::gfx_data_t create_gfx() {
 }
 
 static ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::gfx_data_t /*data*/) {
+    // Default to a 4:3 window. BAR_WINDOW_SIZE=WxH overrides it — handy for widescreen users and for
+    // QA'ing the letterbox present modes (Pillarbox/Crop/Stretch), which only differ on a non-4:3 window.
+    int win_w = 960, win_h = 720;
+    if (const char *ws = std::getenv("BAR_WINDOW_SIZE")) {
+        int w = 0, h = 0;
+        if (std::sscanf(ws, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 240) {
+            win_w = w;
+            win_h = h;
+        }
+    }
     g_window = SDL_CreateWindow("Beetle Adventure Racing: Recompiled",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 960, 720,
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (g_window == nullptr) {
         std::fprintf(stderr, "[BeetleRecomp] SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -228,43 +216,45 @@ static void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t /*data*/) {
             continue;
         }
         // Game controller hotplug. SDL queues a DEVICEADDED for controllers already present at init,
-        // so this also picks up a controller plugged in before launch. We drive one controller (port 0).
+        // so this also picks up controllers plugged in before launch. bar::input tracks all of them
+        // (up to 4 ports can be driven); the Controls dialog assigns which pad drives which port.
         if (event.type == SDL_CONTROLLERDEVICEADDED) {
-            if (g_gamepad == nullptr) {
-                g_gamepad = SDL_GameControllerOpen(event.cdevice.which);
-                if (g_gamepad != nullptr)
-                    std::fprintf(stderr, "[BeetleRecomp] gamepad connected: %s\n", SDL_GameControllerName(g_gamepad));
-            }
+            bar::input::on_controller_added(event.cdevice.which);
+#ifdef BEETLE_ENABLE_UI
+            bar_publish_devices();
+#endif
             continue;
         }
         if (event.type == SDL_CONTROLLERDEVICEREMOVED) {
-            if (g_gamepad != nullptr &&
-                event.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_gamepad))) {
-                SDL_GameControllerClose(g_gamepad);
-                g_gamepad = nullptr;
-                std::fprintf(stderr, "[BeetleRecomp] gamepad disconnected\n");
-            }
+            bar::input::on_controller_removed(event.cdevice.which);
+#ifdef BEETLE_ENABLE_UI
+            bar_publish_devices();
+#endif
             continue;
         }
 #ifdef BEETLE_ENABLE_UI
+        // While the Controls dialog is waiting for a key/button to (re)assign a binding, DON'T consume
+        // Esc/F1, the Back button, or synthesize menu-nav — forward the raw event so it can be captured
+        // as the binding (Esc cancels the capture inside bar_ui). Skip these three intercepts entirely.
+        const bool rebinding = bar_ui::rebind_listening();
         // Esc / F1 toggle the in-game pause menu (pauses the simulation; no effect pre-game — the
         // launcher is already up). The game never reads these keys (game input is GetAsyncKeyState /
         // controller based), so we consume them here.
-        if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
+        if (!rebinding && event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
             (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_F1)) {
             bar_ui::toggle_pause_menu();
             continue;
         }
         // Controller Back/View/Select button also toggles the pause menu (N64 pads have no such
         // button, so it never conflicts with game input).
-        if (event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
+        if (!rebinding && event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
             bar_ui::toggle_pause_menu();
             continue;
         }
         // Controller navigation of the menu: translate buttons to the keyboard nav the menu already
         // handles (D-pad -> arrows = move focus; A -> Enter = activate). Synthesize a key event and feed
-        // it through the same path. Only while the menu owns input.
-        if (bar_ui::menu_capturing_input() && event.type == SDL_CONTROLLERBUTTONDOWN) {
+        // it through the same path. Only while the menu owns input (and not while capturing a rebind).
+        if (!rebinding && bar_ui::menu_capturing_input() && event.type == SDL_CONTROLLERBUTTONDOWN) {
             SDL_Keycode key = 0;
             switch (event.cbutton.button) {
                 case SDL_CONTROLLER_BUTTON_DPAD_UP:    key = SDLK_UP;     break;
@@ -293,7 +283,9 @@ static void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t /*data*/) {
         }
 #endif
     }
-    bar_sample_gamepad();   // refresh the controller snapshot on this (main) thread
+    bar::input::sample_all_ports();   // refresh every assigned pad's snapshot on this (main) thread
+    bar::input::flush_rumble();       // issue SDL rumble for any port that wants it (main thread)
+    bar::input::mempak_flush_all();   // persist any Controller Pak writes (cheap no-op when clean)
 }
 
 // Audio (audio_callbacks_t) — SDL2 queued-audio backend.
@@ -406,9 +398,10 @@ static void set_frequency(uint32_t freq) {
     if (freq != 0 && freq != g_dev_freq) bar_open_audio(freq);
 }
 
-// Input (input::callbacks_t). Port 0 is reported connected; the live pad state comes from
-// bar_poll_keyboard (keyboard + SDL game controller, see bar_poll_gamepad). TODO(BAR): a rebind UI
-// (item 6b) + per-controller profiles.
+// Input (input::callbacks_t). Each of the 4 N64 ports is reported connected per the live InputConfig
+// (bar::input); its buttons/stick come from bar_poll_keyboard -> bar::input::resolve_port, resolving
+// the port's assigned device (keyboard or a specific SDL pad) through its rebindable bindings. The
+// Controls dialog (src/ui) edits that config.
 static void input_poll() {
 }
 
@@ -419,25 +412,32 @@ static void input_poll() {
 extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y);
 
 static bool input_get(int controller_num, uint16_t* buttons, float* x, float* y) {
-    if (controller_num != 0) {
-        return false;   // only port 1 is "connected"
+    if (!bar::input::port_connected(controller_num)) {
+        return false;   // this N64 port has no controller / device assigned
     }
     int8_t sx = 0, sy = 0;
-    const uint16_t b = bar_poll_keyboard(0, &sx, &sy);
+    const uint16_t b = bar_poll_keyboard(controller_num, &sx, &sy);
     if (buttons != nullptr) *buttons = b;
     if (x != nullptr)       *x = (float)sx / 80.0f;   // N64 stick range -> ~[-1, 1]
     if (y != nullptr)       *y = (float)sy / 80.0f;
     return true;
 }
 
-static void input_set_rumble(int /*controller_num*/, bool /*rumble*/) {}
+static void input_set_rumble(int controller_num, bool rumble) {
+    bar::input::set_rumble(controller_num, rumble);
+}
 
 static ultramodern::input::connected_device_info_t input_get_device_info(int controller_num) {
     using namespace ultramodern::input;
-    if (controller_num == 0) {
-        return connected_device_info_t{ Device::Controller, Pak::None };
+    if (!bar::input::port_connected(controller_num)) {
+        return connected_device_info_t{ Device::None, Pak::None };
     }
-    return connected_device_info_t{ Device::None, Pak::None };
+    // A Rumble Pak is surfaced to the high-level path so ultramodern's osMotorInit succeeds; a
+    // Controller Pak is emulated at the SI/joybus level (status bit + mempak), so it reports no
+    // high-level pak here (we don't want the runtime treating it as a rumble device).
+    const Pak pak = (bar::input::port_pak(controller_num) == bar::input_config::PakType::RumblePak)
+                    ? Pak::RumblePak : Pak::None;
+    return connected_device_info_t{ Device::Controller, pak };
 }
 
 // Keyboard -> N64 controller (port 0). BAR reads the pad via the raw SI/PIF path, so
@@ -490,17 +490,6 @@ static uint16_t bar_autoplay_poll(const char* script, int8_t* stick_x, int8_t* s
     if (stick_x) *stick_x = (int8_t)sx;
     if (stick_y) *stick_y = (int8_t)sy;
     return btn;
-}
-
-// Fold the latest controller snapshot (sampled on the main thread by bar_sample_gamepad) into the pad
-// state: OR the buttons, and use the controller's left stick only if the keyboard left it neutral.
-static void bar_poll_gamepad(uint16_t* btn, int* sx, int* sy) {
-    const uint32_t s = g_pad_state.load(std::memory_order_relaxed);
-    *btn |= (uint16_t)(s & 0xFFFF);
-    if (*sx == 0 && *sy == 0) {
-        *sx = (int)(int8_t)((s >> 16) & 0xFF);
-        *sy = (int)(int8_t)((s >> 24) & 0xFF);
-    }
 }
 
 // BAR_SHOTS="frame:path frame:path ..." — request an internal-render screenshot (RT64 GPU readback -> PNG)
@@ -571,45 +560,29 @@ static void bar_burst_poll() {
     }
 }
 
+// The gated per-port input entry. Both the low-level SI/PIF stub (os_unimpl_stubs.cpp) and the
+// high-level input_get callback call this for each port. The per-port device + rebindable bindings
+// live in bar::input (bar_input.cpp); this wrapper keeps the GLOBAL gates + port-0 test tooling:
+//   * BAR_SHOTS / BAR_SHOT_BURST screenshot scheduling (once per SI poll, port 0),
+//   * BAR_AUTOPLAY scripted input (headless testing, port 0),
+//   * freeze while the menu owns input, and the window-focus gate.
 extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y) {
     if (stick_x) *stick_x = 0;
     if (stick_y) *stick_y = 0;
-    if (port != 0) return 0;
-    bar_shots_poll();
-    bar_burst_poll();
-    static const char* autoplay = std::getenv("BAR_AUTOPLAY");
-    if (autoplay && *autoplay) return bar_autoplay_poll(autoplay, stick_x, stick_y);
+    if (port < 0 || port >= 4) return 0;
+    if (port == 0) {
+        bar_shots_poll();
+        bar_burst_poll();
+        static const char* autoplay = std::getenv("BAR_AUTOPLAY");
+        if (autoplay && *autoplay) return bar_autoplay_poll(autoplay, stick_x, stick_y);
+    }
 #ifdef BEETLE_ENABLE_UI
-    // While the cheats/settings overlay is open, freeze game input so menu navigation (arrows/enter)
-    // doesn't also drive the car.
+    // While the launcher/settings/cheats/controls overlay is open, freeze game input so menu
+    // navigation (arrows/enter) doesn't also drive the car.
     if (bar_ui::menu_capturing_input()) return 0;
 #endif
     if (g_bar_hwnd != nullptr && GetForegroundWindow() != g_bar_hwnd) return 0; // only when focused
-    auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
-    uint16_t b = 0;
-    if (down('X'))       b |= 0x8000; // CONT_A
-    if (down('Z'))       b |= 0x4000; // CONT_B
-    if (down(VK_SHIFT))  b |= 0x2000; // CONT_G (Z trigger)
-    if (down(VK_RETURN)) b |= 0x1000; // CONT_START
-    if (down('T'))       b |= 0x0800; // D-pad up
-    if (down('G'))       b |= 0x0400; // D-pad down
-    if (down('F'))       b |= 0x0200; // D-pad left
-    if (down('H'))       b |= 0x0100; // D-pad right
-    if (down('Q'))       b |= 0x0020; // CONT_L
-    if (down('W'))       b |= 0x0010; // CONT_R
-    if (down('I'))       b |= 0x0008; // C-up
-    if (down('K'))       b |= 0x0004; // C-down
-    if (down('J'))       b |= 0x0002; // C-left
-    if (down('L'))       b |= 0x0001; // C-right
-    int sx = 0, sy = 0;
-    if (down(VK_LEFT))  sx -= 80;
-    if (down(VK_RIGHT)) sx += 80;
-    if (down(VK_UP))    sy += 80;   // N64 stick: up is positive
-    if (down(VK_DOWN))  sy -= 80;
-    bar_poll_gamepad(&b, &sx, &sy);   // fold in an SDL game controller if one is connected
-    if (stick_x) *stick_x = (int8_t)sx;
-    if (stick_y) *stick_y = (int8_t)sy;
-    return b;
+    return bar::input::resolve_port(port, stick_x, stick_y);
 }
 
 // Error handling (error_handling::callbacks_t).
@@ -668,6 +641,43 @@ int main(int argc, char** argv) {
     // docs/SETTINGS_MENU_AND_HIGH_FPS.md). Must run before recomp::start() so the renderer reads
     // it when it constructs the RT64 context.
     bar::config::load_and_apply_graphics();
+
+    // Load persisted controller/input settings (input.json) and push them into the live 4-port input
+    // path. The Controls dialog edits the same config; ports 1-3 default to unplugged so single-player
+    // behavior is unchanged. Must run before recomp::start() so the first controller poll sees it.
+    //
+    // FIRST-RUN DEFAULT: if a game controller is plugged in the very first time we run (no input.json
+    // yet), default port 1 to that controller with the "Default Gamepad" map; otherwise keep the
+    // keyboard default. We enumerate here with a minimal early SDL_Init (idempotent — create_gfx
+    // re-inits the full set); the device-level GUID matches what bar_input later opens.
+    {
+        const bool first_run = !bar::input_config::config_file_exists();
+        bar::input_config::InputConfig cfg = bar::input_config::load();   // writes keyboard default on first run
+        if (first_run) {
+            SDL_SetMainReady();
+            SDL_Init(SDL_INIT_GAMECONTROLLER);
+            std::string guid, name;
+            for (int i = 0; i < SDL_NumJoysticks(); i++) {
+                if (!SDL_IsGameController(i)) continue;
+                char buf[33] = {};
+                SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(i), buf, sizeof(buf));
+                const char* nm = SDL_GameControllerNameForIndex(i);
+                guid = buf;
+                name = (nm != nullptr && *nm != '\0') ? nm : "Controller";
+                break;
+            }
+            if (!guid.empty()) {
+                using namespace bar::input_config;
+                cfg.ports[0].connected    = true;
+                cfg.ports[0].device       = DeviceRef{ DeviceType::Gamepad, guid, name };
+                cfg.ports[0].profile_name = "Default Gamepad";
+                if (const BindingProfile* pr = find_profile(cfg, "Default Gamepad")) cfg.ports[0].bindings = pr->bindings;
+                set(cfg);   // persist the controller default so it sticks
+                std::fprintf(stderr, "[BeetleRecomp] first run: defaulting port 1 to controller \"%s\"\n", name.c_str());
+            }
+        }
+        bar::input::set_config(cfg);
+    }
 
     // Load persisted cheat toggles (applied per-frame from the SI hook once the game runs; also
     // editable live via the in-game cheats menu — F1).

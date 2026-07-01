@@ -18,6 +18,7 @@
 #include <functional>
 #include <locale>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,7 @@
 
 #include "RmlUi/Core.h"
 #include "RmlUi/Core/Elements/ElementFormControl.h"
+#include "RmlUi/Core/Elements/ElementFormControlSelect.h"
 #include "RmlUi/Debugger.h"
 
 #include "RmlUi_Platform_SDL.h"   // SystemInterface_SDL + RmlSDL::InputEventHandler (RmlUi backend)
@@ -42,6 +44,8 @@
 #include "ui_renderer.h"
 #include "bar_ui.h"
 #include "game/config.hpp"               // bar::config::save_graphics
+#include "game/input_config.hpp"         // bar::input_config — 4-port controller settings model
+#include "main/bar_input.hpp"            // bar::input::set_config — push edits to the live input path
 #include "main/bar_cheats.h"             // bar_cheats — BAR cheat toggles
 
 namespace fs = std::filesystem;
@@ -66,6 +70,35 @@ Rml::ElementDocument* g_launcher_doc = nullptr;
 Rml::ElementDocument* g_config_doc = nullptr;
 Rml::ElementDocument* g_cheats_doc = nullptr;
 Rml::ElementDocument* g_pause_doc = nullptr;
+Rml::ElementDocument* g_controls_doc = nullptr;
+
+// ---- Controls dialog state (render thread) ----
+// Connected-controller snapshot for the device dropdown, published from main.cpp (which owns the SDL
+// handles). g_controls_dirty requests a full repopulate of an open Controls page — set on hotplug
+// (main thread) and by the change/click handlers after an edit. It is consumed in draw_hook AFTER the
+// event drain, never synchronously inside a handler: repopulating a <select> mid-change-dispatch (its
+// own event) would mutate the element RmlUi is dispatching on.
+std::mutex g_devices_mutex;
+std::vector<bar_ui::UiGamepad> g_devices;
+std::atomic<bool> g_controls_dirty{false};
+
+// Live rebind capture: while active, the next key/gamepad input pressed is recorded as the binding
+// for (port, input). `active` is atomic (read by main.cpp via rebind_listening()); the rest is render-
+// thread-only. Guard against re-entrant change events during programmatic population (mirrors the
+// g_populating_controls guard for the graphics form).
+struct RebindState {
+    std::atomic<bool>            active{false};
+    int                          port = -1;
+    bar::input_config::N64Input  input = bar::input_config::N64Input::A;
+    Rml::Element*                row = nullptr;
+};
+RebindState g_rebind;
+bool g_populating_ctrl = false;
+
+// Defined below (used by the launcher/pause wiring, which appears earlier in the file).
+void show_controls();
+void populate_controls();
+void finish_rebind();
 
 // Which "root" menu is active, so a sub-page's Back returns to the right place: the launcher
 // (pre-game) or the in-game pause menu. Touched only on the render thread (all show_*/Back run there).
@@ -158,6 +191,7 @@ void config_to_controls() {
     set_control_value("msaa_option", enum_to_str(g_working_config.msaa_option));
     set_control_value("divot_option", enum_to_str(g_working_config.divot_option));
     set_control_value("ar_option",   enum_to_str(g_working_config.ar_option));
+    set_control_value("pfm_option",  enum_to_str(g_working_config.pfm_option));
     set_control_value("hr_option",   enum_to_str(g_working_config.hr_option));
     set_control_value("hpfb_option", enum_to_str(g_working_config.hpfb_option));
     g_populating_controls = false;
@@ -196,6 +230,7 @@ void controls_to_config_and_apply() {
     g_working_config.msaa_option = str_to_enum(control_value("msaa_option", enum_to_str(g_working_config.msaa_option)), g_working_config.msaa_option);
     g_working_config.divot_option = str_to_enum(control_value("divot_option", enum_to_str(g_working_config.divot_option)), g_working_config.divot_option);
     g_working_config.ar_option   = str_to_enum(control_value("ar_option",   enum_to_str(g_working_config.ar_option)),   g_working_config.ar_option);
+    g_working_config.pfm_option  = str_to_enum(control_value("pfm_option",  enum_to_str(g_working_config.pfm_option)),  g_working_config.pfm_option);
     g_working_config.hr_option   = str_to_enum(control_value("hr_option",   enum_to_str(g_working_config.hr_option)),   g_working_config.hr_option);
     g_working_config.hpfb_option = str_to_enum(control_value("hpfb_option", enum_to_str(g_working_config.hpfb_option)), g_working_config.hpfb_option);
     try {
@@ -259,10 +294,12 @@ void populate_mod_list() {
 }
 
 void hide_all_docs() {
+    finish_rebind();   // never leave a rebind capture armed across a page switch
     if (g_launcher_doc) g_launcher_doc->Hide();
     if (g_config_doc)   g_config_doc->Hide();
     if (g_cheats_doc)   g_cheats_doc->Hide();
     if (g_pause_doc)    g_pause_doc->Hide();
+    if (g_controls_doc) g_controls_doc->Hide();
 }
 
 // Close the whole overlay and release input back to the game (draw_hook unpauses the sim once the
@@ -330,6 +367,7 @@ void wire_launcher_events() {
         close_overlay();
     });
     add_listener(g_launcher_doc->GetElementById("settings"), "click", [](Rml::Event&) { show_config(); });
+    add_listener(g_launcher_doc->GetElementById("controls"), "click", [](Rml::Event&) { show_controls(); });
     add_listener(g_launcher_doc->GetElementById("cheats"), "click", [](Rml::Event&) { show_cheats(); });
     add_listener(g_launcher_doc->GetElementById("quit"), "click", [](Rml::Event&) { ultramodern::quit(); });
     populate_mod_list();
@@ -397,11 +435,365 @@ void wire_cheats_events() {
     populate_cheats();
 }
 
+// ==========================================================================================
+// Controls dialog — 4-port controller configuration (device / pak / rebindable bindings / profiles).
+// The model + persistence live in bar::input_config; edits are pushed to the live runtime path via
+// bar::input::set_config. SDL controllers are owned by main.cpp, which publishes a name/guid snapshot
+// here (publish_gamepads) so this render-thread code never touches an SDL_GameController* handle.
+// ==========================================================================================
+namespace ic = bar::input_config;
+
+// Push an edited config: persist (input.json) + apply to the live 4-port input path.
+void apply_input_config(const ic::InputConfig& cfg) {
+    ic::set(cfg);                  // update canonical + write input.json
+    bar::input::set_config(cfg);   // push to the runtime (SI stub + input_get read it)
+}
+
+// Human-readable label for a binding, using SDL's stable names.
+std::string bind_display(const ic::Bind& b) {
+    switch (b.source) {
+        case ic::BindSource::Keyboard: {
+            const char* n = SDL_GetScancodeName((SDL_Scancode)b.code);
+            return (n != nullptr && *n != '\0') ? std::string("Key ") + n : std::string("Key ?");
+        }
+        case ic::BindSource::GamepadButton: {
+            const char* n = SDL_GameControllerGetStringForButton((SDL_GameControllerButton)b.code);
+            return (n != nullptr && *n != '\0') ? std::string("Pad ") + n : std::string("Pad Btn");
+        }
+        case ic::BindSource::GamepadAxis: {
+            const char* n = SDL_GameControllerGetStringForAxis((SDL_GameControllerAxis)b.code);
+            return std::string("Pad ") + ((n != nullptr && *n != '\0') ? n : "Axis") + (b.dir < 0 ? " -" : " +");
+        }
+        default: return "Unbound";
+    }
+}
+
+// DFS: the first descendant (or self) whose data-role attribute equals `role`.
+Rml::Element* find_role(Rml::Element* root, const char* role) {
+    if (root == nullptr) return nullptr;
+    if (root->GetAttribute<Rml::String>("data-role", Rml::String()) == role) return root;
+    for (int i = 0; i < (int)root->GetNumChildren(); i++) {
+        if (Rml::Element* r = find_role(root->GetChild(i), role)) return r;
+    }
+    return nullptr;
+}
+
+// DFS: the first descendant (or self) carrying CSS class `cls`.
+Rml::Element* find_class(Rml::Element* root, const char* cls) {
+    if (root == nullptr) return nullptr;
+    if (root->IsClassSet(cls)) return root;
+    for (int i = 0; i < (int)root->GetNumChildren(); i++) {
+        if (Rml::Element* r = find_class(root->GetChild(i), cls)) return r;
+    }
+    return nullptr;
+}
+
+// The <select> value string encoding a port's assigned device.
+std::string device_value(const ic::DeviceRef& d) {
+    switch (d.type) {
+        case ic::DeviceType::Keyboard: return "keyboard";
+        case ic::DeviceType::Gamepad:  return "gpad:" + d.guid;
+        default: return "none";
+    }
+}
+
+// Parse a data-port attribute; returns -1 if missing/invalid.
+int attr_port(Rml::Element* el) {
+    const std::string s = std::string(el->GetAttribute<Rml::String>("data-port", Rml::String()));
+    if (s.empty()) return -1;
+    int p = std::atoi(s.c_str());
+    return (p >= 0 && p < 4) ? p : -1;
+}
+
+// The N64Input whose metadata key matches `key`, or -1.
+int input_index_for_key(const std::string& key) {
+    for (int i = 0; i < (int)ic::N64Input::Count; i++) {
+        if (key == ic::input_info((ic::N64Input)i).key) return i;
+    }
+    return -1;
+}
+
+// Refresh the whole dialog from the canonical config + device snapshot. Guarded so the programmatic
+// SetValue/RemoveAll/Add calls don't trip the delegated "change" handler into re-saving mid-populate.
+void populate_controls() {
+    if (g_controls_doc == nullptr) return;
+    g_populating_ctrl = true;
+
+    const ic::InputConfig cfg = ic::get();
+    std::vector<bar_ui::UiGamepad> devices;
+    { std::lock_guard<std::mutex> lk(g_devices_mutex); devices = g_devices; }
+
+    for (int p = 0; p < 4; p++) {
+        Rml::Element* card = g_controls_doc->GetElementById("port_" + std::to_string(p));
+        if (card == nullptr) continue;
+        const ic::PortConfig& pc = cfg.ports[p];
+
+        card->SetClass("unplugged", !pc.connected);
+        if (Rml::Element* plug = find_role(card, "plug")) {
+            plug->SetClass("on", pc.connected);
+            plug->SetInnerRML(pc.connected ? "Plugged in" : "Unplugged");
+        }
+
+        if (auto* sel = rmlui_dynamic_cast<Rml::ElementFormControlSelect*>(find_role(card, "device"))) {
+            sel->RemoveAll();
+            sel->Add("None", "none");
+            sel->Add("Keyboard", "keyboard");
+            bool found = (pc.device.type != ic::DeviceType::Gamepad);
+            for (const auto& d : devices) {
+                sel->Add(d.name, "gpad:" + d.guid);
+                if (pc.device.type == ic::DeviceType::Gamepad && pc.device.guid == d.guid) found = true;
+            }
+            if (!found) {   // saved gamepad not currently connected — keep the assignment visible
+                const std::string label = (pc.device.display_name.empty() ? std::string("Controller")
+                                                                           : pc.device.display_name) + " (disconnected)";
+                sel->Add(label, "gpad:" + pc.device.guid);
+            }
+            sel->SetValue(device_value(pc.device));
+        }
+
+        if (auto* sel = rmlui_dynamic_cast<Rml::ElementFormControl*>(find_role(card, "pak"))) {
+            sel->SetValue(enum_to_str(pc.pak));
+        }
+
+        if (auto* sel = rmlui_dynamic_cast<Rml::ElementFormControlSelect*>(find_role(card, "profile"))) {
+            sel->RemoveAll();
+            sel->Add("Custom", "");
+            for (const auto& pr : cfg.profiles) sel->Add(pr.name, pr.name);
+            sel->SetValue(pc.profile_name);
+        }
+
+        if (Rml::Element* binds = find_role(card, "binds")) {
+            Rml::String rml;
+            for (int i = 0; i < (int)ic::N64Input::Count; i++) {
+                const ic::InputInfo& inf = ic::input_info((ic::N64Input)i);
+                rml += "<div class=\"bind-row\" data-port=\"" + std::to_string(p) + "\" data-input=\"";
+                rml += inf.key;
+                rml += "\"><span class=\"bind-label\">";
+                rml += inf.label;
+                rml += "</span><span class=\"bind-value\">";
+                rml += bind_display(pc.bindings.map[i]);
+                rml += "</span></div>";
+            }
+            binds->SetInnerRML(rml);
+        }
+    }
+    g_populating_ctrl = false;
+}
+
+// ---- live rebind capture ----
+void finish_rebind() {
+    if (g_rebind.row != nullptr) g_rebind.row->SetClass("listening", false);
+    g_rebind.row = nullptr;
+    g_rebind.port = -1;
+    g_rebind.active.store(false);
+}
+
+void begin_rebind(Rml::Element* row) {
+    const int port = attr_port(row);
+    const int idx  = input_index_for_key(std::string(row->GetAttribute<Rml::String>("data-input", Rml::String())));
+    if (port < 0 || idx < 0) return;
+    finish_rebind();
+    g_rebind.port = port;
+    g_rebind.input = (ic::N64Input)idx;
+    g_rebind.row = row;
+    g_rebind.active.store(true);
+    row->SetClass("listening", true);
+    if (Rml::Element* v = find_class(row, "bind-value")) v->SetInnerRML("Press a key/button...");
+}
+
+// Consume the next input event as the pending binding. Returns true if the event was handled (so the
+// draw hook does NOT forward it to RmlUi). Runs on the render thread inside the event drain.
+bool handle_rebind_event(const SDL_Event& ev) {
+    if (!g_rebind.active.load()) return false;
+    ic::Bind bind;
+    bool commit = false;
+    if (ev.type == SDL_KEYDOWN) {
+        if (ev.key.keysym.scancode == SDL_SCANCODE_ESCAPE) { finish_rebind(); return true; }
+        bind.source = ic::BindSource::Keyboard;
+        bind.code = ev.key.keysym.scancode;
+        commit = true;
+    } else if (ev.type == SDL_CONTROLLERBUTTONDOWN) {
+        bind.source = ic::BindSource::GamepadButton;
+        bind.code = ev.cbutton.button;
+        commit = true;
+    } else if (ev.type == SDL_CONTROLLERAXISMOTION) {
+        if (std::abs((int)ev.caxis.value) <= 20000) return true;   // ignore idle/noise, keep listening
+        bind.source = ic::BindSource::GamepadAxis;
+        bind.code = ev.caxis.axis;
+        bind.dir = ev.caxis.value > 0 ? 1 : -1;
+        commit = true;
+    } else {
+        return false;
+    }
+    if (!commit) return true;
+
+    const int port = g_rebind.port;
+    const ic::N64Input in = g_rebind.input;
+    Rml::Element* row = g_rebind.row;
+    if (port >= 0 && port < 4) {
+        ic::InputConfig cfg = ic::get();
+        cfg.ports[port].bindings.map[(int)in] = bind;
+        cfg.ports[port].profile_name = "";   // edited -> no longer a named profile
+        apply_input_config(cfg);
+        if (row != nullptr) {
+            if (Rml::Element* v = find_class(row, "bind-value")) v->SetInnerRML(bind_display(bind));
+        }
+        if (Rml::Element* card = g_controls_doc->GetElementById("port_" + std::to_string(port))) {
+            if (auto* sel = rmlui_dynamic_cast<Rml::ElementFormControl*>(find_role(card, "profile"))) {
+                g_populating_ctrl = true;
+                sel->SetValue("");
+                g_populating_ctrl = false;
+            }
+        }
+    }
+    finish_rebind();
+    return true;
+}
+
+void show_controls() {
+    hide_all_docs();
+    if (g_controls_doc) {
+        populate_controls();
+        g_controls_doc->Show();
+        if (auto* e = g_controls_doc->GetElementById("back")) e->Focus(true);
+    }
+    g_menu_open.store(true);
+}
+
+void wire_controls_events() {
+    if (g_controls_doc == nullptr) return;
+    add_listener(g_controls_doc->GetElementById("back"), "click", [](Rml::Event&) {
+        if (g_rebind.active.load()) { finish_rebind(); return; }   // Back cancels an armed rebind first
+        go_back();
+    });
+
+    Rml::Element* root = g_controls_doc->GetElementById("controls_root");
+
+    // Delegated "change" for the device / pak / profile dropdowns.
+    add_listener(root, "change", [](Rml::Event& ev) {
+        if (g_populating_ctrl) return;
+        Rml::Element* el = ev.GetTargetElement();
+        while (el != nullptr && el->GetAttribute<Rml::String>("data-role", Rml::String()).empty()) el = el->GetParentNode();
+        if (el == nullptr) return;
+        const Rml::String role = el->GetAttribute<Rml::String>("data-role", Rml::String());
+        const int port = attr_port(el);
+        if (port < 0) return;
+        auto* fc = rmlui_dynamic_cast<Rml::ElementFormControl*>(el);
+        const std::string value = (fc != nullptr) ? std::string(fc->GetValue()) : std::string();
+
+        ic::InputConfig cfg = ic::get();
+        bool full_repopulate = false;
+
+        if (role == "device") {
+            ic::DeviceRef dev;
+            if (value == "keyboard") {
+                dev.type = ic::DeviceType::Keyboard;
+            } else if (value.rfind("gpad:", 0) == 0) {
+                dev.type = ic::DeviceType::Gamepad;
+                dev.guid = value.substr(5);
+                std::lock_guard<std::mutex> lk(g_devices_mutex);
+                for (const auto& d : g_devices) if (d.guid == dev.guid) { dev.display_name = d.name; break; }
+            } else {
+                dev.type = ic::DeviceType::None;
+            }
+            // One physical device per port: steal it from any other port that had it.
+            if (dev.type != ic::DeviceType::None) {
+                for (int q = 0; q < 4; q++) {
+                    if (q == port) continue;
+                    ic::DeviceRef& od = cfg.ports[q].device;
+                    const bool same = (od.type == dev.type) &&
+                                      (dev.type == ic::DeviceType::Keyboard || od.guid == dev.guid);
+                    if (same) { od = ic::DeviceRef{}; full_repopulate = true; }
+                }
+            }
+            cfg.ports[port].device = dev;
+            if (dev.type != ic::DeviceType::None) cfg.ports[port].connected = true;   // picking a device plugs it in
+            // Default the binds to the matching profile when the current ones don't fit the new device
+            // (e.g. a freshly-assigned controller on an empty port, or switching keyboard<->gamepad), so
+            // the device works immediately without manual rebinding.
+            if (dev.type != ic::DeviceType::None && !ic::bindings_match_device(cfg.ports[port].bindings, dev.type)) {
+                const char* prof = (dev.type == ic::DeviceType::Gamepad) ? "Default Gamepad" : "Default Keyboard";
+                if (const ic::BindingProfile* pr = ic::find_profile(cfg, prof)) {
+                    cfg.ports[port].bindings = pr->bindings;
+                    cfg.ports[port].profile_name = prof;
+                    full_repopulate = true;   // refresh the bind rows to the applied profile
+                }
+            }
+        } else if (role == "pak") {
+            cfg.ports[port].pak = str_to_enum(value, ic::PakType::None);
+        } else if (role == "profile") {
+            if (!value.empty()) {
+                if (const ic::BindingProfile* pr = ic::find_profile(cfg, value)) {
+                    cfg.ports[port].bindings = pr->bindings;
+                    cfg.ports[port].profile_name = value;
+                    full_repopulate = true;   // refresh the bind rows to the profile
+                }
+            } else {
+                cfg.ports[port].profile_name = "";
+            }
+        } else {
+            return;
+        }
+
+        apply_input_config(cfg);
+        if (full_repopulate) {
+            g_controls_dirty.store(true);   // deferred to after the drain (see draw_hook)
+        } else if (role == "device") {
+            if (Rml::Element* card = g_controls_doc->GetElementById("port_" + std::to_string(port))) {
+                card->SetClass("unplugged", !cfg.ports[port].connected);
+                if (Rml::Element* plug = find_role(card, "plug")) {
+                    plug->SetClass("on", cfg.ports[port].connected);
+                    plug->SetInnerRML(cfg.ports[port].connected ? "Plugged in" : "Unplugged");
+                }
+            }
+        }
+    });
+
+    // Delegated "click" for the plug toggle, Save-profile button, and bind rows.
+    add_listener(root, "click", [](Rml::Event& ev) {
+        Rml::Element* el = ev.GetTargetElement();
+
+        // A bind row (walk up to the element carrying data-input) -> enter rebind capture.
+        Rml::Element* brow = el;
+        while (brow != nullptr && brow->GetAttribute<Rml::String>("data-input", Rml::String()).empty()) brow = brow->GetParentNode();
+        if (brow != nullptr) { begin_rebind(brow); return; }
+
+        Rml::Element* rel = el;
+        while (rel != nullptr && rel->GetAttribute<Rml::String>("data-role", Rml::String()).empty()) rel = rel->GetParentNode();
+        if (rel == nullptr) return;
+        const Rml::String role = rel->GetAttribute<Rml::String>("data-role", Rml::String());
+        const int port = attr_port(rel);
+        if (port < 0) return;
+
+        if (role == "plug") {
+            ic::InputConfig cfg = ic::get();
+            cfg.ports[port].connected = !cfg.ports[port].connected;
+            apply_input_config(cfg);
+            rel->SetClass("on", cfg.ports[port].connected);
+            rel->SetInnerRML(cfg.ports[port].connected ? "Plugged in" : "Unplugged");
+            if (Rml::Element* card = g_controls_doc->GetElementById("port_" + std::to_string(port))) {
+                card->SetClass("unplugged", !cfg.ports[port].connected);
+            }
+        } else if (role == "save_profile") {
+            ic::InputConfig cfg = ic::get();
+            std::string base = "Port " + std::to_string(port + 1) + " custom";
+            std::string name = base;
+            for (int n = 2; ic::find_profile(cfg, name) != nullptr; n++) name = base + " " + std::to_string(n);
+            ic::save_profile(name, cfg.ports[port].bindings);   // adds to the library + persists
+            ic::InputConfig cfg2 = ic::get();
+            cfg2.ports[port].profile_name = name;
+            apply_input_config(cfg2);
+            g_controls_dirty.store(true);   // refresh every profile dropdown with the new entry (deferred)
+        }
+    });
+}
+
 void wire_pause_events() {
     if (g_pause_doc == nullptr) return;
     add_listener(g_pause_doc->GetElementById("resume"),   "click", [](Rml::Event&) { close_overlay(); });
     add_listener(g_pause_doc->GetElementById("restart"),  "click", [](Rml::Event&) { bar_restart_game(); });
     add_listener(g_pause_doc->GetElementById("settings"), "click", [](Rml::Event&) { show_config(); });
+    add_listener(g_pause_doc->GetElementById("controls"), "click", [](Rml::Event&) { show_controls(); });
     add_listener(g_pause_doc->GetElementById("cheats"),   "click", [](Rml::Event&) { show_cheats(); });
     add_listener(g_pause_doc->GetElementById("quit"),     "click", [](Rml::Event&) { ultramodern::quit(); });
 }
@@ -447,6 +839,7 @@ void init_hook(plume::RenderInterface* interface, plume::RenderDevice* device) {
     g_config_doc   = g_context->LoadDocument(asset_path("config.rml").string());
     g_cheats_doc   = g_context->LoadDocument(asset_path("cheats.rml").string());
     g_pause_doc    = g_context->LoadDocument(asset_path("pause.rml").string());
+    g_controls_doc = g_context->LoadDocument(asset_path("controls.rml").string());
     if (g_launcher_doc == nullptr) {
         std::fprintf(stderr, "[BeetleRecomp][ui] failed to load launcher.rml; menu disabled\n");
         return;
@@ -454,10 +847,12 @@ void init_hook(plume::RenderInterface* interface, plume::RenderDevice* device) {
     if (g_config_doc == nullptr) std::fprintf(stderr, "[BeetleRecomp][ui] warning: config.rml not loaded\n");
     if (g_cheats_doc == nullptr) std::fprintf(stderr, "[BeetleRecomp][ui] warning: cheats.rml not loaded\n");
     if (g_pause_doc  == nullptr) std::fprintf(stderr, "[BeetleRecomp][ui] warning: pause.rml not loaded\n");
+    if (g_controls_doc == nullptr) std::fprintf(stderr, "[BeetleRecomp][ui] warning: controls.rml not loaded\n");
 
     wire_launcher_events();
     wire_config_events();
     wire_cheats_events();
+    wire_controls_events();
     wire_pause_events();
     // Initial overlay page. BAR_SKIP_LAUNCHER starts with the menu hidden (headless / BAR_FORCESTATE
     // runs); BAR_UI_PAGE=cheats|settings opens straight to that page (UI dev aid).
@@ -467,9 +862,11 @@ void init_hook(plume::RenderInterface* interface, plume::RenderDevice* device) {
         if (g_launcher_doc) g_launcher_doc->Hide();
         if (g_config_doc) g_config_doc->Hide();
         if (g_cheats_doc) g_cheats_doc->Hide();
+        if (g_controls_doc) g_controls_doc->Hide();
     }
     else if (start_page != nullptr && std::string(start_page) == "cheats")   show_cheats();
     else if (start_page != nullptr && std::string(start_page) == "settings") show_config();
+    else if (start_page != nullptr && std::string(start_page) == "controls") show_controls();
     else                                                                     show_launcher();
 
     g_ui_ready.store(true);
@@ -495,6 +892,9 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
     SDL_Event ev;
     while (g_event_queue.try_dequeue(ev)) {
         if (g_menu_open.load()) {
+            // Rebind capture (Controls dialog): while armed, the next key/gamepad input becomes the
+            // binding — consume it here so RmlUi never sees it as menu navigation/activation.
+            if (g_rebind.active.load() && handle_rebind_event(ev)) continue;
             RmlSDL::InputEventHandler(g_context, g_window, ev);
             // Activate the focused element on Enter / Space (our buttons/rows are <div>s; RmlUi handles
             // Tab + arrow-key focus movement itself via tab-index / the `nav` property, but not activation).
@@ -503,6 +903,12 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
                 if (Rml::Element* focused = g_context->GetFocusElement()) focused->Click();
             }
         }
+    }
+
+    // A repopulate was requested (hotplug, or an edit in a change/click handler) — do it here, AFTER
+    // the event drain, so we never RemoveAll/Add a <select> while RmlUi is mid-dispatch on it.
+    if (g_controls_dirty.exchange(false) && g_controls_doc != nullptr && g_controls_doc->IsVisible()) {
+        populate_controls();
     }
 
     // Emulator-style pause: freeze the simulation while the in-game pause menu (or a sub-page from it)
@@ -531,6 +937,8 @@ void deinit_hook() {
     g_config_doc = nullptr;
     g_cheats_doc = nullptr;
     g_pause_doc = nullptr;
+    g_controls_doc = nullptr;
+    finish_rebind();
     g_context = nullptr;
     g_listeners.clear();
     Rml::Shutdown();
@@ -553,6 +961,18 @@ void handle_sdl_event(const SDL_Event& event) {
 
 bool menu_capturing_input() {
     return g_menu_open.load();
+}
+
+void publish_gamepads(const std::vector<UiGamepad>& list) {
+    {
+        std::lock_guard<std::mutex> lk(g_devices_mutex);
+        g_devices = list;
+    }
+    g_controls_dirty.store(true);   // draw_hook repopulates an open Controls page next frame
+}
+
+bool rebind_listening() {
+    return g_rebind.active.load();
 }
 
 bool consume_play_request(fs::path& out_rom) {
