@@ -123,7 +123,7 @@ GraphicsConfig default_graphics_config() {
     using namespace ultramodern::renderer;
     GraphicsConfig c{};
     c.developer_mode  = false;
-    c.res_option      = Resolution::Original;                 // native internal res (matches prior behavior)
+    c.res_option      = Resolution::Auto;                     // display-native: render at the window/monitor resolution (integer scale)
     c.wm_option       = WindowMode::Windowed;
     c.hr_option       = HUDRatioMode::Original;
     c.api_option      = GraphicsApi::Auto;                    // RT64 picks D3D12 on Windows / Vulkan on Linux
