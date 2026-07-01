@@ -40,17 +40,16 @@ Disable level-of-detail swapping for cars (always render the high-detail model).
 car LOD selection in the decomp (`lib/bar-decomp` car/model modules) and a host flag (bar_config-style)
 or RDRAM poke / patch. **Files:** `lib/bar-decomp` (find LOD logic), `src/main/bar_config.cpp` or a cheat.
 
-### R6. 🚧 Fix the main-menu transition flash while KEEPING the animation
-**Investigated 2026-06-30:** the animation is NOT disabled anywhere — no `NOFILMROLL`/film-roll flag,
-no fix-recompiled rule, no committed change, no env var. The `filmroll` module
-(`lib/bar-decomp/src/modules/filmroll.c`, GLOBAL_ASM) and the selection slide
-(`func_selection_00418800`) are present and active. So the perceived "disabled animation" is the
-STATUS-3 **flash** making the slide look broken/cut — not an actual disable. The flash is an RT64 HLE
-framebuffer issue (the slide samples a just-written FB with no tracked RT64 target → 1-frame flash).
-**Next (needs runtime tracing):** capture the slide in RenderDoc / RT64 debug to confirm which FB
-address is mis-reconstructed during `func_selection_00418800`, then an RT64-side fix in the framebuffer
-renderer (`lib/rt64/src/render/`) to clear/skip the reconstructed tile when there's no tracked target.
-Requires the machine for frame capture; see STATUS.md item 3.
+### R6. ✅ Main-menu film-roll transition animates again — DONE 2026-06-30
+**Root cause:** the transition is a **VI-origin pan** — `func_filmroll_00400170` loops calling
+`osViSwapBuffer(s0)`, stepping the origin `0xF00` B/frame from page A's framebuffer (`0x1DA800`) into
+page B's (`0x200000`), one screen height over ~40 frames / ~720 ms at 60 fps. It never redraws; only the
+VI origin moves. Our `enable_instant_present()` had put RT64 into **PresentEarly** mode, which presents
+only freshly-**rendered** content and drops VI-origin-only changes — so the pan collapsed to an instant
+swap. **Fix:** `src/main/rt64_render_context.cpp` keeps RT64's default **SkipBuffering** mode (presents
+VI-origin changes, console-accurate); opt into PresentEarly for min latency with `BAR_INSTANT_PRESENT=1`.
+Verified headlessly frame-by-frame (burst capture — see docs/HEADLESS_TESTING.md). Full writeup:
+docs/R6_FILMROLL_FINDINGS.md. (The earlier "STATUS-3 flash / framebuffer" theory was wrong.)
 
 ---
 
@@ -71,16 +70,56 @@ needs a decorator for that; folded into a future pass).
 **Files touched:** `src/ui/assets/{launcher,config,cheats}.rml`, `src/ui/ui_renderer.cpp` (build fix:
 `createCommandList()` takes no args in this plume version), `src/ui/bar_ui.cpp`.
 
-### 2. ⬜ Fix see-through seams between world-geometry planes
-**Problem:** adjacent planes of world geometry sometimes show a thin see-through seam/gap at the
-join. Classic HLE class of bug — coplanar/abutting tris with depth or sub-pixel-coordinate
-precision mismatch, or a near-plane / Z-fighting / fill-rule gap. (BAR uses stock
-`gspF3DEX2_fifo`, which RT64 supports directly — see README "Verified findings".)
-**Next:** capture a seam in RenderDoc / RT64 debug; determine whether it's (a) depth precision
-(try RT64 high-precision FB / depth settings), (b) sub-pixel/coordinate rounding in the F3DEX2 tri
-path, or (c) a fog/decal edge. This belongs to the "per-game F3DEX2 rendering quirks" bucket.
-**Files:** `lib/rt64/` (HLE tri raster / framebuffer), possibly a `patches/` workaround if it's a
-game-side coordinate quirk.
+### 2. 🚧 Fix see-through seams between world-geometry planes — investigated 2026-06-30, plan ready
+**Problem:** adjacent/abutting (often coplanar) world-geometry tris show a thin see-through crack at
+the shared edge, revealing the background/skybox.
+**Root cause (CONFIRMED, not depth/decal):** classic N64 HLE artifact. The RDP fills shared edges via
+sub-pixel **coverage** (fixed-point grid, complementary coverage → seamless); HLE transforms vertices
+in **float** and the host GPU rasterizer reproduces neither the coverage edge-fill nor the **VI "divot"
+filter** (a per-channel median-of-3 that hardware uses at scanout to fill the "one-pixel holes [that]
+appear where polygons are connected together" — Nintendo VI manual, verbatim our bug). Proven by
+forcing angrylion's accurate RDP into non-AA mode → gaps appear ([GLideN64 #2397](https://github.com/gonetz/GLideN64/issues/2397)).
+No HLE renderer fully eliminates these; they **mask** (AA/resolution) or **patch geometry**
+(Zelda64Recomp's "Seam Fixer" mod). Our default is **native** rasterization (`res_option=Original`,
+`ds_option=1`), so the holes are ≤1 native px but show because we run **no divot** — then get magnified
+by the window scale-up. (Decal/Z-fight _flicker_ is a different bug, out of scope.)
+**Full plan + exact code changes:** [SEAM_FIX_PLAN.md](SEAM_FIX_PLAN.md). Two fixes, each with a
+Settings-menu option:
+
+#### 2A. ⬜ MSAA + Supersampling (mask — cheap, existing knobs)
+Adds edge coverage + supersamples thin geometry → softens/reduces seams. MSAA control already exists;
+this defaults it to 4× and exposes the existing (but menu-less) `ds_option` SSAA knob.
+- Default `msaa_option` None → **MSAA4X** ([config.cpp:129](../src/game/config.cpp)).
+- New **Supersampling (SSAA)** `<select id="ds_option">` (Off/2×/4×) — add to `config.rml` + the
+  `config_to_controls`/`controls_to_config_and_apply` get/set in [bar_ui.cpp:144-178](../src/ui/bar_ui.cpp)
+  (int, like `rr_manual`). Both apply **on restart** (the `m_live_*` lock).
+- **Files:** `src/game/config.cpp`, `src/ui/assets/config.rml`, `src/ui/bar_ui.cpp`.
+
+#### 2B. ⬜ VI "divot" filter (the faithful fix — reconstruct the hardware concealer)
+A per-channel **horizontal median-of-3 at native-pixel spacing**, folded into the existing VI pixel
+shader (the shader already samples the fb at native-texel granularity → no new pass/pipeline/shader
+file; runs at the correct resolution; composes with all filtering). New **Seam filter (VI divot)**
+`<select id="divot_option">` (Auto/On/Off) — a per-frame flag, so it applies **live** (not under the
+restart lock). Honest limit: without coverage a median can't distinguish a 1px hole from an intentional
+1px line — mitigated by horizontal-only + threshold + Auto/Off toggle (B3 coverage-gated version is a
+larger follow-up).
+- **B0 ✅ verified (static):** BAR's LAN1 VI mode sets `VI_CTRL_DIVOT_ON` (0x10) with no dynamic
+  toggle (`bar-decomp/.../vimodentsclan1.c:19`, `sched.c:74-97`) → divot bit always on → **default Auto**.
+- **B2 plumbing ✅ verified:** mirror `filtering` — `userConfig.filtering` →
+  `sharedResources->userConfig` ([present_queue.h:112](../lib/rt64/src/hle/rt64_present_queue.h)) →
+  `renderParams` ([:323](../lib/rt64/src/hle/rt64_present_queue.cpp)); push-constant layout is
+  `sizeof`-based so adding CB fields needs no layout edit.
+- **✅ Prereq done:** `lib/rt64` forked to `bryankruman/rt64` + submodule repointed (2026-06-30, commit
+  `2d8383a`); RT64 edits now commit on the fork (`upstream` = `rt64/rt64`, pinned `f0728a2` unchanged).
+- **Files:** `lib/rt64/src/shared/rt64_video_interface.h` (CB field),
+  `lib/rt64/src/shaders/VideoInterfacePS.hlsl` (median), `lib/rt64/src/render/rt64_vi_renderer.{h,cpp}`,
+  `lib/rt64/src/hle/rt64_present_queue.cpp` (set `renderParams.divotFilter` next to `.filtering` at :323),
+  `lib/N64ModernRuntime/.../config.hpp` (`DivotFilter` enum), `src/game/config.cpp`,
+  `src/ui/assets/config.rml`, `src/ui/bar_ui.cpp`, `src/main/rt64_render_context.cpp` (map + plumb like
+  `filtering`).
+
+**Still worth one RenderDoc capture** of a seam to reconfirm it's the coverage/edge class (background
+through the crack), not a decal/Z-fight case.
 
 ### 3. ⬜ Add a high-**resolution** rendering mode
 **Note:** this is resolution scaling (internal render res), *distinct from* the high-**fps**

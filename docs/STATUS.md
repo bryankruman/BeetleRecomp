@@ -212,12 +212,25 @@ stubbed — so the game blocked forever waiting for an SI-complete event and nev
 `__osMaxControllers` to 4 (`fix-recompiled.sh` rule B) so a `READ_BUTTON` command is actually packed. The
 game now renders at 60 fps and reads keyboard input.
 
+## Visual verification — standard practice
+**To see what's on screen, capture RT64's internal render — never a window-manager screenshot.** RT64's
+present is read back GPU→PNG headlessly (no window focus needed), so it's the ground truth and works in
+CI/background runs. Standard tools (all in **[HEADLESS_TESTING.md](HEADLESS_TESTING.md)**):
+- `BAR_SHOTS="frame:path …"` — capture at scripted input frames (aligned with `BAR_AUTOPLAY`).
+- `BAR_SHOT_BURST="fc:dir:count"` — record N consecutive presents to `dir/fNNNN.png` for **animations**
+  the input timeline can't sample (e.g. the film-roll, where the game blocks in a render loop).
+- `RT64_SHOT_TRIGGER`/`RT64_SHOT_OUT` — ad-hoc file-triggered single capture.
+
+Combine with `BAR_SKIP_LAUNCHER=1` + `BAR_AUTOPLAY` to drive the game to any screen and capture it. Don't
+assume where you are — capture and look (see memory `verify-on-the-actual-screen`).
+
 ## Common diagnostic env flags
 `BAR_FPS` (fps counter) · `BAR_NO_AUDIO` (disable audio) · `BAR_AUDIO_DBG` (queue min/max + underrun + peak/
 clip) · `BAR_AUDIO_BUFFER=<vi>` (audio buffer depth, default 2.5) · `BAR_AUDIO_XFORM` / `BAR_AUDIO_CAPTURE`
 (PCM transform / capture) · `BAR_DEBUG_OVERLAYS` (log module loads) · `BAR_NO_INTRO_SKIP` (disable A/B/Start
 intro skip) · `BAR_AUTOPLAY="frames:hexbtn …"` (scripted input: A=8000 B=4000 START=1000 UP=0800) ·
-`BAR_FORCESTATE="frame:state …"` (force `gGameSettings->gameStateFlag`).
+`BAR_FORCESTATE="frame:state …"` (force `gGameSettings->gameStateFlag`) · `BAR_INSTANT_PRESENT` (opt into
+RT64 PresentEarly / min-latency; off by default so VI-origin menu transitions like the film-roll animate).
 
 ## Remaining roadmap (after the current polish items)
 

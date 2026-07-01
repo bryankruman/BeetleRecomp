@@ -503,10 +503,80 @@ static void bar_poll_gamepad(uint16_t* btn, int* sx, int* sy) {
     }
 }
 
+// BAR_SHOTS="frame:path frame:path ..." — request an internal-render screenshot (RT64 GPU readback -> PNG)
+// at each listed frame, on the SAME frame counter as BAR_AUTOPLAY so captures line up with scripted input.
+extern "C" void bar_rt64_request_screenshot(const char *path);
+static void bar_shots_poll() {
+    struct Shot { unsigned long frame; std::string path; };
+    static std::vector<Shot> shots;
+    static bool parsed = false;
+    static size_t idx = 0;
+    static unsigned long long fc = 0;
+    if (!parsed) {
+        parsed = true;
+        if (const char *s = std::getenv("BAR_SHOTS")) {
+            for (const char *p = s; *p; ) {
+                while (*p == ' ' || *p == '\t') ++p;
+                if (!*p) break;
+                char *e = nullptr;
+                long fr = std::strtol(p, &e, 10);
+                if (e && *e == ':') {
+                    const char *ps = e + 1, *pe = ps;
+                    while (*pe && *pe != ' ' && *pe != '\t') ++pe;
+                    if (fr > 0 && pe > ps) shots.push_back({ (unsigned long)fr, std::string(ps, pe - ps) });
+                    p = pe;
+                } else {
+                    p = (e && e != p) ? e : p + 1;
+                }
+            }
+            std::fprintf(stderr, "[BeetleRecomp] BAR_SHOTS: %zu scheduled\n", shots.size());
+        }
+    }
+    ++fc;
+    while (idx < shots.size() && fc >= shots[idx].frame) {
+        bar_rt64_request_screenshot(shots[idx].path.c_str());
+        std::fprintf(stderr, "[BeetleRecomp] BAR_SHOTS -> %s @fc=%llu\n", shots[idx].path.c_str(), (unsigned long long)fc);
+        ++idx;
+    }
+}
+
+// BAR_SHOT_BURST="fc:dir:count" — at input frame fc, tell RT64 to capture the next `count` presents to
+// dir/fNNNN.png (one per present). For animations the input timeline can't sample (film-roll transition:
+// the game blocks in a render loop and stops polling input, so BAR_SHOTS frames freeze mid-roll). Trigger
+// a few frames BEFORE the transition, while fc is still advancing; RT64 then counts presents on its own.
+extern "C" void bar_rt64_start_burst(const char *dir, int count);
+static void bar_burst_poll() {
+    static bool parsed = false, fired = false;
+    static unsigned long fc_trigger = 0; static int count = 0; static std::string dir;
+    static unsigned long long fc = 0;
+    if (!parsed) {
+        parsed = true;
+        if (const char *s = std::getenv("BAR_SHOT_BURST")) {
+            std::string spec(s);
+            size_t c1 = spec.find(':'), c2 = (c1 == std::string::npos) ? std::string::npos : spec.find(':', c1 + 1);
+            if (c2 != std::string::npos) {
+                fc_trigger = std::strtoul(spec.substr(0, c1).c_str(), nullptr, 10);
+                dir = spec.substr(c1 + 1, c2 - c1 - 1);
+                count = std::atoi(spec.substr(c2 + 1).c_str());
+            }
+            std::fprintf(stderr, "[BeetleRecomp] BAR_SHOT_BURST: fc=%lu dir=%s count=%d\n", fc_trigger, dir.c_str(), count);
+        }
+    }
+    ++fc;
+    if (!fired && count > 0 && fc >= fc_trigger) {
+        fired = true;
+        bar_rt64_start_burst(dir.c_str(), count);
+        std::fprintf(stderr, "[BeetleRecomp] BAR_SHOT_BURST triggered @fc=%llu\n", (unsigned long long)fc);
+        std::fflush(stderr);
+    }
+}
+
 extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y) {
     if (stick_x) *stick_x = 0;
     if (stick_y) *stick_y = 0;
     if (port != 0) return 0;
+    bar_shots_poll();
+    bar_burst_poll();
     static const char* autoplay = std::getenv("BAR_AUTOPLAY");
     if (autoplay && *autoplay) return bar_autoplay_poll(autoplay, stick_x, stick_y);
 #ifdef BEETLE_ENABLE_UI
@@ -577,7 +647,7 @@ int main(int argc, char** argv) {
     // ~15.6ms timer resolution, each wake quantizes to ~15.6ms, so a single gfx round-trip costs ~2 quanta
     // (~32ms) and a menu frame several — capping the menu at ~10fps. (A race never waits — it always has gfx
     // queued — so it was unaffected and this was wrongly dismissed as "jitter only".) winmm is linked.
-    timeBeginPeriod(1);
+    if (std::getenv("BAR_NO_TIMER_FIX") == nullptr) timeBeginPeriod(1);  // R6 bisect: BAR_NO_TIMER_FIX=1 reverts this menu-FPS fix
 #endif
 
     recomp::Version project_version{};
@@ -694,7 +764,7 @@ int main(int argc, char** argv) {
     // completion then BOUNCES (re-queues) off the full queue in a ~15M/sec busy-spin that starves the
     // cooperative scheduler and throttled the menu to ~10fps. SI completions are disposable (live input is
     // re-read from PIF RAM each frame), so drop the excess instead of bouncing it.
-    config.message_queue_control.requeue_si = false;
+    config.message_queue_control.requeue_si = (std::getenv("BAR_REQUEUE_SI") != nullptr);  // R6 bisect: default false (the menu-FPS fix); BAR_REQUEUE_SI=1 reverts to stock true
     // config.window_handle / events_callbacks: defaults are fine for now.
 
     // Cooperative audio-thread preemption: raise a host "yield now" flag at ~500Hz; a poll injected at every

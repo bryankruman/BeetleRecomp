@@ -20,6 +20,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <cstdlib>   // R6 bisect: std::getenv(BAR_NO_PREEMPT)
 
 #include <ultramodern/ultramodern.hpp>   // is_game_thread, is_game_started, set_native_thread_name
 
@@ -37,6 +38,8 @@ static std::atomic<bool> g_preempt_run{true};
 static constexpr int kBarMaxPreemptPriority = 100;   // audio mgr ~110, scheduler 127 are above this
 
 extern "C" int bar_consume_yield(uint8_t* rdram) {
+    static const bool bar_no_preempt = std::getenv("BAR_NO_PREEMPT") != nullptr;  // R6 bisect: BAR_NO_PREEMPT=1 disables cooperative-preempt
+    if (bar_no_preempt) return 0;
     if (!g_should_yield.load(std::memory_order_relaxed)) return 0;   // hot path: one relaxed load
     if (!ultramodern::is_game_thread())  return 0;                   // never yield off game threads (RSP task / gfx)
     if (!ultramodern::is_game_started()) return 0;
