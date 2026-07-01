@@ -229,8 +229,10 @@ assume where you are — capture and look (see memory `verify-on-the-actual-scre
 clip) · `BAR_AUDIO_BUFFER=<vi>` (audio buffer depth, default 2.5) · `BAR_AUDIO_XFORM` / `BAR_AUDIO_CAPTURE`
 (PCM transform / capture) · `BAR_DEBUG_OVERLAYS` (log module loads) · `BAR_NO_INTRO_SKIP` (disable A/B/Start
 intro skip) · `BAR_AUTOPLAY="frames:hexbtn …"` (scripted input: A=8000 B=4000 START=1000 UP=0800) ·
-`BAR_FORCESTATE="frame:state …"` (force `gGameSettings->gameStateFlag`) · `BAR_INSTANT_PRESENT` (opt into
-RT64 PresentEarly / min-latency; off by default so VI-origin menu transitions like the film-roll animate).
+`BAR_FORCESTATE="frame:state …"` (force `gGameSettings->gameStateFlag`) · `BAR_PRESENT_MODE=console|skip|early`
+(RT64 present mode; default **console** = present from the VI origin, so VI-origin menu transitions like the
+film-roll animate cleanly with no pre-pan flash. `skip`=SkipBuffering, `early`=PresentEarly/min-latency) ·
+`BAR_INSTANT_PRESENT` (legacy alias for `early`).
 
 ## Remaining roadmap (after the current polish items)
 

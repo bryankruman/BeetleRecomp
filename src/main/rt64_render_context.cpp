@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #ifndef HLSL_CPU
@@ -331,22 +332,32 @@ bool RT64Context::update_config(const ultramodern::renderer::GraphicsConfig& old
 }
 
 void RT64Context::enable_instant_present() {
-    // RT64's PresentEarly mode presents a frame as soon as the renderer produces it (lower latency),
-    // but it ONLY presents freshly-RENDERED content. BAR draws its main-menu page transitions (the
-    // "film-roll") by PANNING the VI origin with osViSwapBuffer across a pre-rendered tall framebuffer
-    // WITHOUT redrawing — so PresentEarly never shows those VI-origin-only changes and the roll
-    // collapses to an instant page swap (see docs/R6_FILMROLL_FINDINGS.md). RT64's default SkipBuffering
-    // mode presents VI-origin changes correctly, which is what the console does, so we keep the default.
-    // Opt in to PresentEarly with BAR_INSTANT_PRESENT for minimum input latency if you don't need the
-    // VI-pan menu transitions. ultramodern's gfx thread calls this once per session (events.cpp).
-    if (std::getenv("BAR_INSTANT_PRESENT") == nullptr) {
-        return;   // keep RT64 default (SkipBuffering) — VI-origin pans (film-roll) present correctly
+    // Despite the name (an ultramodern interface hook called once per session from the gfx thread),
+    // BAR uses RT64's **Console** presentation mode — present strictly from the VI origin, at VI time.
+    // This is what the console does and it's required for BAR's menu page transitions (the "film-roll"),
+    // which PAN the VI origin with osViSwapBuffer across a pre-rendered tall framebuffer without redrawing:
+    //   - PresentEarly presents only freshly-RENDERED content, so it drops the VI-origin pan entirely
+    //     -> the transition collapses to an instant swap (the original R6 bug).
+    //   - SkipBuffering presents the just-rendered framebuffer, so when setup renders the destination
+    //     page it flashes that page for one frame BEFORE the pan begins (a visible glitch).
+    //   - Console presents exactly the VI-origin framebuffer each frame -> the roll scrolls cleanly with
+    //     no pre-pan flash. See docs/R6_FILMROLL_FINDINGS.md.
+    // BAR_PRESENT_MODE overrides for testing: "console" (default) | "skip" | "early". BAR_INSTANT_PRESENT
+    // is a legacy alias for "early" (min latency, but breaks the VI-pan transitions).
+    if (app == nullptr) {
+        return;
     }
-    if (app != nullptr) {
-        app->enhancementConfig.presentation.mode =
-            RT64::EnhancementConfiguration::Presentation::Mode::PresentEarly;
-        app->updateEnhancementConfig();
+    using Mode = RT64::EnhancementConfiguration::Presentation::Mode;
+    Mode m = Mode::Console;
+    if (const char* pm = std::getenv("BAR_PRESENT_MODE")) {
+        if      (std::strcmp(pm, "skip")  == 0) m = Mode::SkipBuffering;
+        else if (std::strcmp(pm, "early") == 0) m = Mode::PresentEarly;
+        else                                    m = Mode::Console;
+    } else if (std::getenv("BAR_INSTANT_PRESENT") != nullptr) {
+        m = Mode::PresentEarly;
     }
+    app->enhancementConfig.presentation.mode = m;
+    app->updateEnhancementConfig();
 }
 
 uint32_t RT64Context::get_display_framerate() const {

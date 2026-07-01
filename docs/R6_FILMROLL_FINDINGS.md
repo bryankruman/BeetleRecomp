@@ -5,14 +5,22 @@ menu pages should *roll* the strip (a vertical scroll from one page to the next)
 instantly.
 
 ## Resolution (fix)
-The transition is a **VI-origin pan**, and RT64 was in **PresentEarly** mode, which never presents
-VI-origin-only changes. Fixed by keeping RT64's default **SkipBuffering** presentation mode.
+The transition is a **VI-origin pan**. RT64's presentation mode decides whether it shows correctly:
 
-- **Fix:** `src/main/rt64_render_context.cpp` — `enable_instant_present()` no longer forces
-  `PresentEarly`; it leaves RT64's default `SkipBuffering`. Opt back into PresentEarly (minimum input
-  latency, but no VI-pan transitions) with `BAR_INSTANT_PRESENT=1`.
-- **Verified** headlessly: the film-roll now animates as a smooth vertical scroll (title → MAIN MENU),
-  captured frame-by-frame with the burst tool (`BAR_SHOT_BURST` / `bar_rt64_start_burst`).
+| mode | film-roll pan | pre-pan flash |
+|---|---|---|
+| PresentEarly (was forced by us) | **no** — dropped, instant swap | — |
+| SkipBuffering (RT64 default) | yes | **yes** — flashes the destination page 1 frame before the pan |
+| **Console (our fix)** | **yes** | **no** |
+
+- **Fix:** `src/main/rt64_render_context.cpp` — `enable_instant_present()` now selects RT64's **Console**
+  presentation mode (present strictly from the VI origin, at VI time — what the console does). `BAR_PRESENT_MODE=skip|early|console` overrides; `BAR_INSTANT_PRESENT=1` is a legacy alias for `early`.
+- **Two rounds:** first switched PresentEarly→SkipBuffering (roll animated but flashed the destination page
+  for one frame during setup, because SkipBuffering presents the just-rendered framebuffer). Console
+  presents only the VI-origin framebuffer, so the setup render of the destination is never shown early.
+- **Verified** headlessly frame-by-frame with the burst tool (`BAR_SHOT_BURST` / `bar_rt64_start_burst`):
+  title → clean vertical scroll → MAIN MENU, no flash. SkipBuffering `f0001` = destination page (flash);
+  Console `f0001` = still the source page (no flash).
 
 ## The mechanism (how the roll actually works)
 `func_filmroll_00400170` (`RecompiledFuncs/funcs_28.c`) **is the animation loop** (not "setup" — an early
