@@ -78,6 +78,7 @@ nlohmann::json graphics_to_json(const GraphicsConfig& c) {
         {"rr_manual_value", c.rr_manual_value},
         {"ds_option",       c.ds_option},
         {"divot_option",    c.divot_option},
+        {"present_fill_mode", c.pfm_option},
     };
 }
 
@@ -97,6 +98,7 @@ GraphicsConfig graphics_from_json(const nlohmann::json& j) {
     c.rr_manual_value = j.value("rr_manual_value", c.rr_manual_value);
     c.ds_option       = j.value("ds_option",       c.ds_option);
     c.divot_option    = j.value("divot_option",    c.divot_option);
+    c.pfm_option      = j.value("present_fill_mode", c.pfm_option);
     return c;
 }
 
@@ -134,6 +136,7 @@ GraphicsConfig default_graphics_config() {
     c.rr_manual_value = 144;                                  // only consulted when rr_option == Manual
     c.ds_option       = 1;
     c.divot_option    = DivotFilter::Auto;                    // seam fix 2B: match the game's VI divot bit (on for BAR)
+    c.pfm_option      = PresentFillMode::Pillarbox;           // letterbox: keep the original pillarbox present by default (no regression)
     return c;
 }
 

@@ -82,6 +82,14 @@ RT64::UserConfiguration::DivotFilter to_rt64(ultramodern::renderer::DivotFilter 
         default:                                       return RT64::UserConfiguration::DivotFilter::OptionCount;
     }
 }
+RT64::UserConfiguration::PresentFillMode to_rt64(ultramodern::renderer::PresentFillMode o) {
+    switch (o) {
+        case ultramodern::renderer::PresentFillMode::Pillarbox: return RT64::UserConfiguration::PresentFillMode::Pillarbox;
+        case ultramodern::renderer::PresentFillMode::Crop:      return RT64::UserConfiguration::PresentFillMode::Crop;
+        case ultramodern::renderer::PresentFillMode::Stretch:   return RT64::UserConfiguration::PresentFillMode::Stretch;
+        default:                                                return RT64::UserConfiguration::PresentFillMode::OptionCount;
+    }
+}
 
 void set_application_user_config(RT64::Application* app, const ultramodern::renderer::GraphicsConfig& config) {
     // Render-resolution scale + supersampling. ds_option is the SSAA (downsample) factor: the scene is
@@ -132,6 +140,7 @@ void set_application_user_config(RT64::Application* app, const ultramodern::rend
     app->userConfig.refreshRateTarget   = config.rr_manual_value;
     app->userConfig.internalColorFormat = to_rt64(config.hpfb_option);
     app->userConfig.divotFilter         = to_rt64(config.divot_option);   // BAR seam fix (2B): live VI divot toggle
+    app->userConfig.presentFillMode     = to_rt64(config.pfm_option);     // BAR letterbox: live window-fit (pillarbox/crop/stretch)
     app->userConfig.displayBuffering    = RT64::UserConfiguration::DisplayBuffering::Triple;
 }
 
