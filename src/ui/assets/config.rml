@@ -16,17 +16,34 @@
         #config_root {
             width: 560dp;
             margin: auto;
-            margin-top: 80dp;
+            margin-top: 60dp;
             padding: 32dp;
             background-color: #1b1b1ef0;
             border: 1dp #3a3a40;
             border-radius: 12dp;
         }
         h1 { font-size: 26dp; color: #f2c14e; margin-bottom: 4dp; }
-        .hint { color: #9a9a9a; font-size: 13dp; margin-bottom: 20dp; }
+        .hint { color: #9a9a9a; font-size: 13dp; margin-bottom: 16dp; }
+        /* Scrollable settings body — bounded height so the page fits any window as settings are added.
+           The Back button + restart bar stay pinned outside this so they're always reachable. */
+        #settings_scroll {
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+            max-height: 360dp;
+            overflow-y: auto;
+            padding-right: 6dp;   /* keep the scrollbar clear of the controls */
+        }
+        scrollbarvertical { width: 12dp; margin-left: 4dp; }
+        scrollbarvertical sliderbar { background-color: #4a4a52; border-radius: 6dp; min-height: 40dp; }
+        scrollbarvertical sliderbar:hover { background-color: #6a6a74; }
+        scrollbarvertical sliderbar:active { background-color: #f2c14e; }
+        scrollbarvertical sliderarrowdec, scrollbarvertical sliderarrowinc { height: 0; }
         .row {
             display: flex;
             align-items: center;
+            width: 100%;             /* definite width so flex rows don't collapse under overflow-y:auto */
+            box-sizing: border-box;
             padding: 10dp 0;
             border-bottom: 1dp #2c2c30;
         }
@@ -45,10 +62,35 @@
         input.range { width: 180dp; tab-index: auto; }
         .row.accent { background-color: #20242c; border: 1dp #2f6db0; border-radius: 8dp; padding: 10dp; }
         .row.accent .label { color: #6fb0ff; }
+        /* Restart-required affordances. The legend explains the * next to settings that only take
+           effect on relaunch; the restart bar appears (C++ adds .show) once such a setting is changed. */
+        .legend { color: #8a8a8a; font-size: 12dp; margin-top: 12dp; }
+        .restart-bar {
+            display: none;            /* shown as flex by C++ when a restart-required setting differs from launch */
+            align-items: center;
+            margin-top: 14dp;
+            padding: 10dp 12dp;
+            background-color: #2a2320;
+            border: 1dp #7a5a2a;
+            border-radius: 8dp;
+        }
+        .restart-bar.show { display: flex; }
+        .restart-msg { flex: 1; color: #e8b44e; font-size: 14dp; }
+        .btn-restart {
+            width: 130dp;
+            padding: 9dp;
+            text-align: center;
+            background-color: #f2c14e;
+            color: #1b1b1e;
+            border-radius: 6dp;
+            tab-index: auto;
+            nav: auto;
+        }
+        .btn-restart:hover, .btn-restart:focus { background-color: #ffd06a; }
         #back {
             display: block;
             width: 160dp;
-            margin-top: 24dp;
+            margin-top: 20dp;
             padding: 10dp;
             text-align: center;
             background-color: #2a2a30;
@@ -64,69 +106,88 @@
 <body>
     <div id="config_root">
         <h1>Graphics</h1>
-        <p class="hint">High refresh rate is interpolated by the renderer — game speed stays identical.</p>
-        <form id="graphics_form">
-            <div class="row accent">
-                <span class="label">Refresh rate<span class="sub">Frame interpolation target</span></span>
-                <select id="rr_option">
-                    <option value="Original">Original (game rate)</option>
-                    <option value="Display">Match display</option>
-                    <option value="Manual">Manual</option>
-                </select>
-            </div>
-            <div class="row">
-                <span class="label">Manual FPS target<span class="sub">Used when refresh rate is Manual</span></span>
-                <input id="rr_manual" class="range" type="range" min="30" max="240" step="1" value="144"/>
-            </div>
-            <div class="row">
-                <span class="label">Resolution<span class="sub">Applies on restart</span></span>
-                <select id="res_option">
-                    <option value="Original">Original (native)</option>
-                    <option value="Original2x">2x</option>
-                    <option value="Auto">Auto (window scale)</option>
-                </select>
-            </div>
-            <div class="row">
-                <span class="label">Window mode</span>
-                <select id="wm_option">
-                    <option value="Windowed">Windowed</option>
-                    <option value="Fullscreen">Fullscreen</option>
-                </select>
-            </div>
-            <div class="row">
-                <span class="label">Anti-aliasing<span class="sub">Applies on restart</span></span>
-                <select id="msaa_option">
-                    <option value="None">None</option>
-                    <option value="MSAA2X">MSAA 2x</option>
-                    <option value="MSAA4X">MSAA 4x</option>
-                    <option value="MSAA8X">MSAA 8x</option>
-                </select>
-            </div>
-            <div class="row">
-                <span class="label">Aspect ratio</span>
-                <select id="ar_option">
-                    <option value="Original">Original</option>
-                    <option value="Expand">Expand</option>
-                    <option value="Manual">Manual</option>
-                </select>
-            </div>
-            <div class="row">
-                <span class="label">HUD ratio</span>
-                <select id="hr_option">
-                    <option value="Original">Original</option>
-                    <option value="Clamp16x9">Clamp 16:9</option>
-                    <option value="Full">Full</option>
-                </select>
-            </div>
-            <div class="row">
-                <span class="label">High-precision framebuffer</span>
-                <select id="hpfb_option">
-                    <option value="Auto">Auto</option>
-                    <option value="On">On</option>
-                    <option value="Off">Off</option>
-                </select>
-            </div>
-        </form>
+        <p class="hint">High refresh rate is interpolated by the renderer — game speed stays identical. Settings marked * apply after a restart.</p>
+        <div id="settings_scroll">
+            <form id="graphics_form">
+                <div class="row accent">
+                    <span class="label">Refresh rate<span class="sub">Frame interpolation target</span></span>
+                    <select id="rr_option">
+                        <option value="Original">Original (game rate)</option>
+                        <option value="Display">Match display</option>
+                        <option value="Manual">Manual</option>
+                    </select>
+                </div>
+                <div class="row">
+                    <span class="label">Manual FPS target<span class="sub">Used when refresh rate is Manual</span></span>
+                    <input id="rr_manual" class="range" type="range" min="30" max="240" step="1" value="144"/>
+                </div>
+                <div class="row">
+                    <span class="label">Resolution *<span class="sub">Internal render scale</span></span>
+                    <select id="res_option">
+                        <option value="Original">Native (1x)</option>
+                        <option value="Original2x">2x</option>
+                        <option value="Native3x">3x</option>
+                        <option value="Native4x">4x</option>
+                        <option value="Native6x">6x</option>
+                        <option value="Native8x">8x</option>
+                        <option value="Auto">Auto — match window</option>
+                    </select>
+                </div>
+                <div class="row">
+                    <span class="label">Supersampling *<span class="sub">SSAA — renders higher, downsamples for smoother edges</span></span>
+                    <select id="ds_option">
+                        <option value="1">Off</option>
+                        <option value="2">2x</option>
+                        <option value="4">4x</option>
+                    </select>
+                </div>
+                <div class="row">
+                    <span class="label">Window mode</span>
+                    <select id="wm_option">
+                        <option value="Windowed">Windowed</option>
+                        <option value="Fullscreen">Fullscreen</option>
+                    </select>
+                </div>
+                <div class="row">
+                    <span class="label">Anti-aliasing *<span class="sub">MSAA</span></span>
+                    <select id="msaa_option">
+                        <option value="None">None</option>
+                        <option value="MSAA2X">MSAA 2x</option>
+                        <option value="MSAA4X">MSAA 4x</option>
+                        <option value="MSAA8X">MSAA 8x</option>
+                    </select>
+                </div>
+                <div class="row">
+                    <span class="label">Aspect ratio</span>
+                    <select id="ar_option">
+                        <option value="Original">Original</option>
+                        <option value="Expand">Expand</option>
+                        <option value="Manual">Manual</option>
+                    </select>
+                </div>
+                <div class="row">
+                    <span class="label">HUD ratio</span>
+                    <select id="hr_option">
+                        <option value="Original">Original</option>
+                        <option value="Clamp16x9">Clamp 16:9</option>
+                        <option value="Full">Full</option>
+                    </select>
+                </div>
+                <div class="row">
+                    <span class="label">High-precision framebuffer</span>
+                    <select id="hpfb_option">
+                        <option value="Auto">Auto</option>
+                        <option value="On">On</option>
+                        <option value="Off">Off</option>
+                    </select>
+                </div>
+            </form>
+        </div>
+        <p class="legend">* Requires a restart to apply.</p>
+        <div id="restart_bar" class="restart-bar">
+            <span class="restart-msg">Some changes need a restart to take effect.</span>
+            <div id="apply_restart" class="btn-restart">Restart now</div>
+        </div>
         <div id="back">Back</div>
     </div>
 </body>

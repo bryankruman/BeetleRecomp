@@ -73,6 +73,7 @@ enum class MenuRoot { Launcher, Pause };
 MenuRoot g_active_root = MenuRoot::Launcher;
 
 GraphicsConfig g_working_config;   // the config the menu edits; pushed to ultramodern on change
+GraphicsConfig g_applied_config;   // snapshot of the config RT64 launched with — the restart-required baseline
 
 std::atomic<bool> g_ui_ready{false};        // documents loaded; menu functional
 std::atomic<bool> g_menu_open{false};       // launcher/pause/config/cheats currently shown + capturing input
@@ -145,6 +146,7 @@ void config_to_controls() {
     set_control_value("rr_option",   enum_to_str(g_working_config.rr_option));
     set_control_value("rr_manual",   std::to_string(g_working_config.rr_manual_value));
     set_control_value("res_option",  enum_to_str(g_working_config.res_option));
+    set_control_value("ds_option",   std::to_string(g_working_config.ds_option));   // supersampling (SSAA) factor
     set_control_value("wm_option",   enum_to_str(g_working_config.wm_option));
     set_control_value("msaa_option", enum_to_str(g_working_config.msaa_option));
     set_control_value("ar_option",   enum_to_str(g_working_config.ar_option));
@@ -157,6 +159,22 @@ std::string control_value(const char* id, const std::string& fallback) {
         return c->GetValue();
     }
     return fallback;
+}
+
+// Resolution scale, supersampling and MSAA change the render-target geometry/sample count, so they are
+// only applied via RT64's validated setup path (see rt64_render_context.cpp) — i.e. on the next launch.
+// A restart is "required" once any of them differs from the config RT64 actually started with.
+bool restart_required() {
+    return g_working_config.res_option  != g_applied_config.res_option
+        || g_working_config.ds_option   != g_applied_config.ds_option
+        || g_working_config.msaa_option != g_applied_config.msaa_option;
+}
+
+// Show/hide the "changes need a restart" bar in the config document to match restart_required().
+void update_restart_banner() {
+    if (auto* b = (g_config_doc != nullptr) ? g_config_doc->GetElementById("restart_bar") : nullptr) {
+        b->SetClass("show", restart_required());
+    }
 }
 
 // Read the controls back into g_working_config, apply to ultramodern, and persist.
@@ -172,9 +190,13 @@ void controls_to_config_and_apply() {
     try {
         g_working_config.rr_manual_value = std::stoi(control_value("rr_manual", std::to_string(g_working_config.rr_manual_value)));
     } catch (...) { /* keep previous */ }
+    try {
+        g_working_config.ds_option = std::stoi(control_value("ds_option", std::to_string(g_working_config.ds_option)));
+    } catch (...) { /* keep previous */ }
 
     ultramodern::renderer::set_graphics_config(g_working_config);
     bar::config::save_graphics(g_working_config);
+    update_restart_banner();   // reflect whether a restart-required setting now differs from launch
 }
 
 // Build the mod list rows (best-effort; empty until the mod loader has scanned a mods/ folder).
@@ -263,6 +285,7 @@ void show_config() {
     hide_all_docs();
     if (g_config_doc) {
         config_to_controls();
+        update_restart_banner();
         g_config_doc->Show();
         if (auto* e = g_config_doc->GetElementById("rr_option")) e->Focus(true);
     }
@@ -304,6 +327,10 @@ void wire_launcher_events() {
 void wire_config_events() {
     if (g_config_doc == nullptr) return;
     add_listener(g_config_doc->GetElementById("back"), "click", [](Rml::Event&) { go_back(); });
+    // "Restart now" (shown only when a restart-required setting changed): relaunch so the new
+    // resolution / SSAA / MSAA apply through RT64's validated setup path. save_graphics() already
+    // ran on the change, so graphics.json is current before the relaunch.
+    add_listener(g_config_doc->GetElementById("apply_restart"), "click", [](Rml::Event&) { bar_restart_game(); });
     // One delegated change handler on the form: any control change re-reads + applies + saves.
     Rml::Element* form = g_config_doc->GetElementById("graphics_form");
     add_listener(form != nullptr ? form : g_config_doc->GetElementById("config_root"), "change",
@@ -378,6 +405,7 @@ void init_hook(plume::RenderInterface* interface, plume::RenderDevice* device) {
     if (g_window == nullptr) return;
 
     g_working_config = ultramodern::renderer::get_graphics_config();
+    g_applied_config = g_working_config;   // baseline: what RT64 is about to set up with (restart-required diff is vs this)
 
     g_system_interface = std::make_unique<SystemInterface_SDL>(g_window);
     g_render_interface.init(interface, device);

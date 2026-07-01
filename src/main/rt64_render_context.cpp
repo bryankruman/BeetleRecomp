@@ -76,22 +76,32 @@ RT64::UserConfiguration::InternalColorFormat to_rt64(ultramodern::renderer::High
 }
 
 void set_application_user_config(RT64::Application* app, const ultramodern::renderer::GraphicsConfig& config) {
+    // Render-resolution scale + supersampling. ds_option is the SSAA (downsample) factor: the scene is
+    // rendered at scale×ss the N64's native framebuffer, then downsampled by ss for the final image, so
+    // the net internal resolution is `scale` with ss× supersampled anti-aliasing. Auto tracks the window.
+    const int ss = std::clamp(config.ds_option, 1, 4);
+    int  scale = 1;
+    bool window_scale = false;
     switch (config.res_option) {
-        default:
-        case ultramodern::renderer::Resolution::Auto:
-            app->userConfig.resolution = RT64::UserConfiguration::Resolution::WindowIntegerScale;
-            app->userConfig.downsampleMultiplier = 1;
-            break;
-        case ultramodern::renderer::Resolution::Original:
-            app->userConfig.resolution = RT64::UserConfiguration::Resolution::Manual;
-            app->userConfig.resolutionMultiplier = std::max(config.ds_option, 1);
-            app->userConfig.downsampleMultiplier = std::max(config.ds_option, 1);
-            break;
-        case ultramodern::renderer::Resolution::Original2x:
-            app->userConfig.resolution = RT64::UserConfiguration::Resolution::Manual;
-            app->userConfig.resolutionMultiplier = 2.0 * std::max(config.ds_option, 1);
-            app->userConfig.downsampleMultiplier = std::max(config.ds_option, 1);
-            break;
+        case ultramodern::renderer::Resolution::Auto:       window_scale = true; break;
+        case ultramodern::renderer::Resolution::Original:   scale = 1; break;
+        case ultramodern::renderer::Resolution::Original2x: scale = 2; break;
+        case ultramodern::renderer::Resolution::Native3x:   scale = 3; break;
+        case ultramodern::renderer::Resolution::Native4x:   scale = 4; break;
+        case ultramodern::renderer::Resolution::Native6x:   scale = 6; break;
+        case ultramodern::renderer::Resolution::Native8x:   scale = 8; break;
+        default:                                            scale = 1; break;
+    }
+
+    if (window_scale) {
+        app->userConfig.resolution           = RT64::UserConfiguration::Resolution::WindowIntegerScale;
+        app->userConfig.downsampleMultiplier = ss;
+    } else {
+        app->userConfig.resolution           = RT64::UserConfiguration::Resolution::Manual;
+        // Clamp the render multiplier to RT64's hard limit (32) — 8x scale × 4x SSAA hits exactly 32.
+        app->userConfig.resolutionMultiplier =
+            std::min<double>(double(scale) * ss, RT64::UserConfiguration::ResolutionMultiplierLimit);
+        app->userConfig.downsampleMultiplier = ss;
     }
 
     switch (config.hr_option) {
