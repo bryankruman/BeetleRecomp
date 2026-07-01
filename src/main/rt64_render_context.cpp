@@ -74,6 +74,14 @@ RT64::UserConfiguration::InternalColorFormat to_rt64(ultramodern::renderer::High
         default:                                                    return RT64::UserConfiguration::InternalColorFormat::OptionCount;
     }
 }
+RT64::UserConfiguration::DivotFilter to_rt64(ultramodern::renderer::DivotFilter o) {
+    switch (o) {
+        case ultramodern::renderer::DivotFilter::Auto: return RT64::UserConfiguration::DivotFilter::Auto;
+        case ultramodern::renderer::DivotFilter::On:   return RT64::UserConfiguration::DivotFilter::On;
+        case ultramodern::renderer::DivotFilter::Off:  return RT64::UserConfiguration::DivotFilter::Off;
+        default:                                       return RT64::UserConfiguration::DivotFilter::OptionCount;
+    }
+}
 
 void set_application_user_config(RT64::Application* app, const ultramodern::renderer::GraphicsConfig& config) {
     // Render-resolution scale + supersampling. ds_option is the SSAA (downsample) factor: the scene is
@@ -123,6 +131,7 @@ void set_application_user_config(RT64::Application* app, const ultramodern::rend
     app->userConfig.refreshRate         = to_rt64(config.rr_option);
     app->userConfig.refreshRateTarget   = config.rr_manual_value;
     app->userConfig.internalColorFormat = to_rt64(config.hpfb_option);
+    app->userConfig.divotFilter         = to_rt64(config.divot_option);   // BAR seam fix (2B): live VI divot toggle
     app->userConfig.displayBuffering    = RT64::UserConfiguration::DisplayBuffering::Triple;
 }
 

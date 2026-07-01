@@ -77,6 +77,7 @@ nlohmann::json graphics_to_json(const GraphicsConfig& c) {
         {"hpfb_option",     c.hpfb_option},
         {"rr_manual_value", c.rr_manual_value},
         {"ds_option",       c.ds_option},
+        {"divot_option",    c.divot_option},
     };
 }
 
@@ -95,6 +96,7 @@ GraphicsConfig graphics_from_json(const nlohmann::json& j) {
     c.hpfb_option     = j.value("hpfb_option",     c.hpfb_option);
     c.rr_manual_value = j.value("rr_manual_value", c.rr_manual_value);
     c.ds_option       = j.value("ds_option",       c.ds_option);
+    c.divot_option    = j.value("divot_option",    c.divot_option);
     return c;
 }
 
@@ -126,11 +128,12 @@ GraphicsConfig default_graphics_config() {
     c.hr_option       = HUDRatioMode::Original;
     c.api_option      = GraphicsApi::Auto;                    // RT64 picks D3D12 on Windows / Vulkan on Linux
     c.ar_option       = AspectRatio::Original;
-    c.msaa_option     = Antialiasing::None;
+    c.msaa_option     = Antialiasing::MSAA4X;                  // seam fix 2A: 4x MSAA adds edge coverage, softening coplanar seams
     c.rr_option       = RefreshRate::Display;                 // HIGH-FPS: interpolate up to the monitor rate
     c.hpfb_option     = HighPrecisionFramebuffer::Auto;
     c.rr_manual_value = 144;                                  // only consulted when rr_option == Manual
     c.ds_option       = 1;
+    c.divot_option    = DivotFilter::Auto;                    // seam fix 2B: match the game's VI divot bit (on for BAR)
     return c;
 }
 

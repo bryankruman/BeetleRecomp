@@ -149,6 +149,7 @@ void config_to_controls() {
     set_control_value("ds_option",   std::to_string(g_working_config.ds_option));   // supersampling (SSAA) factor
     set_control_value("wm_option",   enum_to_str(g_working_config.wm_option));
     set_control_value("msaa_option", enum_to_str(g_working_config.msaa_option));
+    set_control_value("divot_option", enum_to_str(g_working_config.divot_option));
     set_control_value("ar_option",   enum_to_str(g_working_config.ar_option));
     set_control_value("hr_option",   enum_to_str(g_working_config.hr_option));
     set_control_value("hpfb_option", enum_to_str(g_working_config.hpfb_option));
@@ -184,6 +185,7 @@ void controls_to_config_and_apply() {
     g_working_config.res_option  = str_to_enum(control_value("res_option",  enum_to_str(g_working_config.res_option)),  g_working_config.res_option);
     g_working_config.wm_option   = str_to_enum(control_value("wm_option",   enum_to_str(g_working_config.wm_option)),   g_working_config.wm_option);
     g_working_config.msaa_option = str_to_enum(control_value("msaa_option", enum_to_str(g_working_config.msaa_option)), g_working_config.msaa_option);
+    g_working_config.divot_option = str_to_enum(control_value("divot_option", enum_to_str(g_working_config.divot_option)), g_working_config.divot_option);
     g_working_config.ar_option   = str_to_enum(control_value("ar_option",   enum_to_str(g_working_config.ar_option)),   g_working_config.ar_option);
     g_working_config.hr_option   = str_to_enum(control_value("hr_option",   enum_to_str(g_working_config.hr_option)),   g_working_config.hr_option);
     g_working_config.hpfb_option = str_to_enum(control_value("hpfb_option", enum_to_str(g_working_config.hpfb_option)), g_working_config.hpfb_option);

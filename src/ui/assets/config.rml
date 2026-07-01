@@ -158,6 +158,14 @@
                     </select>
                 </div>
                 <div class="row">
+                    <span class="label">Seam filter<span class="sub">VI divot — fills 1px cracks between surfaces</span></span>
+                    <select id="divot_option">
+                        <option value="Auto">Auto (match game)</option>
+                        <option value="On">On</option>
+                        <option value="Off">Off</option>
+                    </select>
+                </div>
+                <div class="row">
                     <span class="label">Aspect ratio</span>
                     <select id="ar_option">
                         <option value="Original">Original</option>
