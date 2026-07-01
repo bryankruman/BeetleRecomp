@@ -1,6 +1,7 @@
 [submodule "lib/bar-decomp"]
 	path = lib/bar-decomp
 	url = https://github.com/bryankruman/BeetleDecomp
+	ignore = dirty
 [submodule "lib/N64ModernRuntime"]
 	path = lib/N64ModernRuntime
 	url = https://github.com/bryankruman/N64ModernRuntime.git
