@@ -141,8 +141,15 @@ void set_control_value(const char* id, const std::string& value) {
     }
 }
 
+// Guard so the programmatic SetValue calls in config_to_controls don't trip the delegated "change"
+// handler into re-saving graphics.json mid-population — which clobbered not-yet-set controls (e.g. the
+// MSAA-4x default got reset to None just by opening Settings, since msaa is populated after the first
+// control whose SetValue fires the change).
+bool g_populating_controls = false;
+
 // Push g_working_config's current values into the config document's controls.
 void config_to_controls() {
+    g_populating_controls = true;
     set_control_value("rr_option",   enum_to_str(g_working_config.rr_option));
     set_control_value("rr_manual",   std::to_string(g_working_config.rr_manual_value));
     set_control_value("res_option",  enum_to_str(g_working_config.res_option));
@@ -153,6 +160,7 @@ void config_to_controls() {
     set_control_value("ar_option",   enum_to_str(g_working_config.ar_option));
     set_control_value("hr_option",   enum_to_str(g_working_config.hr_option));
     set_control_value("hpfb_option", enum_to_str(g_working_config.hpfb_option));
+    g_populating_controls = false;
 }
 
 std::string control_value(const char* id, const std::string& fallback) {
@@ -180,6 +188,7 @@ void update_restart_banner() {
 
 // Read the controls back into g_working_config, apply to ultramodern, and persist.
 void controls_to_config_and_apply() {
+    if (g_populating_controls) return;   // ignore change events fired by programmatic population (see guard)
     using namespace ultramodern::renderer;
     g_working_config.rr_option   = str_to_enum(control_value("rr_option",   enum_to_str(g_working_config.rr_option)),   g_working_config.rr_option);
     g_working_config.res_option  = str_to_enum(control_value("res_option",  enum_to_str(g_working_config.res_option)),  g_working_config.res_option);
