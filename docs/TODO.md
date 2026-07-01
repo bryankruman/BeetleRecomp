@@ -46,8 +46,10 @@ or RDRAM poke / patch. **Files:** `lib/bar-decomp` (find LOD logic), `src/main/b
 page B's (`0x200000`), one screen height over ~40 frames / ~720 ms at 60 fps. It never redraws; only the
 VI origin moves. Our `enable_instant_present()` had put RT64 into **PresentEarly** mode, which presents
 only freshly-**rendered** content and drops VI-origin-only changes — so the pan collapsed to an instant
-swap. **Fix:** `src/main/rt64_render_context.cpp` keeps RT64's default **SkipBuffering** mode (presents
-VI-origin changes, console-accurate); opt into PresentEarly for min latency with `BAR_INSTANT_PRESENT=1`.
+swap. **Fix:** `src/main/rt64_render_context.cpp` selects RT64's **Console** presentation mode (present
+strictly from the VI origin, at VI time — what the console does). `BAR_PRESENT_MODE=skip|early|console`
+overrides; `BAR_INSTANT_PRESENT=1` = legacy `early`. (SkipBuffering also animates the pan but flashes the
+destination page for one frame before it, because it presents the just-rendered buffer; Console doesn't.)
 Verified headlessly frame-by-frame (burst capture — see docs/HEADLESS_TESTING.md). Full writeup:
 docs/R6_FILMROLL_FINDINGS.md. (The earlier "STATUS-3 flash / framebuffer" theory was wrong.)
 

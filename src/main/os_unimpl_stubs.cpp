@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <chrono>   // R6 diagnostic: BAR_DBG_FPS loop-rate counter (remove after)
 #include <cstdio>   // R6 diagnostic
+#include <cstring>  // BAR_BURST_ON_ROLL: memcpy/strchr/strcmp for the burst-capture spec parse
 
 #include "main/bar_cheats.h"   // bar_cheats::apply_frame (host-side RDRAM cheat pokes)
 
@@ -29,7 +30,38 @@ extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y
 // R6 diagnostic (env-gated BAR_DBG_SLIDE): trace the menu page-transition slide. Called from the
 // recompiled transition-start (func_selection_00402E98) and slide-draw (func_selection_00418800) to
 // see, per navigation, whether the slide draws over many frames or just 1-2 (instant). Remove after R6.
+extern "C" void bar_rt64_start_burst(const char *dir, int count);
 extern "C" void bar_dbg_slide(const char* tag) {
+    // Deterministic burst-capture trigger for the film-roll transition: when the animation loop
+    // (func_filmroll_00400170) is entered, tell RT64 to capture the next N presents to dir/fNNNN.png.
+    // BAR_BURST_ON_ROLL="dir:count". Fires regardless of BAR_DBG_SLIDE; robust to boot-timing variance.
+    {
+        static bool parsed = false, fired = false;
+        static char burst_dir[256] = {0};
+        static int  burst_count = 0;
+        static char burst_tag[64] = "func_filmroll_00400170";   // default trigger: the pan loop
+        if (!parsed) {
+            parsed = true;
+            if (const char* spec = std::getenv("BAR_BURST_ON_ROLL")) {   // "dir:count[:tag]"
+                if (const char* c1 = std::strchr(spec, ':')) {
+                    size_t dlen = (size_t)(c1 - spec);
+                    if (dlen >= sizeof(burst_dir)) dlen = sizeof(burst_dir) - 1;
+                    std::memcpy(burst_dir, spec, dlen); burst_dir[dlen] = '\0';
+                    burst_count = std::atoi(c1 + 1);
+                    if (const char* c2 = std::strchr(c1 + 1, ':')) {     // optional trigger-tag override
+                        std::strncpy(burst_tag, c2 + 1, sizeof(burst_tag) - 1);
+                        burst_tag[sizeof(burst_tag) - 1] = '\0';
+                    }
+                }
+            }
+        }
+        if (!fired && burst_count > 0 && std::strcmp(tag, burst_tag) == 0) {
+            fired = true;
+            bar_rt64_start_burst(burst_dir, burst_count);
+            std::fprintf(stderr, "[BeetleRecomp] BURST_ON_ROLL -> %s x%d @%s\n", burst_dir, burst_count, burst_tag);
+            std::fflush(stderr);
+        }
+    }
     static const bool on = std::getenv("BAR_DBG_SLIDE") != nullptr;
     if (!on) return;
     long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
