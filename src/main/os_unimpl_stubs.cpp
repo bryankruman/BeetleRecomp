@@ -18,11 +18,31 @@
 #include "recomp.h"
 #include <ultramodern/ultramodern.hpp>
 #include <cstdlib>
+#include <chrono>   // R6 diagnostic: BAR_DBG_FPS loop-rate counter (remove after)
+#include <cstdio>   // R6 diagnostic
 
 #include "main/bar_cheats.h"   // bar_cheats::apply_frame (host-side RDRAM cheat pokes)
 
 // Keyboard -> N64 pad mapping lives in main.cpp (it owns the Win32 window / focus).
 extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y);
+
+// R6 diagnostic (env-gated BAR_DBG_SLIDE): trace the menu page-transition slide. Called from the
+// recompiled transition-start (func_selection_00402E98) and slide-draw (func_selection_00418800) to
+// see, per navigation, whether the slide draws over many frames or just 1-2 (instant). Remove after R6.
+extern "C" void bar_dbg_slide(const char* tag) {
+    static const bool on = std::getenv("BAR_DBG_SLIDE") != nullptr;
+    if (!on) return;
+    long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count();
+    static long long t0 = 0; if (t0 == 0) t0 = ms;
+    static unsigned long n = 0;
+    std::fprintf(stderr, "[BAR_DBG_SLIDE] %-9s #%lu t+%lldms\n", tag, ++n, ms - t0);
+}
+extern "C" void bar_dbg_caller(const char* tag, unsigned addr) {
+    static const bool on = std::getenv("BAR_DBG_SLIDE") != nullptr;
+    if (!on) return;
+    std::fprintf(stderr, "[BAR_DBG_SLIDE] %s caller-ra=0x%08X\n", tag, addr);
+}
 
 #define BAR_OS_STUB(name) \
     extern "C" void name(uint8_t* rdram, recomp_context* ctx) { (void)rdram; (void)ctx; }
@@ -74,6 +94,30 @@ extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
     // controller poll (per frame) in both the menus and a race, the right cadence for the
     // "every frame" cheat writes (unlocks, debug-options flags). No-op when nothing is enabled.
     bar_cheats::apply_frame(rdram);
+    // R6 diagnostic (env-gated BAR_DBG_FPS): the menu/game main loop polls the controller once per
+    // iteration, so this hook's call rate == the loop rate. The page-slide animation advances per loop
+    // iteration; if this is >> native 60 Hz the slide completes in ~1 display frame ("disabled"-looking).
+    { static const bool dbg = std::getenv("BAR_DBG_FPS") != nullptr;
+      if (dbg) {
+          static unsigned long n = 0; static long long t0 = 0;
+          long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch()).count();
+          ++n; if (t0 == 0) t0 = ms;
+          if (ms - t0 >= 1000) { std::fprintf(stderr, "[BAR_DBG_FPS] %lu SI-polls/sec (== menu loop rate)\n", n); n = 0; t0 = ms; }
+      } }
+    // R6 tooling (env-gated BAR_DBG_STATE): log currentGameState (gGameSettings+0xA4) transitions so a
+    // BAR_AUTOPLAY script can be tuned/verified headlessly (boot -> logos -> intro -> menu=0xE -> race=2).
+    { static const bool dbg = std::getenv("BAR_DBG_STATE") != nullptr;
+      if (dbg) {
+          static int32_t last = -0x7FFF;
+          int32_t st = (int32_t)MEM_W(0XA4, (int64_t)(int32_t)0x80025CF0);
+          if (st != last) {
+              long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count();
+              std::fprintf(stderr, "[BAR_DBG_STATE] currentGameState -> %d (0x%X) @%lldms\n", st, st, ms);
+          }
+          last = st;
+      } }
     if (direction == 0 /* OS_READ */ && valid_pifram) {
         // The PIF RAM holds one joybus command block per controller (8 bytes for the status-query
         // and button-read commands BAR uses for the menu). Branch on the command byte (offset 3) so
