@@ -31,18 +31,37 @@ BAR_SKIP_LAUNCHER=1 BAR_AUTOPLAY="120:0 30:8000 150:0 30:0800 150:0 30:8000 700:
 Main-menu **screen transitions** are driven by **A** (select) — each fires the recompiled
 `func_selection_00402E98` (the `E98start` marker in `BAR_DBG_SLIDE` traces).
 
-## 3. Internal-render screenshot (RT64) — `RT64_SHOT_TRIGGER=<file> RT64_SHOT_OUT=<png>`
-Captures RT64's **actual presented image** via a GPU readback of the swapchain (no window manager). Built
-into the RT64 fork (`lib/rt64/src/hle/rt64_present_queue.cpp`, at the draw-hook site): on each present, if
-the trigger file exists it copies the swapchain texture → readback buffer → `stbi_write_png` → deletes the
-trigger. (Also fixed a plume bug: `D3D12CommandList::copyTextureRegion` crashed on a buffer destination
-because it called `setSamplePositions(dstLocation.texture)` with a null texture — `plume_d3d12.cpp`.)
+## 3. Internal-render screenshot (RT64) — **the standard way to see the screen**
+**Always capture RT64's internal render, never a window-manager screenshot.** It reads RT64's actual
+presented image back GPU→PNG (960×720), needs no window focus, and works headless / in the background, so
+it's the ground truth for "what's on screen." Built into the RT64 fork
+(`lib/rt64/src/hle/rt64_present_queue.cpp`, at the draw-hook): on each present it copies the swapchain
+texture → readback buffer → `stbi_write_png`. Three ways to request one:
 
-Usage from a shell:
+- **`BAR_SHOTS="frame:path …"`** (preferred, scriptable) — capture at scripted input frames, on the same
+  timeline as `BAR_AUTOPLAY`, so captures line up with input. `main.cpp bar_shots_poll`.
+- **`BAR_SHOT_BURST="fc:dir:count"`** (animations) — see §3b.
+- **`RT64_SHOT_TRIGGER=<file> RT64_SHOT_OUT=<png>`** (ad-hoc fallback) — `touch` the trigger, next present
+  writes the PNG and deletes the trigger.
+
 ```
-touch "$RT64_SHOT_TRIGGER"   # request a capture
-sleep 2.5                    # let a present happen
-# then read $RT64_SHOT_OUT (a PNG, 960x720 = RT64's internal render)
+BAR_SKIP_LAUNCHER=1 BAR_SHOTS="510:menu.png" BAR_AUTOPLAY="120:0 30:8000 150:0 30:0800 150:0 30:8000 700:0" \
+  ./BeetleRecomp.exe    # -> menu.png is the main menu, no window needed
+```
+(A prior `tools/shot.ps1` did a window-manager grab — **superseded**; don't use it.)
+
+## 3b. Burst capture (record an animation) — `BAR_SHOT_BURST="fc:dir:count"`
+Captures the next `count` presents to `dir/f0000.png, f0001.png, …`, **one per RT64 present** (not per
+input frame). Use this for animations the input-frame timeline can't sample — the main-menu **film-roll**
+transition blocks the game thread in a render loop, so it stops polling input and `BAR_SHOTS` frames
+freeze mid-roll. RT64 counts presents itself (`bar_rt64_start_burst` in the RT64 fork,
+`lib/rt64/src/hle/rt64_present_queue.cpp`); `main.cpp` fires it at input frame `fc`. Trigger a few frames
+**before** the transition (while `fc` still advances). `dir` must already exist.
+```
+mkdir -p roll
+BAR_SKIP_LAUNCHER=1 BAR_SHOT_BURST="900:roll:60" \
+  BAR_AUTOPLAY="120:0 30:8000 150:0 30:0800 150:0 30:8000 400:0 20:0400 300:0" ./BeetleRecomp.exe &
+#   ...reach menu, wait, press Down (film-roll) ~fc910 -> roll/f0000..f0059 = the roll frames
 ```
 
 ## 4. Diagnostics

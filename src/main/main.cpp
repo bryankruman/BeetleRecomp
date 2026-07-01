@@ -540,11 +540,43 @@ static void bar_shots_poll() {
     }
 }
 
+// BAR_SHOT_BURST="fc:dir:count" — at input frame fc, tell RT64 to capture the next `count` presents to
+// dir/fNNNN.png (one per present). For animations the input timeline can't sample (film-roll transition:
+// the game blocks in a render loop and stops polling input, so BAR_SHOTS frames freeze mid-roll). Trigger
+// a few frames BEFORE the transition, while fc is still advancing; RT64 then counts presents on its own.
+extern "C" void bar_rt64_start_burst(const char *dir, int count);
+static void bar_burst_poll() {
+    static bool parsed = false, fired = false;
+    static unsigned long fc_trigger = 0; static int count = 0; static std::string dir;
+    static unsigned long long fc = 0;
+    if (!parsed) {
+        parsed = true;
+        if (const char *s = std::getenv("BAR_SHOT_BURST")) {
+            std::string spec(s);
+            size_t c1 = spec.find(':'), c2 = (c1 == std::string::npos) ? std::string::npos : spec.find(':', c1 + 1);
+            if (c2 != std::string::npos) {
+                fc_trigger = std::strtoul(spec.substr(0, c1).c_str(), nullptr, 10);
+                dir = spec.substr(c1 + 1, c2 - c1 - 1);
+                count = std::atoi(spec.substr(c2 + 1).c_str());
+            }
+            std::fprintf(stderr, "[BeetleRecomp] BAR_SHOT_BURST: fc=%lu dir=%s count=%d\n", fc_trigger, dir.c_str(), count);
+        }
+    }
+    ++fc;
+    if (!fired && count > 0 && fc >= fc_trigger) {
+        fired = true;
+        bar_rt64_start_burst(dir.c_str(), count);
+        std::fprintf(stderr, "[BeetleRecomp] BAR_SHOT_BURST triggered @fc=%llu\n", (unsigned long long)fc);
+        std::fflush(stderr);
+    }
+}
+
 extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y) {
     if (stick_x) *stick_x = 0;
     if (stick_y) *stick_y = 0;
     if (port != 0) return 0;
     bar_shots_poll();
+    bar_burst_poll();
     static const char* autoplay = std::getenv("BAR_AUTOPLAY");
     if (autoplay && *autoplay) return bar_autoplay_poll(autoplay, stick_x, stick_y);
 #ifdef BEETLE_ENABLE_UI

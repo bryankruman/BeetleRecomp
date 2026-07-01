@@ -312,12 +312,17 @@ bool RT64Context::update_config(const ultramodern::renderer::GraphicsConfig& old
 }
 
 void RT64Context::enable_instant_present() {
-    // Present each frame as early as RT64 can produce it, decoupling the game thread from
-    // RDP-completion latency. ultramodern's gfx thread calls this once per session, right after
-    // the game starts (events.cpp gfx_thread_func). Without it the game thread can block waiting
-    // on the renderer, coupling render time back into frame production (stutter/latency — not
-    // game speed). RT64 reads the enhancement config through the shared queue resources, so push
-    // the change with updateEnhancementConfig().
+    // RT64's PresentEarly mode presents a frame as soon as the renderer produces it (lower latency),
+    // but it ONLY presents freshly-RENDERED content. BAR draws its main-menu page transitions (the
+    // "film-roll") by PANNING the VI origin with osViSwapBuffer across a pre-rendered tall framebuffer
+    // WITHOUT redrawing — so PresentEarly never shows those VI-origin-only changes and the roll
+    // collapses to an instant page swap (see docs/R6_FILMROLL_FINDINGS.md). RT64's default SkipBuffering
+    // mode presents VI-origin changes correctly, which is what the console does, so we keep the default.
+    // Opt in to PresentEarly with BAR_INSTANT_PRESENT for minimum input latency if you don't need the
+    // VI-pan menu transitions. ultramodern's gfx thread calls this once per session (events.cpp).
+    if (std::getenv("BAR_INSTANT_PRESENT") == nullptr) {
+        return;   // keep RT64 default (SkipBuffering) — VI-origin pans (film-roll) present correctly
+    }
     if (app != nullptr) {
         app->enhancementConfig.presentation.mode =
             RT64::EnhancementConfiguration::Presentation::Mode::PresentEarly;
