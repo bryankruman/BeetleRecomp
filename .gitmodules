@@ -16,6 +16,7 @@
 [submodule "lib/N64Recomp"]
 	path = lib/N64Recomp
 	url = https://github.com/N64Recomp/N64Recomp.git
+	ignore = untracked
 [submodule "lib/freetype-windows-binaries"]
 	path = lib/freetype-windows-binaries
 	url = https://github.com/ubawurinna/freetype-windows-binaries.git
