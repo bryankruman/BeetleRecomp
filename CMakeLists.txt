@@ -2,9 +2,10 @@
 #
 # Adapted from Zelda64Recomp/Zelda64Recomp @ dev (CMakeLists.txt). Pinned deps in this repo:
 #   lib/N64ModernRuntime @ main (recomp::start(Configuration) — see src/main/main.cpp)
-#   lib/rt64 @ main, lib/RmlUi @ 6.1.x, lib/lunasvg @ 3.5.x, lib/N64Recomp @ mod-tool-release
+#   lib/rt64 @ main, lib/RecompFrontend @ main, lib/N64Recomp @ mod-tool-release
 #
-# !!! UNTESTED — not yet configured/built (no local toolchain). Treat as a first draft.
+# The fork integration is undergoing fresh-build and runtime verification; see
+# docs/FORK_REVIEW.md for the evidence and remaining gates.
 #
 # Prereqs before this will configure/build:
 #   1) scripts/setup.*  -> `git submodule update --init --recursive` (populates the NESTED
@@ -22,11 +23,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Tier-2 settings/launcher/cheats menu (src/ui, RmlUi over RT64). ON by default: the launcher +
-# settings + BAR cheats menu ship in the standard build. It depends on the lib/freetype-windows-binaries
-# submodule (vendored); turn the menu OFF with -DBEETLE_ENABLE_UI=OFF to build the bare core port
-# (recompiled code + runtime + RT64) without RmlUi/Freetype.
-option(BEETLE_ENABLE_UI "Build the RmlUi settings/launcher/cheats menu (requires the Freetype submodule)" ON)
+# The frontend is RecompFrontend (recompui + recompinput) — the launcher, settings, controls and
+# input layer shared by the wiseguy-style recomps. The build uses its vendored
+# RmlUi and supporting libraries. The previous src/ui and top-level UI submodules
+# remain in Git for recovery and comparison, and are not part of this build.
+#
+# Off only for a deliberately UI-less build (headless testing, or bisecting a renderer problem).
+option(BEETLE_ENABLE_FRONTEND "Build the RecompFrontend launcher/menus (recompui + recompinput)" ON)
+option(BEETLE_REQUIRE_PATCHES "Require generated viewport patches for a release build" OFF)
+
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-everything /W4")
@@ -45,6 +50,14 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 # ---- RT64 first: defines the `rt64` target + build_*_shader() helpers ----
 set(RT64_STATIC TRUE)
 set(RT64_SDL_WINDOW_VULKAN TRUE)
+# Linux: every translation unit that includes plume_render_interface_types.h must agree that
+# RenderWindow is an SDL_Window*. RT64 defines these for its own directory only, so RecompFrontend's
+# recompui compiled against the X11 struct and failed on `appCore.window = window_handle`
+# (rt64_render_context.cpp). Defined at this scope, before any library is added -- the fix Hybrid
+# Heaven: Recompiled uses.
+if (UNIX AND NOT APPLE)
+    add_compile_definitions(PLUME_SDL_VULKAN_ENABLED RT64_SDL_WINDOW_VULKAN)
+endif()
 add_compile_definitions(HLSL_CPU)
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/rt64 ${CMAKE_BINARY_DIR}/rt64)
 # RT64 vendors SDL2 2.26.3, whose SDL_endian.h manually defines _m_prefetch (an old Clang-11
@@ -54,51 +67,63 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_definitions(rt64 PRIVATE __PRFCHWINTRIN_H)
 endif()
 
-# ---- UI libs (RmlUi + lunasvg + Freetype). The Tier-2 settings/launcher menu (src/ui) is built
-# when -DBEETLE_ENABLE_UI=ON. RmlUi needs Freetype: on Windows we point it at the prebuilt
-# lib/freetype-windows-binaries submodule (add it once with:
-#   git submodule add https://github.com/ubawurinna/freetype-windows-binaries.git lib/freetype-windows-binaries
-# ); on Linux/macOS the system Freetype is found. ----
-if (BEETLE_ENABLE_UI)
-    # Satisfy RmlUi's find_package("Freetype") + Freetype::Freetype requirement. On Windows the
-    # standard FindFreetype can't locate the prebuilt binaries' spaced path, so create the imported
-    # target ourselves before RmlUi's dependency scan runs.
-    if (WIN32 AND NOT TARGET Freetype::Freetype)
-        set(BAR_FT_DIR "${CMAKE_SOURCE_DIR}/lib/freetype-windows-binaries")
-        if (NOT EXISTS "${BAR_FT_DIR}/include/ft2build.h")
-            message(FATAL_ERROR
-                "BEETLE_ENABLE_UI=ON but lib/freetype-windows-binaries is missing. Add it with:\n"
-                "  git submodule add https://github.com/ubawurinna/freetype-windows-binaries.git lib/freetype-windows-binaries")
-        endif()
-        # The prebuilt-binaries repo's static-lib dir is VS-version-stamped (vs2015-2022/win64, vs2026/x64,
-        # ...) and changes over time — glob for the x64 static lib instead of hardcoding the version path.
-        file(GLOB_RECURSE BAR_FT_LIBS
-            "${BAR_FT_DIR}/release static/*/x64/freetype.lib"
-            "${BAR_FT_DIR}/release static/*/win64/freetype.lib")
-        if (NOT BAR_FT_LIBS)
-            message(FATAL_ERROR "freetype.lib not found under '${BAR_FT_DIR}/release static/*/x64' — check the submodule layout")
-        endif()
-        list(GET BAR_FT_LIBS 0 BAR_FT_LIB)
-        message(STATUS "BeetleRecomp: using Freetype ${BAR_FT_LIB}")
-        add_library(Freetype::Freetype STATIC IMPORTED)
-        set_target_properties(Freetype::Freetype PROPERTIES
-            IMPORTED_LOCATION "${BAR_FT_LIB}"
-            INTERFACE_INCLUDE_DIRECTORIES "${BAR_FT_DIR}/include")
-    endif()
-
-    set(BUILD_SHARED_LIBS OFF)
-    set(LUNASVG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    add_subdirectory(${CMAKE_SOURCE_DIR}/lib/lunasvg)
-    set(RMLUI_SVG_PLUGIN ON CACHE BOOL "" FORCE)
-    set(RMLUI_TESTS_ENABLED OFF CACHE BOOL "" FORCE)
-    set(RMLUI_SAMPLES OFF CACHE BOOL "" FORCE)        # no RmlUi samples/backend — we render via our RT64 bridge
-    set(RMLUI_BACKEND "auto" CACHE STRING "" FORCE)   # unused when samples are off, but must be a valid value
-    add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RmlUi)
-    target_compile_definitions(rmlui_core PRIVATE LUNASVG_BUILD_STATIC)
-endif()
+# NOTE: this project deliberately does NOT define Freetype::Freetype. RecompFrontend vendors its own
+# freetype-windows-binaries and a FindFreetype.cmake that creates that imported target itself, and
+# CMake refuses to create an imported target twice.
 
 # ---- N64ModernRuntime: provides the `librecomp` and `ultramodern` targets ----
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime)
+
+# ---- RecompFrontend: recompui (launcher/settings/mods, built on RmlUi) + recompinput (SDL2 input,
+# controller profiles). It consumes N64ModernRuntime and RT64 by PATH rather than by target, so it
+# reuses the very same runtime and renderer this port already builds. Must come after
+# N64ModernRuntime, which provides the `miniz` target recompui links. ----
+if (BEETLE_ENABLE_FRONTEND)
+    # recompui/recompinput include SDL2 headers directly and expect either sdl2_SOURCE_DIR (the
+    # Windows FetchContent layout) or SDL2_INCLUDE_DIRS (a system package) to be set ALREADY — their
+    # own CMake notes this as a standalone-build limitation. Our SDL2 acquisition lives further down
+    # beside the BeetleRecomp target, which is too late: the frontend would configure with an empty
+    # include path and fail on `#include "SDL.h"`. Acquire it here first. Both calls are idempotent,
+    # so the later block simply reuses what this populates.
+    if (WIN32)
+        include(FetchContent)
+        set(SDL2_VERSION "2.30.3")
+        FetchContent_Declare(sdl2
+            URL https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-devel-${SDL2_VERSION}-VC.zip)
+        FetchContent_MakeAvailable(sdl2)
+    else()
+        find_package(SDL2 REQUIRED)
+    endif()
+
+    # recompui compiles its RmlUi interface shaders with RT64's build_vertex_shader/build_pixel_shader
+    # macros, which read these DXC_* variables from the enclosing scope — and RT64 does not export
+    # them to the parent. Without them DXC emits nothing, and the follow-up bin2c step fails with
+    # "Failed to open file ... InterfaceVS.hlsl.dxil! (Or it's empty)". Set them BEFORE the
+    # add_subdirectory so the frontend's scope inherits them. Entry points match ours (VSMain/PSMain).
+    set(DXC_COMMON_OPTS "-I${CMAKE_SOURCE_DIR}/lib/RecompFrontend/recompui/shaders")
+    set(DXC_DXIL_OPTS "-Wno-ignored-attributes")
+    set(DXC_SPV_OPTS "-spirv" "-fspv-target-env=vulkan1.0" "-fvk-use-dx-layout")
+    set(DXC_PS_OPTS "${DXC_COMMON_OPTS}" "-E" "PSMain" "-T" "ps_6_0")
+    set(DXC_VS_OPTS "${DXC_COMMON_OPTS}" "-E" "VSMain" "-T" "vs_6_0" "-fvk-invert-y")
+    if (WIN32)
+        set(DXC "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc.exe")
+    elseif (CMAKE_SYSTEM_NAME MATCHES "Linux")
+        set(DXC "LD_LIBRARY_PATH=${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/x64" "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc-linux")
+    endif()
+
+    set(RECOMP_FRONTEND_N64MODERNRUNTIME_PATH ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime CACHE PATH "" FORCE)
+    set(RECOMP_FRONTEND_RT64_PATH             ${CMAKE_SOURCE_DIR}/lib/rt64             CACHE PATH "" FORCE)
+    add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RecompFrontend)
+
+    # Same SDL_endian.h / _m_prefetch clash the rt64 target is guarded against above, reached here
+    # through the FetchContent SDL2 instead of RT64's vendored copy: SDL defines the builtin manually
+    # as an old Clang-11 workaround, and clang 17+ rejects redefining it. Setting SDL's own guard
+    # macro makes it defer to the compiler builtin.
+    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_definitions(recompui    PRIVATE __PRFCHWINTRIN_H)
+        target_compile_definitions(recompinput PRIVATE __PRFCHWINTRIN_H)
+    endif()
+endif()
 
 # Shared include set for the generated C and the host.
 set(RECOMP_INCLUDES
@@ -125,31 +150,58 @@ file(GLOB FUNC_CXX_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/RecompiledFuncs
 target_sources(RecompiledFuncs PRIVATE ${FUNC_C_SOURCES} ${FUNC_CXX_SOURCES})
 
 # ---------------------------------------------------------------------------
-# PatchesLib — recompiled custom patches. Disabled until patches exist
-# (RecompiledPatches/ is produced by `make -C patches && ./N64Recomp patches.toml`).
-# TODO(BAR): uncomment + add to the link list once you author patches.
+# PatchesLib — the recompiled C-to-MIPS patches that override or hook game functions.
+#
+# Produced by:  scripts/build-patches.sh   (patches/*.c -> patches/patches.elf, built in WSL
+#                                           because the Windows LLVM has no MIPS backend)
+#               ./N64Recomp patches.toml   (patches.elf -> RecompiledPatches/patches.c)
+#
+# Optional by design: the tree builds and runs without any patches, so this is wired up only when
+# the recompiled output is actually present. That keeps a fresh clone building before anyone has
+# installed a MIPS toolchain.
 # ---------------------------------------------------------------------------
-# add_library(PatchesLib STATIC
-#     ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c
-#     ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.c)
-# target_compile_options(PatchesLib PRIVATE -fno-strict-aliasing -Wno-unused-variable -Wno-implicit-function-declaration)
-# target_include_directories(PatchesLib PRIVATE ${RECOMP_INCLUDES})
+#
+# NOT a static library. Patch functions carry the same C names as the recompiled originals and the
+# linker is what makes the patch win. Under clang-cl RECOMP_FUNC expands to a WEAK definition, for the
+# originals and the patches alike, and with two weak definitions the linker keeps whichever it meets
+# first. A static PatchesLib only ever contributes members for symbols that are still undefined when
+# it is scanned; by then RecompiledFuncs' object holding the original has usually been pulled in for
+# some other function, so the original won and the patch was silently ignored -- confirmed with the
+# uvGfxClipRect viewport patch, which linked cleanly and changed nothing. Compiling patches.c
+# directly into the executable puts its definitions in an object file, which the linker sees before
+# it opens any archive, so the patch is the first definition and wins. The wiring is below the
+# add_executable(), where the target exists.
+if (EXISTS ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c)
+    set(BEETLE_PATCH_SOURCE ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c)
+    message(STATUS "BeetleRecomp: compiling recompiled patches into the executable (RecompiledPatches/patches.c)")
+else()
+    set(BEETLE_PATCH_SOURCE "")
+    if (BEETLE_REQUIRE_PATCHES)
+        message(FATAL_ERROR "Generate RecompiledPatches/patches.c with scripts/build-patches.sh and N64Recomp patches.toml first")
+    endif()
+    message(STATUS "BeetleRecomp: no RecompiledPatches/patches.c — building without patches")
+endif()
 
 # ---------------------------------------------------------------------------
 # Main executable
 # ---------------------------------------------------------------------------
 add_executable(BeetleRecomp
     ${CMAKE_SOURCE_DIR}/src/main/main.cpp
-    ${CMAKE_SOURCE_DIR}/src/main/os_unimpl_stubs.cpp     # no-op stubs for ignored OS funcs BAR calls
+    ${CMAKE_SOURCE_DIR}/src/main/os_unimpl_stubs.cpp     # controller DMA and remaining low-level OS bindings
     ${CMAKE_SOURCE_DIR}/src/main/register_overlays.cpp   # wires recomp_overlays.inl into librecomp
     ${CMAKE_SOURCE_DIR}/src/main/overlay_bridge.cpp      # registers uv modules as overlays on load
     ${CMAKE_SOURCE_DIR}/src/main/hw_stubs.cpp            # native stubs for raw RCP-register libultra funcs
+    ${CMAKE_SOURCE_DIR}/src/main/bar_pi.cpp              # cartridge word reads used during boot
     ${CMAKE_SOURCE_DIR}/src/main/rt64_render_context.cpp # RT64-backed RendererContext subclass
     ${CMAKE_SOURCE_DIR}/src/main/bar_config.cpp          # feature/settings flags (fast-boot, etc.)
+    ${CMAKE_SOURCE_DIR}/src/main/bar_frustum.cpp         # draw distance + the frustum the game culls against
     ${CMAKE_SOURCE_DIR}/src/main/bar_cheats.cpp          # BAR-specific cheats (host-side RDRAM pokes)
     ${CMAKE_SOURCE_DIR}/src/main/bar_preempt.cpp         # cooperative audio-thread preemption (no-underrun)
     ${CMAKE_SOURCE_DIR}/src/main/bar_crash.cpp           # symbolized crash backtrace (debug aid)
+    ${CMAKE_SOURCE_DIR}/src/main/bar_watchdog.cpp        # SDL-pump hang detector: all-thread stacks on a stall
+    ${CMAKE_SOURCE_DIR}/src/main/bar_rumble.cpp          # the pulsed Rumble Pak motor, modelled per port (duty -> strength)
     ${CMAKE_SOURCE_DIR}/src/main/bar_input.cpp           # live 4-port runtime input path (device/keymap/rumble/pak)
+    ${CMAKE_SOURCE_DIR}/src/main/bar_inspector.cpp       # HUD inspector: the F1 debug menu's port half + hud.json
     ${CMAKE_SOURCE_DIR}/src/game/config.cpp              # host-owned settings persistence + high-FPS enable
     ${CMAKE_SOURCE_DIR}/src/game/input_config.cpp        # 4-port controller settings model + input.json persistence
     ${CMAKE_SOURCE_DIR}/rsp/aspMain.cpp                  # RSPRecomp output: BAR audio ucode (M_AUDTASK)
@@ -196,7 +248,44 @@ if (WIN32)
         LINK_FLAGS_DEBUG          "/SUBSYSTEM:CONSOLE"
         LINK_FLAGS_RELEASE        "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
     target_link_libraries(BeetleRecomp PRIVATE SDL2 Winmm.lib Dbghelp.lib)   # Winmm: timeBeginPeriod; Dbghelp: crash backtrace
-    # TODO(BAR): app icon -> target_sources(BeetleRecomp PRIVATE icons/app.rc)
+
+    # App icon. RC is not in project()'s language list because it only exists on Windows, so enable
+    # it here. See icons/app.rc for why the icon is resource ID 1 — it is what makes SDL pick it up
+    # for the game window as well as Explorer for the executable.
+    #
+    # Getting a .rc through Ninja + clang-cl takes three corrections; each was an actual build
+    # failure, in this order.
+    #
+    # 1. The resource compiler must be llvm-rc, not the Windows SDK's rc.exe. CMake compiles a .rc
+    #    in two steps here -- preprocess with clang-cl, then run the resource compiler on the
+    #    result -- and clang-cl's -E output carries GNU line markers ('# 1 "app.rc"'). rc.exe runs
+    #    its own preprocessor over that and rejects every one of them with "RC2019: expected
+    #    preprocessor command, found '1'". llvm-rc accepts them, which is what that two-step path
+    #    was built for. It ships in the same LLVM bin directory as the clang-cl this project
+    #    already requires, so hint the search there before falling back to PATH. The cache entry is
+    #    forced because CMake caches whatever it found on a previous configure.
+    #
+    # 2. CMAKE_DEPFILE_FLAGS_RC must be cleared. CMake appends clang's depfile flags
+    #    ("-clang:-MD -clang:-MF -clang:<dep>") to the *shared* RC flags, so they reach the resource
+    #    compiler too -- rc.exe reads the leading -c as its code-page switch and dies with "RC1205:
+    #    invalid code page". Clearing them loses automatic dependency scanning, hence the explicit
+    #    OBJECT_DEPENDS on app.ico below; app.rc references nothing else.
+    #
+    # 3. icons/ has to be on the resource include path. The preprocessed .rc is written into the
+    #    build tree, so the ICON statement's relative "app.ico" no longer resolves next to it and
+    #    the resource compiler fails with "file not found : app.ico".
+    get_filename_component(_beetle_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    find_program(BEETLE_RC_COMPILER NAMES llvm-rc HINTS "${_beetle_llvm_bin}")
+    if (BEETLE_RC_COMPILER)
+        set(CMAKE_RC_COMPILER "${BEETLE_RC_COMPILER}" CACHE FILEPATH "Resource compiler" FORCE)
+    endif()
+    set(CMAKE_DEPFILE_FLAGS_RC "")
+    enable_language(RC)
+
+    target_sources(BeetleRecomp PRIVATE ${CMAKE_SOURCE_DIR}/icons/app.rc)
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/icons/app.rc PROPERTIES
+        INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/icons"
+        OBJECT_DEPENDS      "${CMAKE_SOURCE_DIR}/icons/app.ico")
 endif()
 
 # ---- Linux: RT64 -> Vulkan ----
@@ -212,58 +301,67 @@ endif()
 
 # ---- Link the runtime + generated code ----
 target_link_libraries(BeetleRecomp PRIVATE
-    # PatchesLib            # enable once patches exist
     RecompiledFuncs
     librecomp
     ultramodern
     rt64
 )
+
+# Patches are compiled INTO the executable so their definitions precede the recompiled originals
+# in RecompiledFuncs (see the PatchesLib note above for why a static library cannot do this).
+if (BEETLE_PATCH_SOURCE)
+    target_sources(BeetleRecomp PRIVATE ${BEETLE_PATCH_SOURCE})
+    set_source_files_properties(${BEETLE_PATCH_SOURCE} PROPERTIES
+        COMPILE_OPTIONS "-fno-strict-aliasing;-Wno-unused-variable;-Wno-implicit-function-declaration"
+        INCLUDE_DIRECTORIES "${RECOMP_INCLUDES};${CMAKE_SOURCE_DIR}/RecompiledPatches")
+endif()
+
+# ---- RecompFrontend launcher/menus + input ----
+if (BEETLE_ENABLE_FRONTEND)
+    target_sources(BeetleRecomp PRIVATE ${CMAKE_SOURCE_DIR}/src/frontend/bar_frontend.cpp)
+    target_link_libraries(BeetleRecomp PRIVATE recompui recompinput)
+    target_compile_definitions(BeetleRecomp PRIVATE BEETLE_ENABLE_FRONTEND)
+    # recompui.h pulls SDL.h and RmlUi headers; RmlUi arrives transitively via recompui's PUBLIC
+    # link, but SDL2 comes from our own FetchContent above.
+    if (WIN32)
+        target_include_directories(BeetleRecomp PRIVATE ${sdl2_SOURCE_DIR}/include)
+    endif()
+
+    # Ship the UI assets recompui resolves as <exe dir>/assets/<name>: the REQUIRED primary font and
+    # the project stylesheet. Without them recompui throws at menu-creation time.
+    # Copy the whole tree so icons/ (and anything added later) comes along: recompui resolves both
+    # "recomp.rcss" and "icons/X.svg" through the same <exe dir>/assets root.
+    #
+    # The typefaces come from RmlUi's own sample assets rather than being committed a second time:
+    # RmlUi is already a submodule of recompui, and it vendors the whole Lato family plus NotoEmoji
+    # under the SIL Open Font License. Four files, and every one of them is asked for by name:
+    #
+    #   LatoLatin-Regular.ttf   the primary font, registered in src/frontend/bar_frontend.cpp.
+    #   LatoLatin-Bold.ttf      the 700-weight face the theme's headings and labels ask for.
+    #   LatoLatin-Italic.ttf    the italic face, for the same reason.
+    #   NotoEmoji-Regular.ttf   recompui loads this UNCONDITIONALLY as a fallback face
+    #                           (ui_state.cpp's font_faces[]). It is not optional: without the file
+    #                           beside the executable, Rml::LoadFontFace fails on every startup and
+    #                           any glyph outside Lato's coverage renders as a blank box.
+    #
+    # This mirrors wave-race-64-recomp, this project's reference port, so the two launchers draw
+    # their text from the same set of faces.
+    set(BEETLE_RMLUI_ASSETS "${CMAKE_SOURCE_DIR}/lib/RecompFrontend/recompui/lib/RmlUi/Samples/assets")
+    add_custom_command(TARGET BeetleRecomp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_SOURCE_DIR}/assets/ui"
+                "$<TARGET_FILE_DIR:BeetleRecomp>/assets"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${BEETLE_RMLUI_ASSETS}/LatoLatin-Regular.ttf"
+                "${BEETLE_RMLUI_ASSETS}/LatoLatin-Bold.ttf"
+                "${BEETLE_RMLUI_ASSETS}/LatoLatin-Italic.ttf"
+                "${BEETLE_RMLUI_ASSETS}/NotoEmoji-Regular.ttf"
+                "$<TARGET_FILE_DIR:BeetleRecomp>/assets"
+        COMMENT "Staging RecompFrontend assets (stylesheet, fonts, icons)")
+endif()
 # ---------------------------------------------------------------------------
 # Tier-2 settings/launcher menu (src/ui) — RmlUi rendered through RT64.
 # ---------------------------------------------------------------------------
-if (BEETLE_ENABLE_UI)
-    target_sources(BeetleRecomp PRIVATE
-        ${CMAKE_SOURCE_DIR}/src/ui/ui_renderer.cpp                  # RmlUi -> RT64 (plume) render bridge
-        ${CMAKE_SOURCE_DIR}/src/ui/bar_ui.cpp                       # bootstrap + render hooks + menu controller
-        ${CMAKE_SOURCE_DIR}/lib/RmlUi/Backends/RmlUi_Platform_SDL.cpp  # SystemInterface_SDL + SDL->RmlUi input
-    )
-    target_compile_definitions(BeetleRecomp PRIVATE
-        BEETLE_ENABLE_UI
-        RMLUI_SDL_VERSION_MAJOR=2          # the SDL platform backend targets SDL2
-    )
-    target_include_directories(BeetleRecomp PRIVATE
-        ${CMAKE_SOURCE_DIR}/lib/RmlUi/Include
-        ${CMAKE_SOURCE_DIR}/lib/RmlUi/Backends
-        ${CMAKE_SOURCE_DIR}/lib/rt64/src/rhi              # rt64_render_hooks.h
-        ${CMAKE_SOURCE_DIR}/lib/rt64/src/render           # rt64_texture_cache.h
-        ${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/plume    # plume_render_interface_builders.h
-        ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/thirdparty/concurrentqueue
-        ${CMAKE_BINARY_DIR}/shaders                        # generated Interface{VS,PS}.hlsl.{dxil,spirv}.h
-    )
-    target_link_libraries(BeetleRecomp PRIVATE RmlUi::Core RmlUi::Debugger lunasvg)
-
-    # ---- DXC options (RT64 doesn't export these to the parent scope) for build_*_shader() ----
-    set(DXC_COMMON_OPTS "-I${CMAKE_SOURCE_DIR}/src/ui/shaders")
-    set(DXC_DXIL_OPTS "-Wno-ignored-attributes")
-    set(DXC_SPV_OPTS "-spirv" "-fspv-target-env=vulkan1.0" "-fvk-use-dx-layout")
-    set(DXC_PS_OPTS "${DXC_COMMON_OPTS}" "-E" "PSMain" "-T" "ps_6_0")
-    set(DXC_VS_OPTS "${DXC_COMMON_OPTS}" "-E" "VSMain" "-T" "vs_6_0" "-fvk-invert-y")
-    if (WIN32)
-        set(DXC "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc.exe")
-    elseif (CMAKE_SYSTEM_NAME MATCHES "Linux")
-        set(DXC "LD_LIBRARY_PATH=${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/x64" "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc-linux")
-    endif()
-    # Compile the RmlUi interface shaders into C blobs the render bridge #includes. Output lands in
-    # ${CMAKE_BINARY_DIR}/shaders/ (matching the include dir + the InterfaceVS/PS blob names).
-    build_vertex_shader(BeetleRecomp "src/ui/shaders/InterfaceVS.hlsl" "shaders/InterfaceVS.hlsl")
-    build_pixel_shader(BeetleRecomp  "src/ui/shaders/InterfacePS.hlsl" "shaders/InterfacePS.hlsl")
-
-    # ---- Ship the UI assets (documents, stylesheet, fonts) next to the exe under assets/ui/ ----
-    add_custom_command(TARGET BeetleRecomp POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:BeetleRecomp>/assets/ui"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_SOURCE_DIR}/src/ui/assets" "$<TARGET_FILE_DIR:BeetleRecomp>/assets/ui")
-endif()
 
 # ---- Bring-up crash diagnosis: embed debug info (/Z7) in the boot-path targets + emit a PDB.
 # RT64 is deliberately left at Release (no option change -> not rebuilt) since the early-boot

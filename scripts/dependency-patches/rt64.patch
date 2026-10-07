@@ -1,0 +1,2679 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -341,6 +341,7 @@
+ 
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_application.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_application_window.cpp"
++    "${PROJECT_SOURCE_DIR}/src/hle/rt64_bar_hud.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_color_converter.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_command_warning.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_draw_call.cpp"
+--- a/src/common/rt64_user_configuration.cpp
++++ b/src/common/rt64_user_configuration.cpp
+@@ -80,7 +80,7 @@
+         aspectTarget = 16.0f / 9.0f;
+         extAspectRatio = AspectRatio::Original;
+         extAspectTarget = 16.0f / 9.0f;
+-        presentFillMode = PresentFillMode::Pillarbox;   // BAR: preserve the original letterbox/pillarbox present by default
++        presentFillMode = PresentFillMode::Pillarbox;   // BAR baseline: whole picture at true proportions
+         upscale2D = Upscale2D::ScaledOnly;
+         threePointFiltering = true;
+         refreshRate = RefreshRate::Original;
+--- a/src/hle/rt64_application.cpp
++++ b/src/hle/rt64_application.cpp
+@@ -574,9 +574,12 @@
+             case VK_F1:
+                 processDeveloperShortcut(DeveloperShortcut::Inspector);
+                 return true;
+-            case VK_F2:
+-                processDeveloperShortcut(DeveloperShortcut::RayTracing);
+-                return true;
++            // BAR: F2 is deliberately unbound. The port turns developer mode on in every build so
++            // that F1 opens the debug menu, which arms these shortcuts for everyone; a session-wide
++            // ray tracing toggle with nothing on screen to explain what changed is not something to
++            // leave under a finger. F1 (the menu), F3 (view RDRAM) and F4 (texture replacements) are
++            // either visibly reversible or plainly diagnostic, so they stay. With no case for it the
++            // key is not filtered, and passes through to the game like any other.
+             case VK_F3:
+                 processDeveloperShortcut(DeveloperShortcut::ViewRDRAM);
+                 return true;
+@@ -606,9 +609,6 @@
+             switch (event->key.keysym.scancode) {
+             case SDL_SCANCODE_F1:
+                 processDeveloperShortcut(DeveloperShortcut::Inspector);
+-                return true;
+-            case SDL_SCANCODE_F2:
+-                processDeveloperShortcut(DeveloperShortcut::RayTracing);
+                 return true;
+             case SDL_SCANCODE_F3:
+                 processDeveloperShortcut(DeveloperShortcut::ViewRDRAM);
+--- /dev/null
++++ b/src/hle/rt64_bar_hud.cpp
+@@ -0,0 +1,898 @@
++//
++// RT64 -- Beetle Adventure Racing HUD anchoring and the port's HUD inspector
++//
++
++#include "rt64_bar_hud.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <set>
++
++#include "../include/rt64_extended_gbi.h"
++#include "rt64_draw_call.h"
++#include "rt64_game_call.h"
++#include "rt64_projection.h"
++
++// The port installs these; see the header. Null in a standalone RT64, which is why every call site
++// checks.
++extern "C" {
++    void (*RT64_BarCullScale)(float scale) = nullptr;
++    void (*RT64_PortInspectorHook)() = nullptr;
++    void (*RT64_BarHudNoteElement)(const char *identity, const char *secondIdentity,
++        float minX, float maxX, float minY, float maxY, int givenClass, const char *kind) = nullptr;
++    void (*RT64_BarHudEndFrame)() = nullptr;
++    int (*RT64_BarHudTagLookup)(const char *identity, const char *secondIdentity, int *outClass) = nullptr;
++}
++
++namespace RT64 {
++    namespace BarHud {
++        static std::atomic_bool sRacing = { false };
++        static std::atomic_uint32_t sGameState = { 0 };
++        static std::atomic_bool sPaused = { false };
++
++        // Env switches, read once. BAR_HUD_ANCHOR=0 disables the positional heuristic entirely (the
++        // HUD goes back to sitting in the middle of the frame); BAR_HUD_ORTHO=0 keeps the rectangles
++        // anchored but leaves the orthographic layer -- the speedometer needle -- centred, which is
++        // how the two halves are told apart on screen. BAR_HUD_TRACE=1 prints each anchored
++        // rectangle once.
++        //
++        // BAR_HUD_ANCHOR=0 does NOT disable tags: an element someone has explicitly tagged in
++        // hud.json is still placed where the tag says. That is the point of the switch -- it isolates
++        // the heuristic, so the two can be told apart.
++        static bool envFlag(const char *name, bool fallback) {
++            const char *value = std::getenv(name);
++            if (value == nullptr) {
++                return fallback;
++            }
++
++            return (value[0] != '0');
++        }
++
++        static bool anchorEnabled() {
++            static const bool enabled = envFlag("BAR_HUD_ANCHOR", true);
++            return enabled;
++        }
++
++        static bool orthoEnabled() {
++            static const bool enabled = envFlag("BAR_HUD_ORTHO", true);
++            return enabled;
++        }
++
++        static bool traceEnabled() {
++            static const bool enabled = envFlag("BAR_HUD_TRACE", false);
++            return enabled;
++        }
++
++        // BAR_HUD_TRACE=2 prints EVERY distinct rectangle once, centred ones included, with its kind
++        // and both identities -- the element list of a screen the inspector is awkward to read on,
++        // such as the four-player battle, whose one 2D layer holds every player's HUD.
++        static bool traceAll() {
++            static const bool enabled = [] {
++                const char *value = std::getenv("BAR_HUD_TRACE");
++                return (value != nullptr) && (value[0] == '2');
++            }();
++            return enabled;
++        }
++
++        void setRacing(bool racing) {
++            if (traceEnabled()) {
++                static int last = -1;
++                if (int(racing) != last) {
++                    last = int(racing);
++                    fprintf(stdout, "[hud] racing=%d\n", last);
++                    fflush(stdout);
++                }
++            }
++
++            sRacing.store(racing, std::memory_order_relaxed);
++        }
++
++        bool racing() {
++            return anchorEnabled() && sRacing.load(std::memory_order_relaxed);
++        }
++
++        void setGameState(uint32_t state) {
++            sGameState.store(state, std::memory_order_relaxed);
++        }
++
++        void setPaused(bool paused) {
++            sPaused.store(paused, std::memory_order_relaxed);
++        }
++
++        bool paused() {
++            return sPaused.load(std::memory_order_relaxed);
++        }
++
++        uint32_t gameState() {
++            return sGameState.load(std::memory_order_relaxed);
++        }
++
++        const char *&lastIdentityPtr();
++
++        // Identities promoted out of somebody's hud.json and into the build.
++        //
++        // This is the intended end of a tag's life. hud.json is where an element is IDENTIFIED, in
++        // the inspector, against a running game; once the answer is known it belongs here, so that
++        // every build carries it and nobody has to have the right file in their settings folder. A
++        // hud.json still repeating what this table says is not wrong, but it is one more thing that
++        // can disagree.
++        //
++        // Consulted AFTER the port's tag lookup, so a live override in the panel and a hand-written
++        // hud.json both still win -- which is what makes it possible to check a promoted answer
++        // against a different one without editing this array.
++        struct BuiltinTag {
++            const char *identity;
++            Class cls;
++            uint32_t requiredState = 0; // Zero applies in every state.
++        };
++
++        static const BuiltinTag sBuiltinTags[] = {
++            // Promoted 11 Sep 2026, from hud.json, in the order they were found. All three are
++            // pinned to Center against the positional heuristic, which is the only thing a Center tag
++            // can override -- Center is already the default everywhere else, so each of these is an
++            // element a race was throwing to an edge that should have stayed where the game put it.
++            //
++            // WHAT each one is has not been written down yet. That is a gap, not a style choice: an
++            // address with no name cannot be checked by anyone who was not there, and if one of them
++            // ever stops matching there is nothing to search the game for. Name them.
++            { "tex:0x003C6E20", Class::Center },
++            { "tex:0x003C66A8", Class::Center },
++            { "tex:0x003CEA48", Class::Center },
++
++            // Promoted 17 Sep 2026, from hud.json (59 entries, in the file's order within each class).
++            // Unnamed, like the entries above: the inspector session that made them did not record what
++            // each element is. fill:0xFFFCFFFC (below) names a colour, not an element, so it is the first
++            // suspect if a screen that was not checked shows a misplaced rectangle. The ortho:<n> tags this
++            // pass also promoted were removed on the same day: see the content-identity pass below.
++            { "tex:0x003768A0", Class::Center },
++            { "tex:0x00417BE0", Class::Center },
++            { "tex:0x003D9B38", Class::Center },
++            { "tex:0x003D4E40", Class::Center },
++            { "tex:0x004199A0", Class::Center },
++            { "tex:0x0041D840", Class::Center },
++            { "tex:0x0041E720", Class::Center },
++            { "tex:0x00418C88", Class::Center },
++            { "tex:0x00362358", Class::Center },
++            { "tex:0x004048D8", Class::Center },
++            { "tex:0x004074E8", Class::Center },
++            { "tex:0x003D3E98", Class::Center },
++            { "tex:0x004092A8", Class::Center },
++            { "tex:0x003D69F8", Class::Center },
++            { "tex:0x003D8A88", Class::Center },
++            { "tex:0x003D00C8", Class::Center },
++            { "tex:0x003D9968", Class::Center },
++            { "tex:0x00404CC0", Class::Center },
++            { "tex:0x00405C68", Class::Center },
++            { "tex:0x003D6CC8", Class::Center },
++            { "tex:0x00403D18", Class::Center },
++            { "tex:0x003D7BA8", Class::Center },
++            { "tex:0x0038ECB8", Class::Center },
++            { "tex:0x0040A3C8", Class::Center },
++            { "tex:0x00409400", Class::Center },
++            { "tex:0x003C7DE8", Class::Center },
++            { "tex:0x00411B08", Class::Center },
++            { "tex:0x00413478", Class::Center },
++            { "tex:0x0041DB60", Class::Center },
++            { "tex:0x004131B8", Class::Center },
++            { "tex:0x00416D00", Class::Center },
++            { "tex:0x003C5F40", Class::Center },
++            { "tex:0x00414F40", Class::Center },
++            { "tex:0x00416D38", Class::Center },
++            { "tex:0x0041EB28", Class::Center },
++            { "tex:0x00414F78", Class::Center },
++            { "tex:0x0040B6E8", Class::Center },
++            { "tex:0x004122D8", Class::Center },
++            { "tex:0x0040F4A8", Class::Center },
++            { "tex:0x00414098", Class::Center },
++            { "tex:0x00420AB8", Class::Center },
++            { "tex:0x00419C30", Class::Center },
++            { "tex:0x00410450", Class::Center },
++            // Saved in the same session after the list above was taken.
++            { "tex:0x0039E290", Class::Center },
++            { "tex:0x003D2EF0", Class::Center },
++            { "tex:0x003D8368", Class::Center },
++            { "tex:0x00400EE8", Class::Center },
++            { "tex:0x00400008", Class::Center },
++            { "tex:0x003B9B70", Class::Center },
++            { "tex:0x003B1380", Class::Center },
++            { "tex:0x00408520", Class::Center },
++            { "tex:0x00402D70", Class::Center },
++
++            // Promoted 17 Sep 2026 (second pass), from hud.json: 14 texture tags, unnamed.
++            { "tex:0x003B4658", Class::Center },
++            { "tex:0x0041D140", Class::Center },
++            { "tex:0x003B8498", Class::Center },
++            { "tex:0x0041A248", Class::Center },
++            { "tex:0x0041E020", Class::Center },
++            { "tex:0x004174E0", Class::Center },
++            { "tex:0x004192A0", Class::Center },
++            { "tex:0x00410460", Class::Center },
++            { "tex:0x00414840", Class::Center },
++            { "tex:0x00416600", Class::Center },
++            { "tex:0x00412D78", Class::Center },
++            { "tex:0x00411408", Class::Center },
++            { "tex:0x003B74D0", Class::Center },
++            { "tex:0x00376330", Class::Left },
++
++            // Promoted 17 Sep 2026 (third pass). fill:0xFFFCFFFC was moved from Center to Left while fixing
++            // the speedometer. Moved back to Center on 19 Sep 2026: Daniel's hud.json had it Center, and
++            // hud.json beats this table, so Center is what every playtest since had (1P, 2P and the
++            // 4-player battle all signed off). A bare colour, not an element -- first suspect if a
++            // screen shows a misplaced flat rectangle.
++            { "fill:0xFFFCFFFC", Class::Center },
++
++            // Promoted 17 Sep 2026 (content identities). Projection layers are named by what they draw
++            // (<kind>#<hash> of the layer's first draw call, see classifyProjection), no longer by their
++            // index: the index differs between courses, so the ortho:1-5 and ortho:7 tags promoted earlier
++            // pinned the speedometer or the pause backdrop onto the wrong layer on other courses, and were
++            // removed. The speedometer needs no tag -- an untagged orthographic layer is Left in a race.
++            // ortho#269E7CEF: the pause backdrop, tagged Cover by Daniel in the panel. Traced as a flat,
++            // untextured, force-blended full-screen quad with no depth test, one identity through every
++            // pause. Also drawn smaller for the pre-race course overview, which coverScale handles. OPEN:
++            // a bottom band flickers on alternate presents while paused -- see docs/HUD-INSPECTOR.md.
++            { "ortho#269E7CEF", Class::Cover },
++
++            // 4-player battle HUD, measured 19 Sep 2026 with BAR_HUD_TRACE=2. Every player has the
++            // same copies, so each goes to the side of the screen it is drawn on (Class::Sides).
++            // ortho#AE46B54C is the health-bar layer: 8 draws, two per bar, at x 24..30 (players one
++            // and three) and 288..295 (two and four), and nothing else. The six textures are the
++            // ladybug icons beside each bar (x 32..48 and 272..288).
++            { "ortho#AE46B54C", Class::Sides },
++            { "tex:0x002D95C8", Class::Sides },
++            { "tex:0x002B3CA0", Class::Sides },
++            { "tex:0x002D9370", Class::Sides },
++            { "tex:0x002D9188", Class::Sides },
++            { "tex:0x002D97B0", Class::Sides },
++            { "tex:0x002D9BF0", Class::Sides },
++            // (persp#0DB8F095 Center removed 19 Sep 2026: perspective layers are Center by rule now,
++            // see classifyProjection.)
++
++            // Promoted 17 Sep 2026 (after the pause-flicker fix), from hud.json: 26 texture tags, unnamed.
++            // tex: identities are texture addresses with no content hash; if one ever pins an element on a
++            // screen it was not tagged on, that is the first thing to suspect.
++            { "tex:0x0040C8C8", Class::Center },
++            { "tex:0x00414760", Class::Center },
++            { "tex:0x00417CE0", Class::Center },
++            { "tex:0x0040E500", Class::Center },
++            { "tex:0x00418600", Class::Center },
++            { "tex:0x003841E8", Class::Center },
++            { "tex:0x0040F8C8", Class::Center },
++            { "tex:0x004129A0", Class::Center },
++            { "tex:0x004194E0", Class::Center },
++            { "tex:0x0040E238", Class::Center },
++            { "tex:0x00412630", Class::Center },
++            { "tex:0x00411AC0", Class::Center },
++            { "tex:0x0040FD00", Class::Center },
++            { "tex:0x00414580", Class::Center },
++            { "tex:0x004135D8", Class::Center },
++            { "tex:0x0040ADA0", Class::Center },
++            { "tex:0x0040CC28", Class::Center },
++            { "tex:0x0040E9E8", Class::Center },
++            { "tex:0x00409DF8", Class::Center },
++            { "tex:0x0041B408", Class::Center },
++            { "tex:0x00419478", Class::Center },
++            { "tex:0x00406028", Class::Center },
++            { "tex:0x00411688", Class::Center },
++            { "tex:0x0040DB08", Class::Center },
++            { "tex:0x004184B0", Class::Center },
++            { "tex:0x00408E50", Class::Center },
++
++            // Promoted 17 Sep 2026 (main menu widescreen), from hud.json: 53 texture tags, unnamed.
++            // The left/right/stretch ones are the menu's film strip edges and backgrounds, at heap addresses
++            // (0x0019F748-0x001CF360). A traced Coventry Cove race matched none of them outside the menus
++            // (BAR_HUD_TRACE); heap addresses can be reused, so they are the first suspects if an element
++            // moves to an edge on a screen that was not checked.
++            { "tex:0x003D7A08", Class::Center },
++            { "tex:0x004211C0", Class::Center },
++            { "tex:0x00415700", Class::Center },
++            { "tex:0x00423150", Class::Center },
++            { "tex:0x003A0030", Class::Center },
++            { "tex:0x0041AEC0", Class::Center },
++            { "tex:0x00418F70", Class::Center },
++            { "tex:0x003D95A8", Class::Center },
++            { "tex:0x0041E428", Class::Center },
++            { "tex:0x00416528", Class::Center },
++            { "tex:0x003D5600", Class::Center },
++            { "tex:0x003BCD10", Class::Center },
++            { "tex:0x003B9F08", Class::Center },
++            { "tex:0x003B6D80", Class::Center },
++            { "tex:0x0041B798", Class::Center },
++            { "tex:0x0041C678", Class::Center },
++            { "tex:0x00418968", Class::Center },
++            { "tex:0x0041D558", Class::Center },
++            { "tex:0x0040FA90", Class::Center },
++            { "tex:0x00413530", Class::Center },
++            { "tex:0x00412948", Class::Center },
++            { "tex:0x00414410", Class::Center },
++            { "tex:0x00419910", Class::Center },
++            { "tex:0x004119A0", Class::Center },
++            { "tex:0x003AD168", Class::Center },
++            { "tex:0x00294A10", Class::Center },
++            { "tex:0x001BB8E8", Class::Left, 14 },
++            { "tex:0x001B7E30", Class::Left, 14 },
++            { "tex:0x001B8C08", Class::Left, 14 },
++            { "tex:0x001BA828", Class::Left, 14 },
++            { "tex:0x001CD3E0", Class::Left, 14 },
++            { "tex:0x001CA4A0", Class::Left, 14 },
++            { "tex:0x001CB460", Class::Left, 14 },
++            { "tex:0x001CC420", Class::Left, 14 },
++            { "tex:0x001BDF48", Class::Left, 14 },
++            { "tex:0x001CE3A0", Class::Left, 14 },
++            { "tex:0x001CF360", Class::Left, 14 },
++            { "tex:0x001BC520", Class::Left, 14 },
++            { "tex:0x001BCD20", Class::Left, 14 },
++            { "tex:0x001B66E0", Class::Left, 14 },
++            { "tex:0x0019F748", Class::Left, 14 },
++            { "tex:0x001BD528", Class::Left, 14 },
++            { "tex:0x001B72E0", Class::Left, 14 },
++            { "tex:0x001B5E68", Class::Left, 14 },
++            { "tex:0x001C6EF0", Class::Right, 14 },
++            { "tex:0x001C5F30", Class::Right, 14 },
++            { "tex:0x001C3FB0", Class::Right, 14 },
++            { "tex:0x001C2FF0", Class::Right, 14 },
++            { "tex:0x001C4F70", Class::Right, 14 },
++            { "tex:0x001C7EB0", Class::Right, 14 },
++            { "tex:0x001C0440", Class::Stretch, 14 },
++            { "tex:0x001BFB08", Class::Stretch, 14 },
++            { "tex:0x001C1EA8", Class::Stretch, 14 },
++
++            // Promoted 19 Sep 2026, from hud.json (52 entries, in the file's order within each class).
++            // Unnamed: the inspector session did not record what each element is. tex: identities are
++            // texture addresses with no content hash (see the note on the 17 Sep pass above).
++            { "tex:0x0041D230", Class::Center },
++            { "tex:0x00419A38", Class::Center },
++            { "tex:0x004037D8", Class::Center },
++            { "tex:0x00405508", Class::Center },
++            { "tex:0x0041B768", Class::Center },
++            { "tex:0x00412850", Class::Center },
++            { "tex:0x003C9D38", Class::Center },
++            { "tex:0x0041C350", Class::Center },
++            { "tex:0x00417A38", Class::Center },
++            { "tex:0x00416048", Class::Center },
++            { "tex:0x00414B40", Class::Center },
++            { "tex:0x004198C0", Class::Center },
++            { "tex:0x003CDF58", Class::Center },
++            { "tex:0x00415168", Class::Center },
++            { "tex:0x00407390", Class::Center },
++            { "tex:0x0041B6D0", Class::Center },
++            { "tex:0x00404560", Class::Center },
++            { "tex:0x0040ED48", Class::Center },
++            { "tex:0x004189E0", Class::Center },
++            { "tex:0x00409150", Class::Center },
++            { "tex:0x003D6D68", Class::Center },
++            { "tex:0x00411EF0", Class::Center },
++            { "tex:0x003D9680", Class::Center },
++            { "tex:0x003D8A98", Class::Center },
++            { "tex:0x0040CDB8", Class::Center },
++            { "tex:0x00410428", Class::Center },
++            { "tex:0x003BF8F8", Class::Center },
++            { "tex:0x003D7AF0", Class::Center },
++            { "tex:0x00408270", Class::Center },
++            { "tex:0x003C8A50", Class::Center },
++            { "tex:0x003BBB90", Class::Center },
++            { "tex:0x00411010", Class::Center },
++            { "tex:0x00416950", Class::Center },
++            { "tex:0x0041A7F0", Class::Center },
++            { "tex:0x0040EAB8", Class::Center },
++            { "tex:0x00413CB0", Class::Center },
++            { "tex:0x003B9870", Class::Center },
++            { "tex:0x0040D2B0", Class::Center },
++            { "tex:0x00411EA0", Class::Center },
++            { "tex:0x0040E258", Class::Center },
++            { "tex:0x0041E5D8", Class::Center },
++            { "tex:0x0041C648", Class::Center },
++            { "tex:0x004100E0", Class::Center },
++            { "tex:0x00412D80", Class::Center },
++            { "tex:0x000DC630", Class::Center },
++            { "tex:0x000DF620", Class::Center },
++            { "tex:0x003B3FA0", Class::Center },
++            { "tex:0x003BBDB8", Class::Center },
++            { "tex:0x003D7CF0", Class::Stretch },
++            // (persp#F6D3F6D5 Cover removed 19 Sep 2026: it matched Metro Madness's race view at random
++            // and zoomed it to 4:3. Perspective layers are Center by rule now, see classifyProjection.)
++            // tex:0x00172830 is a rectangle: Cover acts only on projections, so for it this is Center.
++            { "tex:0x00172830", Class::Cover },
++        };
++
++        static bool builtinTag(const char *identity, const char *secondIdentity, Class *outClass) {
++            for (const BuiltinTag &tag : sBuiltinTags) {
++                if (tag.requiredState != 0 && tag.requiredState != gameState()) continue;
++                if (((identity != nullptr) && (std::strcmp(tag.identity, identity) == 0)) ||
++                    ((secondIdentity != nullptr) && (std::strcmp(tag.identity, secondIdentity) == 0)))
++                {
++                    *outClass = tag.cls;
++                    return true;
++                }
++            }
++
++            return false;
++        }
++
++        // The positional heuristic, unchanged from when anchoring was the only thing this file did.
++        // It answers Left, Right or Center, and it is only ever consulted during a race.
++        static Class classifyByPosition(const FixedRect &rect, int32_t screenWidth, bool fillCycle) {
++            if (rect.isNull() || (screenWidth <= 0)) {
++                return Class::Center;
++            }
++
++            // Every HUD element is a textured rectangle. The rectangles drawn in fill cycle are the
++            // frame and depth clears and BAR's overscan mask -- backdrop layers that must keep
++            // spanning the frame, not elements with a place on it.
++            if (fillCycle) {
++                return Class::Center;
++            }
++
++            // BAR renders 320x240 and its HUD is authored against exactly that, so the bands are
++            // measured against the game's screen rather than against the draw's scissor: the scissor
++            // is sometimes RT64's unbounded 2048x2048 one, against which every band test is
++            // meaningless. Requiring the rectangle to lie inside the screen is what rejects the
++            // full-frame backdrops, whose height alone already puts them outside both bands.
++            const int32_t screenH = (screenWidth * 3) / 4;
++            if ((rect.ulx < 0) || (rect.uly < 0) || (rect.lrx > (screenWidth << 2)) || (rect.lry > (screenH << 2))) {
++                return Class::Center;
++            }
++
++            // The top and bottom bands hold the HUD; the middle band holds the centred race messages
++            // and is left as RT64 places it. Measured element extents, in game pixels: speedometer
++            // 21..53, timer 21..51, lap 51..70, messages 79..154, map 149..205, position 202..222.
++            const int32_t topBand = (screenH * 33) / 100;      // 79
++            const int32_t bottomBand = (screenH * 60) / 100;   // 144
++            const bool inTopBand = (rect.lry <= (topBand << 2));
++            const bool inBottomBand = (rect.uly >= (bottomBand << 2));
++            if (!inTopBand && !inBottomBand) {
++                return Class::Center;
++            }
++
++            // Within a band, the side an element belongs to is simply the side it is drawn on. The
++            // thresholds leave a wide neutral middle so that a centred element appearing in a band --
++            // a lap time, a "wrong way" warning -- is not thrown to an edge.
++            const int32_t centreX = (rect.ulx + rect.lrx) / 2;
++            const int32_t leftLimit = ((screenWidth * 40) / 100) << 2;    // 128
++            const int32_t rightLimit = ((screenWidth * 60) / 100) << 2;   // 192
++            if (centreX <= leftLimit) {
++                return Class::Left;
++            }
++            else if (centreX >= rightLimit) {
++                return Class::Right;
++            }
++
++            return Class::Center;
++        }
++
++        Class classifyRect(const FixedRect &rect, int32_t screenWidth, bool fillCycle,
++            uint32_t textureAddress, uint32_t displayListAddress, bool textureOn, uint32_t fillColor)
++        {
++            const bool listing = (RT64_BarHudNoteElement != nullptr);
++            const bool tagging = (RT64_BarHudTagLookup != nullptr);
++            constexpr bool anyBuiltinTags = (sizeof(sBuiltinTags) / sizeof(sBuiltinTags[0])) > 0;
++
++            // Nothing to do at all: no inspector listening, nothing tagged either way, and not in a
++            // race. This is the shipped path in a session where the debug menu is never opened, so
++            // it costs one branch per rectangle rather than two string formats -- but only while the
++            // built-in table is empty, since a promoted tag has to be applied everywhere.
++            if (!listing && !tagging && !anyBuiltinTags && !racing()) {
++                return Class::Center;
++            }
++
++            // The element's identity, which is what a tag names and what the inspector's filter
++            // matches on. Which scheme applies depends on the draw, and getting this wrong is not a
++            // cosmetic problem: an untextured rectangle carries whatever G_SETTIMG last set, so
++            // identifying it by texture address gives it the identity of some unrelated element.
++            // That really happened -- a pause screen's black overlay and the menu text under it came
++            // out with the same "tex:" address, and tagging the overlay stretched the text.
++            char identity[24];
++            char secondIdentity[24];
++            const char *kind = "untex";
++            if (fillCycle) {
++                // The fill colour is far more specific than the display list, and stable between
++                // frames: a backdrop keeps its colour where its display list address need not.
++                kind = "fill";
++                std::snprintf(identity, sizeof(identity), "fill:0x%08X", fillColor);
++                std::snprintf(secondIdentity, sizeof(secondIdentity), "dl:0x%08X", displayListAddress);
++            }
++            else if (textureOn) {
++                kind = "tex";
++                std::snprintf(identity, sizeof(identity), "tex:0x%08X", textureAddress);
++                std::snprintf(secondIdentity, sizeof(secondIdentity), "dl:0x%08X", displayListAddress);
++            }
++            else {
++                // Untextured and not a fill: a shaded or blended rectangle, which is what a
++                // translucent overlay is. The display list is all there is to go on, so it is the
++                // identity rather than the afterthought -- and the texture address is deliberately
++                // NOT offered as the second one, because it belongs to somebody else.
++                std::snprintf(identity, sizeof(identity), "dl:0x%08X", displayListAddress);
++                std::snprintf(secondIdentity, sizeof(secondIdentity), "untex");
++            }
++
++            // Tags first, and they apply everywhere -- that is the whole difference between a tag and
++            // the heuristic. The heuristic then runs only in a race.
++            Class cls = Class::Center;
++            bool tagged = false;
++            if (tagging) {
++                int tagClass = 0;
++                if (RT64_BarHudTagLookup(identity, secondIdentity, &tagClass) != 0) {
++                    cls = Class(tagClass);
++                    tagged = true;
++                }
++            }
++
++            if (!tagged) {
++                Class builtin = Class::Center;
++                if (builtinTag(identity, secondIdentity, &builtin)) {
++                    cls = builtin;
++                    tagged = true;
++                }
++            }
++
++            if (!tagged && racing()) {
++                cls = classifyByPosition(rect, screenWidth, fillCycle);
++            }
++
++            cls = resolveSides(cls, (rect.ulx + rect.lrx) / 8.0f, screenWidth);
++
++            if (listing) {
++                RT64_BarHudNoteElement(identity, secondIdentity,
++                    rect.ulx / 4.0f, rect.lrx / 4.0f, rect.uly / 4.0f, rect.lry / 4.0f,
++                    int(cls), kind);
++            }
++
++            if (((cls != Class::Center) || traceAll()) && traceEnabled()) {
++                static std::set<uint64_t> seen;
++                uint64_t key =
++                    (uint64_t(uint16_t(rect.ulx)) << 48) | (uint64_t(uint16_t(rect.uly)) << 32) |
++                    (uint64_t(uint16_t(rect.lrx)) << 16) | uint64_t(uint16_t(rect.lry));
++                for (const char *c = identity; *c != '\0'; c++) {
++                    key = (key * 1099511628211ull) ^ uint8_t(*c);
++                }
++                if ((seen.size() < 4000) && seen.insert(key).second) {
++                    static const char *names[] = { "center", "left", "right", "stretch", "spill", "cover", "sides" };
++                    fprintf(stdout, "[hud] %s %s %s px=(%.1f,%.1f)-(%.1f,%.1f) state=%u -> %s%s\n", kind,
++                        identity, secondIdentity, rect.ulx / 4.0f, rect.uly / 4.0f, rect.lrx / 4.0f,
++                        rect.lry / 4.0f, gameState(), names[int(cls)], tagged ? " (tagged)" : "");
++                    fflush(stdout);
++                }
++            }
++
++            return cls;
++        }
++
++        void endFrame() {
++            if (RT64_BarHudEndFrame != nullptr) {
++                RT64_BarHudEndFrame();
++            }
++        }
++
++        uint16_t leftOriginFor(Class cls) {
++            switch (cls) {
++            case Class::Left:
++                return G_EX_ORIGIN_LEFT;
++            case Class::Right:
++                return G_EX_ORIGIN_RIGHT;
++            case Class::Center:
++            case Class::Stretch:
++            case Class::Spill:
++            default:
++                // Stretch and Spill both leave the element where it is. Stretch changes how wide it
++                // may be drawn and Spill how far it may run; neither is a translation, and giving
++                // either an origin would move it as well, which is not what was asked for.
++                return G_EX_ORIGIN_NONE;
++            }
++        }
++
++        uint16_t rightOriginFor(Class cls) {
++            // Both edges of an element take the same origin, so the element translates towards its
++            // edge instead of being stretched towards it.
++            return leftOriginFor(cls);
++        }
++
++        // FNV-1a over the fields that say what a layer draws. See the declaration for what is in
++        // it and what is deliberately not.
++        static uint32_t projectionContentHash(const Projection &proj, const DrawCallTile *callTiles,
++            size_t callTileCount)
++        {
++            uint64_t h = 1469598103934665603ULL;
++            auto mix = [&h](uint64_t v) {
++                for (int i = 0; i < 8; i++) {
++                    h ^= (v >> (i * 8)) & 0xFF;
++                    h *= 1099511628211ULL;
++                }
++            };
++
++            // Only the layer's FIRST draw call. Hashing every call was measured to be unstable: a
++            // menu layer (~200 calls) and the 3D world changed identity almost every frame, because
++            // text, digits and geometry come and go within the layer. What a layer opens with -- the
++            // pause backdrop's quad, the speedometer needle -- is the element it exists for.
++            for (uint32_t c = 0; (c < proj.gameCallCount) && (c < 1); c++) {
++                const DrawCall &call = proj.gameCalls[c].callDesc;
++                mix((uint64_t(call.colorCombiner.L) << 32) | call.colorCombiner.H);
++                mix((uint64_t(call.otherMode.L) << 32) | call.otherMode.H);
++                mix((uint64_t(call.textureOn) << 32) | call.triangleCount);
++                if (call.textureOn && (callTiles != nullptr)) {
++                    for (uint32_t t = 0; t < call.tileCount; t++) {
++                        const size_t tileIndex = size_t(call.tileIndex) + t;
++                        if (tileIndex < callTileCount) {
++                            mix(callTiles[tileIndex].tmemHashOrID);
++                        }
++                    }
++                }
++            }
++
++            return uint32_t(h ^ (h >> 32));
++        }
++
++        Class classifyProjection(ProjKind kind, const Projection &proj, const DrawCallTile *callTiles,
++            size_t callTileCount, bool publish)
++        {
++            // The identity names the layer by its content, with its kind as the prefix so the
++            // inspector can still tell a 3D layer from a 2D one. Never by index -- see the declaration.
++            static const char *const kPrefixes[] = { "persp", "ortho", "rect", "proj" };
++            const char *prefix = kPrefixes[int(kind) & 3];
++            const FixedRect &scissor = proj.scissorRect;
++
++            char identity[24];
++            static thread_local char sLastIdentity[24];
++            std::snprintf(identity, sizeof(identity), "%s#%08X", prefix,
++                projectionContentHash(proj, callTiles, callTileCount));
++
++            // Precedence, the same as for rectangles: the panel's live override and hud.json
++            // first (both answered by the port), then an identity promoted into the build, and only
++            // then the default rule.
++            //
++            // Only orthographic layers have a default, and it is the old whole-layer behaviour: pin
++            // them to the left edge during a race, because the needle is what that rule was written
++            // for and it is still right for a race nobody has paused. Everything else is Center
++            // until somebody tags it, so listing the other projections changes nothing by itself.
++            Class cls = Class::Center;
++            if ((kind == ProjKind::Orthographic) && racing() && orthoEnabled()) {
++                cls = Class::Left;
++            }
++
++            bool tagged = false;
++            if (RT64_BarHudTagLookup != nullptr) {
++                int tagClass = 0;
++                if (RT64_BarHudTagLookup(identity, "", &tagClass) != 0) {
++                    cls = Class(tagClass);
++                    tagged = true;
++                }
++            }
++
++            if (!tagged) {
++                Class builtin = Class::Center;
++                if (builtinTag(identity, "", &builtin)) {
++                    cls = builtin;
++                }
++            }
++
++            // A 3D (perspective) layer is Center by rule, whatever a tag says. Its identity is the hash
++            // of its first draw call, and on a moving race view that call changes with the camera, so
++            // a tag made on one screen lands on the race view at random spots: a promoted
++            // persp#F6D3F6D5 Cover tag zoomed Metro Madness's view and dropped it to stretched 4:3 in
++            // one stretch of track (measured with BAR_DBG_PROJ: covers=1 horiz=1 origin=none, and
++            // still widen=0). Daniel: the 3D view "should be locked to center". The inspector still
++            // lists these layers, with the class they actually get.
++            if (kind == ProjKind::Perspective) {
++                cls = Class::Center;
++            }
++
++            // BAR_HUD_TRACE: each distinct orthographic identity once per racing/paused state, with its
++            // call count, extent and class, so a scripted run can show an element keeping its identity
++            // across courses and screens.
++            std::memcpy(sLastIdentity, identity, sizeof(sLastIdentity));
++            lastIdentityPtr() = sLastIdentity;
++            if (publish && traceEnabled() && (kind == ProjKind::Orthographic)) {
++                static std::set<uint64_t> seenProj;
++                // The game state is part of the key: the save screen after a race has the same racing
++                // and paused flags as the pre-race course overview, so its layers were never printed.
++                const uint64_t key = (uint64_t(std::strtoul(identity + std::strlen(prefix) + 1, nullptr, 16)) << 8) |
++                    (uint64_t(gameState() & 0x3F) << 2) | uint64_t(racing() ? 1 : 0) | (uint64_t(paused() ? 1 : 0) << 1);
++                if ((seenProj.size() < 2000) && seenProj.insert(key).second) {
++                    fprintf(stdout, "[hud-proj] %s calls=%u scissor=(%.1f,%.1f)-(%.1f,%.1f) racing=%d paused=%d class=%d\n",
++                        identity, proj.gameCallCount, scissor.ulx / 4.0f, scissor.uly / 4.0f, scissor.lrx / 4.0f,
++                        scissor.lry / 4.0f, racing() ? 1 : 0, paused() ? 1 : 0, int(cls));
++                    fflush(stdout);
++                }
++            }
++
++            if (publish && (RT64_BarHudNoteElement != nullptr)) {
++                RT64_BarHudNoteElement(identity, "", scissor.ulx / 4.0f, scissor.lrx / 4.0f,
++                    scissor.uly / 4.0f, scissor.lry / 4.0f, int(cls), prefix);
++            }
++
++            return cls;
++        }
++
++        void coverScale(Class cls, float quadMinX, float quadMinY, float quadMaxX, float quadMaxY,
++            float *outX, float *outY)
++        {
++            *outX = 1.0f;
++            *outY = 1.0f;
++            if (cls != Class::Cover) {
++                return;
++            }
++
++            // The quad's own bounds, unless a fixed rectangle was asked for. Scaling is about the
++            // screen centre (160,120), so each side needs centre/distance; the larger covers both.
++            const bool forcedInset = (std::getenv("BAR_HUD_COVER_INSET") != nullptr);
++            if (!forcedInset && (quadMinX < 160.0f) && (quadMaxX > 160.0f) && (quadMinY < 120.0f) && (quadMaxY > 120.0f)) {
++                const float sx = std::max(160.0f / (160.0f - quadMinX), 160.0f / (quadMaxX - 160.0f));
++                const float sy = std::max(120.0f / (120.0f - quadMinY), 120.0f / (quadMaxY - 120.0f));
++                if ((sx >= 1.0f) && (sy >= 1.0f) && (sx < 4.0f) && (sy < 4.0f)) {
++                    *outX = sx;
++                    *outY = sy;
++                    return;
++                }
++            }
++
++            // The rectangle BAR authors its full-screen 2D into. Measured with BAR_DBG_RECT during a
++            // race as the complement of the overscan mask, and confirmed from the pause screen: with
++            // the backdrop's projection merely stretched, its top edge still sat at about 9% of the
++            // frame height, which is 21 of 240 -- the inset, not a failure of the stretch.
++            static const struct Inset {
++                float left = 22.0f, top = 17.0f, right = 296.0f, bottom = 223.0f;
++            } inset = [] {
++                Inset parsed;
++                const char *e = std::getenv("BAR_HUD_COVER_INSET");
++                if (e != nullptr) {
++                    float l = 0.0f, t = 0.0f, r = 0.0f, b = 0.0f;
++                    if (sscanf(e, "%f,%f,%f,%f", &l, &t, &r, &b) == 4 &&
++                        std::isfinite(l) && std::isfinite(t) && std::isfinite(r) && std::isfinite(b) &&
++                        l >= 0.0f && t >= 0.0f && r <= 320.0f && b <= 240.0f && r > l && b > t) {
++                        parsed.left = l;
++                        parsed.top = t;
++                        parsed.right = r;
++                        parsed.bottom = b;
++                    }
++                }
++                return parsed;
++            }();
++
++            const float width = inset.right - inset.left;
++            const float height = inset.bottom - inset.top;
++            if ((width > 0.0f) && (height > 0.0f)) {
++                *outX = 320.0f / width;
++                *outY = 240.0f / height;
++            }
++        }
++
++        Class resolveSides(Class cls, float centreX, int32_t screenWidth) {
++            if (cls != Class::Sides) {
++                return cls;
++            }
++
++            if ((gameState() != 6) || (screenWidth <= 0)) {
++                return Class::Center;
++            }
++
++            return (centreX < (screenWidth / 2.0f)) ? Class::Left : Class::Right;
++        }
++
++        uint16_t viewportOriginFor(Class cls) {
++            switch (cls) {
++            case Class::Sides:
++                // The layer as a whole is placed like a Left-anchored one (not widened); the
++                // framebuffer renderer then moves each right-half draw to the right edge instead.
++                return (gameState() == 6) ? uint16_t(G_EX_ORIGIN_LEFT) : uint16_t(G_EX_ORIGIN_NONE);
++            case Class::Left:
++                return G_EX_ORIGIN_LEFT;
++            case Class::Right:
++                return G_EX_ORIGIN_RIGHT;
++            default:
++                // Center keeps the projection processor's own decision; Stretch and Cover are
++                // expressed by the aspect-ratio compensation and the magnification instead of by an
++                // origin, so both want none of one. Spill has no meaning
++                // for a whole projection -- a projection is not scissored by the 4:3 box the way an
++                // individual rectangle is -- and is treated as Center.
++                return G_EX_ORIGIN_NONE;
++            }
++        }
++
++        const char *&lastIdentityPtr() {
++            static thread_local const char *ptr = "";
++            return ptr;
++        }
++
++        const char *lastProjectionIdentity() {
++            return lastIdentityPtr();
++        }
++
++        bool traceAllEnabled() {
++            return traceEnabled() && traceAll();
++        }
++
++        bool snapSplitDivider(int32_t screenWidth, uint32_t fillColor, int32_t &ulx, int32_t &uly,
++            int32_t &lrx, int32_t &lry)
++        {
++            static const bool enabled = envFlag("BAR_SPLIT_DIVIDERS", true);
++            if (!enabled || (screenWidth != 320) || (fillColor != 0x00010001)) {
++                return false;
++            }
++
++            // Quarter pixels. The inset is x 22..297 and y 16..223, and a fill rectangle's lower-right
++            // corner arrives as the last pixel (297.x / 223.x) or one past it (298 / 224), so both are
++            // accepted.
++            constexpr int32_t kThin = 2 * 4;
++            const int32_t pxUlx = ulx >> 2, pxLrx = lrx >> 2, pxUly = uly >> 2, pxLry = lry >> 2;
++            const bool horizontalLine = ((lry - uly) <= kThin) && (pxUlx == 22) && ((pxLrx == 297) || (pxLrx == 298));
++            const bool verticalLine = ((lrx - ulx) <= kThin) && (pxUly == 16) && ((pxLry == 223) || (pxLry == 224));
++            if (horizontalLine) {
++                ulx = 0;
++                lrx = (320 << 2) - 1;
++                return true;
++            }
++
++            if (verticalLine) {
++                uly = 0;
++                lry = (240 << 2) - 1;
++                return true;
++            }
++
++            return false;
++        }
++
++        bool coversForWidening(bool perspective, const FixedRect &inter, const FixedRect &fbScissor) {
++            if (inter.isEmpty()) {
++                return false;
++            }
++
++            if ((inter.ulx <= fbScissor.ulx) && (inter.lrx >= fbScissor.lrx)) {
++                return true;
++            }
++
++            const int32_t fbWidth = fbScissor.width(true, true);
++            const int32_t interWidth = inter.width(true, true);
++            if (fbWidth <= 0) {
++                return false;
++            }
++
++            static const int coverPercent = [] {
++                const char *e = std::getenv("BAR_ASPECT_COVER");
++                int parsed = 0;
++                if ((e != nullptr) && (sscanf(e, "%d", &parsed) == 1) && (parsed > 0) && (parsed <= 100)) {
++                    return parsed;
++                }
++                return 80;
++            }();
++            if ((coverPercent < 100) && ((int64_t(interWidth) * 100) >= (int64_t(fbWidth) * coverPercent))) {
++                return true;
++            }
++
++            static const bool splitTile = [] {
++                const char *e = std::getenv("BAR_SPLIT_TILE");
++                return (e == nullptr) || (e[0] == '\0') || (e[0] != '0');
++            }();
++            if (splitTile && perspective) {
++                const bool halfWidth = ((int64_t(interWidth) * 100) >= (int64_t(fbWidth) * 45)) &&
++                    ((int64_t(interWidth) * 100) <= (int64_t(fbWidth) * 55));
++                const bool atLeft = inter.left(true) <= (fbScissor.left(true) + 1);
++                const bool atRight = inter.right(true) >= (fbScissor.right(true) - 1);
++                if (halfWidth && (atLeft || atRight)) {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++    }
++};
++
++// Bridge for the app: BAR's racing state and game state live in the game's RDRAM, which only the app
++// side can read, so it pushes the answers in once per controller poll rather than RT64 guessing.
++extern "C" void bar_rt64_set_hud_anchor(int racing) {
++    RT64::BarHud::setRacing(racing != 0);
++}
++
++extern "C" void bar_rt64_set_game_state(unsigned int state) {
++    RT64::BarHud::setGameState(state);
++}
++
++extern "C" void bar_rt64_set_hud_paused(int paused) {
++    RT64::BarHud::setPaused(paused != 0);
++}
++
++extern "C" unsigned int bar_rt64_get_game_state() {
++    return RT64::BarHud::gameState();
++}
+--- /dev/null
++++ b/src/hle/rt64_bar_hud.h
+@@ -0,0 +1,246 @@
++//
++// RT64 -- Beetle Adventure Racing HUD anchoring and the port's HUD inspector
++//
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++#include "common/rt64_common.h"
++
++namespace RT64 {
++    struct Projection;
++    struct DrawCallTile;
++
++    // BAR authors its HUD against a fixed 320x240 screen, so in a widened frame RT64's default
++    // placement (scale the element about the frame's centre by the inverse aspect scale) leaves the
++    // whole HUD huddled in the middle 4:3 region with empty picture either side of it. Anchoring
++    // moves each element to the edge it belongs to instead, which is what the extended GBI's
++    // per-element origins exist for -- BAR emits none, so we classify its draws here and supply them.
++    //
++    // Two things decide an element's class, in this order:
++    //
++    //   1. A **tag**, looked up by the element's identity through the port (the inspector's live
++    //      override first, then hud.json). Tags apply EVERYWHERE, in menus as well as races.
++    //   2. The **positional heuristic** below, which runs only during a race. It is measured by
++    //      position (see docs/RACING_DRAW_MAP.md): everything in the top band is the speedometer
++    //      (left) and the timer and lap counter (right); everything in the bottom band is the course
++    //      map and the position counter (right); the middle band is where the centred race messages
++    //      ("GO!") are drawn and is deliberately left alone. It is racing-only because BAR's menu
++    //      screens are authored as whole 4:3 compositions and look broken pulled apart -- so a menu
++    //      element moves only when someone has explicitly tagged it.
++    namespace BarHud {
++        // What an element can be told to do. The values are the wire format: they are what the
++        // port's dropdown indexes and what hud.json's list names map to, so do not renumber them.
++        enum class Class : int {
++            Center  = 0,  // Leave RT64's default centring alone -- stay in the 4:3 box.
++            Left    = 1,  // Hold this element's distance from the left edge of the widened frame.
++            Right   = 2,  // Hold its distance from the right edge.
++            Stretch = 3,  // Do not squeeze it to 4:3 (G_EX_ASPECT_STRETCH). For backdrops and wipes.
++            Spill   = 4,  // Placement untouched; only lift the 4:3 scissor so it may run past the
++                          // old frame's edge. The one class that is about clipping, not placement.
++            Cover   = 5,  // ORTHOGRAPHIC LAYERS ONLY. Stretch, and then magnify the layer's content
++                          // about its centre by exactly enough to put BAR's overscan-safe rectangle
++                          // on the frame's edges. For a layer whose geometry is authored inset for a
++                          // CRT and so cannot reach the edges however the layer itself is scaled.
++            Sides   = 6,  // Split screen: each draw goes to the edge of the half it is drawn in --
++                          // Left if its centre is left of the screen's middle, Right otherwise. For
++                          // an element every player has a copy of (the battle's health bars and
++                          // ladybug icons), where one identity names all four copies and a single
++                          // side would be wrong for half of them. The identity still names content;
++                          // only the direction comes from where each copy is drawn. Applies only in
++                          // the battle state (6); Center everywhere else. See resolveSides.
++        };
++
++        // Set by the app once per controller poll: true only while the game is in its racing state.
++        void setRacing(bool racing);
++        bool racing();
++
++        // The app's game-state value, shown in the inspector's header so that a list of elements can
++        // be tied to the screen it came from. BAR keeps it at gGameSettings + 0xA4.
++        void setGameState(uint32_t state);
++        uint32_t gameState();
++
++        // Whether the game's own pause menu is up (gGameSettings + 0x86). Pushed in by the app from
++        // the SI poll, like the racing flag. It matters because a paused race is still a race as far
++        // as currentGameState is concerned, and the two screens want opposite things from the
++        // orthographic layer -- see orthoViewportOrigin.
++        void setPaused(bool paused);
++        bool paused();
++
++        // Where a 2D rectangle belongs on the widened frame, and -- as a side effect -- the point at
++        // which the element is published to the port's inspector.
++        //
++        // `rect` is the draw's own rectangle in RDP quarter-pixel coordinates and `screenWidth` the
++        // colour image's width in game pixels (320 for BAR); `fillCycle` says whether the draw is a
++        // fill-cycle rectangle.
++        //
++        // The remaining four build the element's IDENTITY, which is what a tag names -- and which of
++        // them is used depends on the draw, because a stale value is worse than no value:
++        //
++        //   textured        "tex:<G_SETTIMG address>", with the display list as the second identity.
++        //   fill cycle      "fill:<fill colour>", which is far more specific than the display list
++        //                   and stable between frames.
++        //   untextured      "dl:<display list address>". NOT the texture address: an untextured draw
++        //                   carries whatever G_SETTIMG last set, which belongs to some other element
++        //                   entirely. Tagging by it moved a menu's text when the thing being tagged
++        //                   was the black overlay drawn over it.
++        Class classifyRect(const FixedRect &rect, int32_t screenWidth, bool fillCycle,
++            uint32_t textureAddress, uint32_t displayListAddress, bool textureOn, uint32_t fillColor);
++
++        // The extended-GBI origin that realises a class, for the left and right edge of an element.
++        // Center, Stretch and Spill all want G_EX_ORIGIN_NONE: neither of the last two moves an
++        // element, they change how wide it may be drawn and how far it may run.
++        uint16_t leftOriginFor(Class cls);
++        uint16_t rightOriginFor(Class cls);
++
++        // What an ORTHOGRAPHIC PROJECTION should do, decided per projection.
++        //
++        // EVERY projection in the frame is offered, not only the orthographic ones -- a projection is
++        // the only handle there is on anything drawn as geometry, since individual triangles are not
++        // hooked. Only orthographic layers get a default; everything else is Center until tagged, so
++        // listing them changes nothing on its own.
++        //
++        // BAR draws some of its 2D as geometry under an orthographic projection rather than as
++        // texture rectangles, and those layers never appear in the rectangle list at all -- they go
++        // through the projection processor instead. Two of them want opposite things:
++        //
++        //   * the speedometer's needle lives in the dial at the left of the screen, and has to
++        //     follow it there or the two come apart. That is Class::Left.
++        //   * the pause screen's darkened backdrop has to cover the whole widened frame. That is
++        //     Class::Stretch, which means "do not compensate the projection's aspect ratio", so the
++        //     layer's own 320-wide space is mapped across the full frame.
++        //
++        // They cannot be told apart by when they are drawn -- a paused race is still a race -- so
++        // they are told apart by WHICH projection they are. `projectionIndex` is the same number
++        // RT64's own debugger shows in its Game editor ("Orthographic #4"), and the identity a tag
++        // names is "ortho:<n>", so what is seen there and what is tagged here are the same thing.
++        //
++        // Untagged, the answer is the old rule: Left while racing, Center otherwise. BAR_HUD_ORTHO=0
++        // turns that default off on its own, to tell the rectangle and projection halves apart on
++        // screen; it does not disable tags.
++        //
++        // `publish` says whether to hand this projection to the inspector. The same question is
++        // asked from two places -- the projection processor, which transforms the layer, and the
++        // framebuffer renderer, which places its viewport -- and they MUST get the same answer or
++        // the layer is placed by one rule and transformed by the other. Only the first publishes.
++        // The projection types the classifier distinguishes, matching RT64's Projection::Type and
++        // the prefix each one's identity carries.
++        enum class ProjKind : int {
++            Perspective = 0,   // "persp:<n>" -- the 3D world
++            Orthographic = 1,  // "ortho:<n>" -- 2D drawn as geometry
++            Rectangle = 2,     // "rect:<n>"  -- the layer texture rectangles are drawn into
++            Other = 3,         // "proj:<n>"
++        };
++
++        // A projection layer is identified by WHAT IT DRAWS, never by its index. The index is only
++        // its position in this frame's list, and that differs between courses and screens: the
++        // speedometer's needle was ortho:1 on one course and ortho:3 on another, while ortho:5 was
++        // the pause backdrop, so every tag promoted against an index fixed one course and broke
++        // another. The identity is "<kind>#<hash>", a hash over the layer's FIRST draw call of its
++        // colour combiner, other mode, texture on/off, triangle count and, when textured, the
++        // content hash of each texture tile. Colours and vertices are left out on purpose: they
++        // animate (fades, the needle's angle) while the layer stays the same element.
++        // `callTiles` is the workload's DrawCallTile array the calls' tileIndex refers to.
++        Class classifyProjection(ProjKind kind, const Projection &proj, const DrawCallTile *callTiles,
++            size_t callTileCount, bool publish);
++
++        // The magnification Class::Cover asks for, as a factor on the projection matrix's x and y,
++        // which scales the layer about the centre of BAR's 320x240 screen. Returns 1.0 for every other
++        // class. The factors put the layer's own quad on the frame's edges: `quadMin`/`quadMax` are the
++        // screen-space bounds (N64 pixels) of the layer's first draw call. The same layer draws
++        // different quads -- (21,16)-(297,225) on the pause screen, (31,23)-(288,219) in the pre-race
++        // course overview -- so one fixed rectangle left the overview short of the edges. Each factor
++        // is the larger of the two sides' ratios, so an off-centre quad still reaches both edges.
++        // With no usable bounds, the television inset (22,17)-(296,223) is used instead.
++        // BAR_HUD_COVER_INSET="l,t,r,b" forces a fixed rectangle, as before.
++        void coverScale(Class cls, float quadMinX, float quadMinY, float quadMaxX, float quadMaxY,
++            float *outX, float *outY);
++
++        // Turns a class into the viewport origin the projection processor wants. Stretch and Center
++        // both give G_EX_ORIGIN_NONE -- Stretch is expressed by suppressing the aspect-ratio
++        // compensation instead, which is a separate lever at the same call site.
++        uint16_t viewportOriginFor(Class cls);
++
++        // Class::Sides made concrete for one draw whose horizontal centre is `centreX` game pixels on
++        // a `screenWidth`-wide screen. Any other class is returned unchanged.
++        Class resolveSides(Class cls, float centreX, int32_t screenWidth);
++
++        // Whether a projection drawn into `inter` (its scissor intersected with its viewport) covers
++        // enough of its framebuffer pair's scissor `fbScissor` to be widened. The projection
++        // processor (which widens the matrix) and the framebuffer renderer (which widens the
++        // viewport and scissor) MUST both ask this one function: when they disagreed, the sky was
++        // widened and then clipped straight back to 4:3.
++        //
++        // Three ways to qualify, in order:
++        //   1. Upstream's strict test: `inter` spans the pair's scissor from edge to edge.
++        //   2. BAR_ASPECT_COVER (default 80): it covers that percentage of the pair's width. BAR's
++        //      racing viewport is inset for a CRT (275/320) and clamped to sScreenWidth - 1, so it
++        //      never passes the strict test.
++        //   3. A split-screen tile, for perspective projections only: half the pair's width (45-55 %)
++        //      and touching its left or right edge (1 px tolerance). The pair's scissor is the union
++        //      of everything drawn in it, and in BAR's 4-player battle player four's view shares its
++        //      pair with the full-screen HUD pass drawn straight after it: 160 against 320, 50 %, so
++        //      it stayed 4:3 while the other three -- each alone in its pair -- were widened.
++        //      BAR_SPLIT_TILE=0 turns this off for A/B.
++        bool coversForWidening(bool perspective, const FixedRect &inter, const FixedRect &fbScissor);
++
++        // BAR's split-screen dividers, extended to the frame's edges. Called from RDP::fillRect with
++        // the rectangle in RDP quarter-pixel coordinates, before it is recorded; adjusts it in place
++        // and returns true when it did.
++        //
++        // The dividers between the split-screen views are two thin black fill-cycle rectangles drawn
++        // at BAR's overscan inset, measured (BAR_HUD_TRACE=2, 4-player battle) at (22,119)-(298,121)
++        // and (159,16)-(161,224). The views themselves reach the frame's edges -- patches/
++        // viewport_patch.c snaps their inset edges, RT64 widens them -- so the dividers stopped
++        // short of them. This snaps the same four inset edges on a line at most 2 px thick, the
++        // same rule the viewport patch applies to viewports. A horizontal divider then spans the
++        // whole 320-wide screen, which RT64 already stretches across the widened frame, as it does
++        // every full-width fill. Only black (0x00010001) lines on a 320-wide colour image qualify.
++        // BAR_SPLIT_DIVIDERS=0 turns it off for A/B.
++        // BAR_HUD_TRACE=2: the full element listing (see rt64_bar_hud.cpp).
++        bool traceAllEnabled();
++
++        // The identity the last classifyProjection call on this thread computed, for traces that
++        // run straight after it (the projection processor's [hud-ortho] listing).
++        const char *lastProjectionIdentity();
++
++        bool snapSplitDivider(int32_t screenWidth, uint32_t fillColor, int32_t &ulx, int32_t &uly,
++            int32_t &lrx, int32_t &lry);
++
++        // End of a display list, which is where the list of elements the inspector shows is
++        // published. Called from State::advanceWorkload.
++        void endFrame();
++    }
++};
++
++// ---- The port's side of the inspector ----------------------------------------------------------
++//
++// RT64 is a library and must keep building on its own, so none of this is a call into the port: the
++// port sets these pointers at startup (src/main/bar_inspector.cpp) and they stay null otherwise.
++// Every call site checks for null, so an unpatched or standalone RT64 behaves exactly as before.
++extern "C" {
++    // Installed before renderer threads start. Reports RT64's actual widening to
++    // the host so the game's culling agrees with Original, widescreen and resize.
++    extern void (*RT64_BarCullScale)(float scale);
++    // Draws the port's window inside RT64's inspector UI, with an ImGui frame already open. Called
++    // once per frame from State::inspect(), which only runs in RT64's developer mode.
++    extern void (*RT64_PortInspectorHook)();
++
++    // One classified 2D element of the frame being built. Extents are in the game's own 320x240
++    // pixels, before any widescreen arithmetic. `kind` is "tex", "fill", "untex" or "ortho" -- which
++    // identity scheme this element got, shown in the panel so that two rows that look alike can be
++    // told apart. An "ortho" row is a whole projection rather than a single draw, and arrives from
++    // the projection processor rather than from the RDP.
++    extern void (*RT64_BarHudNoteElement)(const char *identity, const char *secondIdentity,
++        float minX, float maxX, float minY, float maxY, int givenClass, const char *kind);
++
++    // End of the display list: the frame just noted is complete and may be shown.
++    extern void (*RT64_BarHudEndFrame)();
++
++    // The port's tag lookup: the inspector's live override first, then hud.json. Returns non-zero
++    // and writes a BarHud::Class into *outClass when this identity is tagged. Installed even when
++    // the inspector itself is off, so that a saved hud.json still applies.
++    extern int (*RT64_BarHudTagLookup)(const char *identity, const char *secondIdentity, int *outClass);
++}
+--- a/src/hle/rt64_framebuffer_pair.cpp
++++ b/src/hle/rt64_framebuffer_pair.cpp
+@@ -21,6 +21,7 @@
+         depthWrite = false;
+         syncRequired = false;
+         fillRectOnly = true;
++        barMenuStretch = false;
+         ditherPatterns.fill(0);
+         scissorRect.reset();
+         startFbDiscards.clear();
+--- a/src/hle/rt64_framebuffer_pair.h
++++ b/src/hle/rt64_framebuffer_pair.h
+@@ -45,6 +45,10 @@
+         bool depthWrite;
+         bool syncRequired;
+         bool fillRectOnly; // This only applies if there's at least one draw call.
++        // BAR: a menu frame (game state 14) drew a Stretch-tagged rectangle into this pair. The workload
++        // queue clears such a colour image to black once per frame before its first pair is drawn; see
++        // WorkloadQueue "BAR menu clear".
++        bool barMenuStretch = false;
+         std::vector<uint32_t> startFbDiscards;
+         std::vector<FramebufferOperation> startFbOperations;
+         std::vector<FramebufferOperation> endFbOperations;
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -202,6 +202,15 @@
+         }
+ 
+         RenderTarget *colorTarget = nullptr;
++
++        // BAR film roll: when the VI origin lies inside a known framebuffer (BAR's menu transition pans
++        // the origin through two stacked 320x240 pages), present a composite of the two render targets
++        // instead of uploading the RDRAM bytes, which are native 4:3 and partly stale. See the branch
++        // below and docs/HUD-INSPECTOR.md "Film-roll transition". BAR_NO_ROLL_COMPOSE=1 turns it off.
++        RenderTarget *barRollTop = nullptr;
++        RenderTarget *barRollBottom = nullptr;
++        uint32_t barRollRowOffset = 0;
++        uint32_t barRollNativeHeight = 0;
+         int32_t framesToPresent = 1;
+         bool lockedWorkloadMutex = false;
+         InterpolatedFrameCounters &frameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
+@@ -232,7 +241,7 @@
+             }
+ 
+             Framebuffer *presentFb = viFb;
+-            
++
+             // Show the framebuffer the debugger has requested instead.
+             if (present.debuggerFramebuffer.view) {
+                 Framebuffer *candidateFb = fbManager.find(present.debuggerFramebuffer.address);
+@@ -242,6 +251,13 @@
+             }
+             
+             if ((presentFb != nullptr) && (viFb != nullptr)) {
++                // BAR film roll: the most recent framebuffers presented at an exact origin, newest
++                // first, so a roll whose outgoing page RT64 never drew at its RDRAM address can still
++                // find that page's render target (see the fallback below).
++                if (barRollRecentExact[0] != viFb->addressStart) {
++                    barRollRecentExact[1] = barRollRecentExact[0];
++                    barRollRecentExact[0] = viFb->addressStart;
++                }
+                 for (uint32_t colorAddress : ext.sharedResources->colorImageAddressVector) {
+                     Framebuffer *colorFb = fbManager.find(colorAddress);
+                     if (colorFb == nullptr) {
+@@ -306,6 +322,97 @@
+             else {
+                 uint32_t fbAddress = present.screenVI.fbAddress();
+ 
++                // BAR film roll (see the declaration of barRollTop). Find the framebuffer whose image
++                // contains the origin on a whole row, and the framebuffer that starts where it ends.
++                static const bool barRollComposeEnabled = (std::getenv("BAR_NO_ROLL_COMPOSE") == nullptr);
++                if (barRollComposeEnabled && !viewRDRAM) {
++                    for (auto &entry : fbManager.framebuffers) {
++                        Framebuffer &topFb = entry.second;
++                        const uint32_t rowBytes = topFb.imageRowBytes(topFb.width);
++                        if ((rowBytes == 0) || (topFb.height == 0) || (fbAddress <= topFb.addressStart) || (fbAddress >= topFb.addressEnd) ||
++                            (((fbAddress - topFb.addressStart) % rowBytes) != 0))
++                        {
++                            continue;
++                        }
++
++                        Framebuffer *bottomFb = fbManager.find(topFb.addressEnd);
++                        if ((bottomFb == nullptr) || (bottomFb->width != topFb.width) || (bottomFb->siz != topFb.siz)) {
++                            continue;
++                        }
++
++                        RenderTarget &topTarget = targetManager.get(RenderTargetKey(topFb.addressStart, topFb.width, topFb.siz, Framebuffer::Type::Color), true);
++                        RenderTarget &bottomTarget = targetManager.get(RenderTargetKey(bottomFb->addressStart, bottomFb->width, bottomFb->siz, Framebuffer::Type::Color), true);
++                        if (topTarget.isEmpty() || bottomTarget.isEmpty() || (topTarget.width != bottomTarget.width) ||
++                            (topTarget.height != bottomTarget.height) || (topTarget.format != bottomTarget.format) ||
++                            (topTarget.downsampleMultiplier > 1) || (bottomTarget.downsampleMultiplier > 1))
++                        {
++                            continue;
++                        }
++
++                        barRollTop = &topTarget;
++                        barRollBottom = &bottomTarget;
++                        barRollRowOffset = (fbAddress - topFb.addressStart) / rowBytes;
++                        barRollNativeHeight = topFb.height;
++                        break;
++                    }
++                }
++
++                // Fallback: no known framebuffer contains the origin, but one starts a whole number of rows
++                // below it -- the incoming page. The outgoing page was never drawn by RT64 at its RDRAM
++                // address: on the first title -> Main Menu roll RT64 knows only 0x003DA800 and 0x00200000
++                // while the origin pans from 0x001DA800 (measured with a temporary per-present VI origin log); the game put the
++                // title page there itself (inferred). Use the most recently presented other page instead.
++                if (barRollComposeEnabled && !viewRDRAM && (barRollTop == nullptr)) {
++                    for (auto &entry : fbManager.framebuffers) {
++                        Framebuffer &bottomFb = entry.second;
++                        const uint32_t rowBytes = bottomFb.imageRowBytes(bottomFb.width);
++                        if ((rowBytes == 0) || (bottomFb.height == 0) || (bottomFb.addressStart <= fbAddress) ||
++                            (((bottomFb.addressStart - fbAddress) % rowBytes) != 0) ||
++                            (((bottomFb.addressStart - fbAddress) / rowBytes) >= bottomFb.height))
++                        {
++                            continue;
++                        }
++
++                        uint32_t topAddress = 0;
++                        for (uint32_t recent : barRollRecentExact) {
++                            if ((recent != 0) && (recent != bottomFb.addressStart)) {
++                                topAddress = recent;
++                                break;
++                            }
++                        }
++
++                        Framebuffer *topFb = (topAddress != 0) ? fbManager.find(topAddress) : nullptr;
++                        if ((topFb == nullptr) || (topFb->width != bottomFb.width) || (topFb->siz != bottomFb.siz) || (topFb->height != bottomFb.height)) {
++                            continue;
++                        }
++
++                        RenderTarget &topTarget = targetManager.get(RenderTargetKey(topFb->addressStart, topFb->width, topFb->siz, Framebuffer::Type::Color), true);
++                        RenderTarget &bottomTarget = targetManager.get(RenderTargetKey(bottomFb.addressStart, bottomFb.width, bottomFb.siz, Framebuffer::Type::Color), true);
++                        if (topTarget.isEmpty() || bottomTarget.isEmpty() || (topTarget.width != bottomTarget.width) ||
++                            (topTarget.height != bottomTarget.height) || (topTarget.format != bottomTarget.format) ||
++                            (topTarget.downsampleMultiplier > 1) || (bottomTarget.downsampleMultiplier > 1))
++                        {
++                            continue;
++                        }
++
++                        barRollTop = &topTarget;
++                        barRollBottom = &bottomTarget;
++                        barRollRowOffset = bottomFb.height - ((bottomFb.addressStart - fbAddress) / rowBytes);
++                        barRollNativeHeight = bottomFb.height;
++                        break;
++                    }
++                }
++
++                if (barRollTop != nullptr) {
++                    lockedWorkloadMutex = true;
++                    ext.sharedResources->workloadMutex.lock();
++                    colorTarget = barRollTop;
++                    if (!present.paused && (viHistory.top().vi != present.screenVI)) {
++                        viHistory.pushVI(present.screenVI, present.screenVI.fbSize().x);
++                    }
++                }
++                else {
++
+                 // Use a scratch framebuffer to upload the RAM to the render target.
+                 hlslpp::uint2 fbSize = present.screenVI.fbSize();
+                 scratchFb.addressStart = fbAddress;
+@@ -339,6 +446,7 @@
+ 
+                 if (!present.paused && (viHistory.top().vi != present.screenVI)) {
+                     viHistory.pushVI(present.screenVI, fbSize.x);
++                }
+                 }
+             }
+         }
+@@ -448,6 +556,42 @@
+                         renderParams.texture = colorTarget->getResolvedTexture();
+                         renderParams.textureWidth = colorTarget->width;
+                         renderParams.textureHeight = colorTarget->height;
++
++                        // BAR film roll: top page shifted up by the origin's row offset, bottom page below it.
++                        if ((barRollTop != nullptr) && (colorTarget == barRollTop) && (barRollNativeHeight > 0)) {
++                            barRollBottom->resolveTarget(ext.presentGraphicsWorker, ext.shaderLibrary);
++                            if ((barRollTexture == nullptr) || (barRollTextureWidth != colorTarget->width) ||
++                                (barRollTextureHeight != colorTarget->height) || (barRollTextureFormat != colorTarget->format))
++                            {
++                                barRollTexture = ext.device->createTexture(RenderTextureDesc::Texture2D(colorTarget->width, colorTarget->height, 1, colorTarget->format));
++                                barRollTexture->setName("BAR Film Roll Composite");
++                                barRollTextureWidth = colorTarget->width;
++                                barRollTextureHeight = colorTarget->height;
++                                barRollTextureFormat = colorTarget->format;
++                            }
++
++                            const uint32_t w = colorTarget->width;
++                            const uint32_t h = colorTarget->height;
++                            const uint32_t split = std::min(h, uint32_t((uint64_t(barRollRowOffset) * h + barRollNativeHeight / 2) / barRollNativeHeight));
++                            RenderTexture *topTexture = barRollTop->getResolvedTexture();
++                            RenderTexture *bottomTexture = barRollBottom->getResolvedTexture();
++                            RenderTextureBarrier copyBarriers[] = {
++                                RenderTextureBarrier(barRollTexture.get(), RenderTextureLayout::COPY_DEST),
++                                RenderTextureBarrier(topTexture, RenderTextureLayout::COPY_SOURCE),
++                                RenderTextureBarrier(bottomTexture, RenderTextureLayout::COPY_SOURCE)
++                            };
++                            commandList->barriers(RenderBarrierStage::COPY, copyBarriers, uint32_t(std::size(copyBarriers)));
++                            if (split < h) {
++                                const RenderBox topBox(0, int32_t(split), int32_t(w), int32_t(h));
++                                commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(barRollTexture.get()), RenderTextureCopyLocation::Subresource(topTexture), 0, 0, 0, &topBox);
++                            }
++                            if (split > 0) {
++                                const RenderBox bottomBox(0, 0, int32_t(w), int32_t(split));
++                                commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(barRollTexture.get()), RenderTextureCopyLocation::Subresource(bottomTexture), 0, h - split, 0, &bottomBox);
++                            }
++                            commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(barRollTexture.get(), RenderTextureLayout::SHADER_READ));
++                            renderParams.texture = barRollTexture.get();
++                        }
+                     }
+                 }
+                 
+--- a/src/hle/rt64_present_queue.h
++++ b/src/hle/rt64_present_queue.h
+@@ -57,6 +57,12 @@
+         Timestamp presentTimestamp;
+         VIHistory viHistory;
+         bool presentWaitEnabled = false;
++        // BAR transition resources belong to this queue/device, never a process-wide static.
++        uint32_t barRollRecentExact[2]{};
++        std::unique_ptr<RenderTexture> barRollTexture;
++        uint32_t barRollTextureWidth = 0;
++        uint32_t barRollTextureHeight = 0;
++        RenderFormat barRollTextureFormat = RenderFormat::UNKNOWN;
+ 
+         PresentQueue();
+         ~PresentQueue();
+--- a/src/hle/rt64_rdp.cpp
++++ b/src/hle/rt64_rdp.cpp
+@@ -4,13 +4,21 @@
+ 
+ #include "rt64_rdp.h"
+ 
++#include "render/rt64_vi_renderer.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstdint>
++
+ #include <cassert>
++#include <set>
+ 
+ #include "../include/rt64_extended_gbi.h"
+ 
+ #include "common/rt64_math.h"
+ #include "gbi/rt64_f3d.h"
+ 
++#include "rt64_bar_hud.h"
+ #include "rt64_color_converter.h"
+ #include "rt64_interpreter.h"
+ #include "rt64_state.h"
+@@ -977,6 +985,27 @@
+         scissorRect.uly = std::clamp(uly + extAlignment.topOffset, extAlignment.topBound, extAlignment.bottomBound);
+         scissorRect.lrx = std::clamp(movedFromOrigin(lrx + extAlignment.rightOffset, extAlignment.rightOrigin), extAlignment.leftBound, extAlignment.rightBound);
+         scissorRect.lry = std::clamp(lry + extAlignment.bottomOffset, extAlignment.topBound, extAlignment.bottomBound);
++        // BAR_DBG_SCISSOR=1 logs each DISTINCT scissor rectangle the game sets, in both raw 10.2
++        // fixed point and pixels. BAR's uvgfxmgr emits these from uvGfxClipRect, so this shows the
++        // rectangle the game itself is asking for -- which is how to tell a game-drawn inset (black
++        // bars baked into the 320x240 image) apart from anything the renderer's window fit is doing.
++        {
++            static const bool scDbg = std::getenv("BAR_DBG_SCISSOR") != nullptr;
++            if (scDbg) {
++                static int32_t lastUlx = INT32_MIN, lastUly = 0, lastLrx = 0, lastLry = 0;
++                if (ulx != lastUlx || uly != lastUly || lrx != lastLrx || lry != lastLry) {
++                    lastUlx = ulx; lastUly = uly; lastLrx = lrx; lastLry = lry;
++                    fprintf(stderr, "[scissor] raw=(%d,%d)-(%d,%d)  px=(%.1f,%.1f)-(%.1f,%.1f)  w=%.1f h=%.1f\n",
++                        ulx, uly, lrx, lry, ulx / 4.0, uly / 4.0, lrx / 4.0, lry / 4.0,
++                        (lrx - ulx) / 4.0, (lry - uly) / 4.0);
++                    fflush(stderr);
++                }
++            }
++        }
++        // BAR: tell the present stage which region of the framebuffer this screen draws into.
++        // Raw scissor coordinates are 10.2 fixed point, so convert to framebuffer pixels.
++        VIRenderer::barReportGameScissor(ulx / 4.0f, uly / 4.0f, lrx / 4.0f, lry / 4.0f);
++
+         scissorModeStack[scissorStackSize - 1] = mode;
+         extended.scissorLeftOriginStack[scissorStackSize - 1] = extAlignment.leftOrigin;
+         extended.scissorRightOriginStack[scissorStackSize - 1] = extAlignment.rightOrigin;
+@@ -1044,6 +1073,11 @@
+         if ((mode == G_CYC_COPY) || (mode == G_CYC_FILL)) {
+             lrx |= 3;
+             lry |= 3;
++        }
++
++        // BAR: the split-screen dividers are drawn at the overscan inset; reach the frame's edges.
++        if (mode == G_CYC_FILL) {
++            BarHud::snapSplitDivider(colorImage.width, fillColorStack[fillColorStackSize - 1], ulx, uly, lrx, lry);
+         }
+ 
+         drawRect(ulx, uly, lrx, lry, 0, 0, 0, 0, false, extAlignment);
+@@ -1197,6 +1231,85 @@
+             return;
+         }
+ 
++        // BAR draws a black border around its CRT overscan-safe area: four black fill rectangles that
++        // together are the complement of the rectangle it renders into (measured with BAR_DBG_RECT
++        // during a race: (0,0)-(320,17), (0,224)-(320,240), (0,17)-(21,223) and (296,17)-(320,223)).
++        // On a television the bezel hid that margin. On a monitor it is a black frame, and in
++        // widescreen it is worse than that: the top and bottom rectangles span the whole scissor
++        // width, so RT64 stretches them across the widened frame, while the side ones do not and so
++        // are pinned at their 4:3 positions -- black columns standing in the middle of the picture
++        // with widened world visible outside them. That is the "island" recorded in KNOWN_ISSUES; the
++        // 3D itself already covers the whole frame, the mask is simply painted over it.
++        //
++        // `patches/viewport_patch.c` already removed the same overscan inset from the game's viewport
++        // and scissor. This removes the other half of it, the mask drawn on top. Recognised narrowly:
++        // an opaque black fill rectangle, hugging one edge of the scissor, no thicker than a tenth of
++        // it. The intro's cinematic letterbox is ~20% of the height and so is deliberately kept.
++        // BAR_KEEP_OVERSCAN=1 restores the mask.
++        {
++            static const bool keepOverscan = std::getenv("BAR_KEEP_OVERSCAN") != nullptr;
++            const FixedRect &sc = scissorRectStack[scissorStackSize - 1];
++            if (!keepOverscan && (otherMode.cycleType() == G_CYC_FILL) && !sc.isNull() &&
++                ((fillColorStack[fillColorStackSize - 1] & 0xFFFF) == 0x0001))
++            {
++                const int32_t bandX = (sc.lrx - sc.ulx) / 10;
++                const int32_t bandY = (sc.lry - sc.uly) / 10;
++                const bool left   = (drawRect.ulx <= sc.ulx) && (drawRect.lrx <= sc.ulx + bandX);
++                const bool right  = (drawRect.lrx >= sc.lrx) && (drawRect.ulx >= sc.lrx - bandX);
++                const bool top    = (drawRect.uly <= sc.uly) && (drawRect.lry <= sc.uly + bandY);
++                const bool bottom = (drawRect.lry >= sc.lry) && (drawRect.uly >= sc.lry - bandY);
++                if (left || right || top || bottom) {
++                    return;
++                }
++            }
++        }
++
++        // BAR_SKIP_WIDE=<pixels>: probe -- drop textured rectangles at least this wide, to find out
++        // which on-screen element a class of draw is responsible for. Measured so far: at 150 the
++        // track-select screen loses its course-name text, and the racing sky is unaffected (so the
++        // sky is not made of wide texture rectangles). See docs/RACING_DRAW_MAP.md.
++        {
++            static const int skipWide = [] {
++                const char *e = std::getenv("BAR_SKIP_WIDE");
++                int parsed = 0;
++                return ((e != nullptr) && (sscanf(e, "%d", &parsed) == 1)) ? parsed : 0;
++            }();
++            if ((skipWide > 0) && (otherMode.cycleType() != G_CYC_FILL) &&
++                ((drawRect.lrx - drawRect.ulx) >= (skipWide * 4)))
++            {
++                return;
++            }
++        }
++
++        // BAR_DBG_RECT=1 logs each DISTINCT 2D rectangle the game draws, in framebuffer pixels, with
++        // the cycle type, whether it is textured, and the current fill colour. BAR's black overscan
++        // border is drawn as 2D rectangles, and this is what identifies them (position, size and
++        // colour) so they can be told apart from the HUD elements drawn beside them.
++        {
++            static const bool rectDbg = std::getenv("BAR_DBG_RECT") != nullptr;
++            if (rectDbg) {
++                static std::set<uint64_t> seen;
++                const uint64_t key =
++                    (uint64_t(uint16_t(drawRect.ulx)) << 48) | (uint64_t(uint16_t(drawRect.uly)) << 32) |
++                    (uint64_t(uint16_t(drawRect.lrx)) << 16) | uint64_t(uint16_t(drawRect.lry));
++                if ((seen.size() < 4000) && seen.insert(key).second) {
++                    const char *cyc = "2cycle";
++                    switch (otherMode.cycleType()) {
++                    case G_CYC_1CYCLE: cyc = "1cycle"; break;
++                    case G_CYC_COPY:   cyc = "copy";   break;
++                    case G_CYC_FILL:   cyc = "fill";   break;
++                    default: break;
++                    }
++                    const FixedRect &sc = scissorRectStack[scissorStackSize - 1];
++                    fprintf(stdout, "[rect] px=(%.1f,%.1f)-(%.1f,%.1f) %s tex=%d fill=0x%08X sc=(%.1f,%.1f)-(%.1f,%.1f) fbw=%u\n",
++                        drawRect.ulx / 4.0f, drawRect.uly / 4.0f, drawRect.lrx / 4.0f, drawRect.lry / 4.0f,
++                        cyc, int(state->drawCall.textureOn), fillColorStack[fillColorStackSize - 1],
++                        sc.ulx / 4.0f, sc.uly / 4.0f, sc.lrx / 4.0f, sc.lry / 4.0f, colorImage.width);
++                    fflush(stdout);
++                }
++            }
++        }
++
+         // Check if framebuffer pair must be changed.
+         checkFramebufferPair();
+ 
+@@ -1238,6 +1351,80 @@
+ 
+         if (flushedState) {
+             state->loadDrawState();
++        }
++
++        // BAR: anchor the racing HUD to the edges of the widened frame. BAR emits no extended-GBI
++        // origins of its own, so without this every 2D element is placed by scaling it about the
++        // frame's centre and the whole HUD stays huddled in the middle 4:3 region. Supplying the
++        // origins here is the same thing a game built for the extended GBI would do, so everything
++        // downstream -- the rectangle's placement, its scissor, the misalignment correction -- already
++        // knows what to do with them. See rt64_bar_hud.cpp for how an element is classified.
++        //
++        // The scissor has to travel with the rectangle: BAR scissors its HUD to the full 320x240
++        // screen, which by default converts to the centred 4:3 region, and an element anchored to an
++        // edge of the widened frame lands outside it and is clipped away. Giving the scissor the two
++        // edge origins widens it to the whole frame for this draw only.
++        //
++        // This runs after loadDrawState because loadDrawState is what copies the game's own scissor
++        // origins into the draw call; marking the attribute changed afterwards is what makes the next
++        // draw reload them and so keeps the widened scissor to this one rectangle.
++        {
++            // classifyRect is called for EVERY 2D rectangle now, not only during a race, because it
++            // is also what publishes the frame's elements to the port's HUD inspector and what
++            // applies a hud.json tag -- and both of those have to work in the menus. It returns
++            // Class::Center and costs a single branch when there is no inspector, no tag table and
++            // no race in progress.
++            const bool fillCycle = (otherMode.cycleType() == G_CYC_FILL);
++            const BarHud::Class cls = BarHud::classifyRect(drawRect, colorImage.width, fillCycle,
++                texture.address, state->displayListAddress, state->drawCall.textureOn != 0,
++                fillColorStack[fillColorStackSize - 1]);
++
++            if ((cls == BarHud::Class::Stretch) && (BarHud::gameState() == 14)) {
++                fbPair.barMenuStretch = true;
++            }
++
++            switch (cls) {
++            case BarHud::Class::Left:
++            case BarHud::Class::Right:
++                drawCall.rectLeftOrigin = BarHud::leftOriginFor(cls);
++                drawCall.rectRightOrigin = BarHud::rightOriginFor(cls);
++                drawCall.scissorLeftOrigin = G_EX_ORIGIN_LEFT;
++                drawCall.scissorRightOrigin = G_EX_ORIGIN_RIGHT;
++                state->updateDrawStatusAttribute(DrawAttribute::Scissor);
++                break;
++            case BarHud::Class::Stretch:
++                // "Do not squeeze this to 4:3", which is not the same as "cover the widened frame":
++                // a 320-wide rectangle reaches the frame's full width and a narrower one is widened
++                // about its centre by the same factor. The element's own origins are deliberately
++                // left alone -- pinning its edges to the frame's edges is what Left and Right do.
++                drawCall.rectAspect = G_EX_ASPECT_STRETCH;
++                // The scissor has to travel with it, for the same reason it travels with Left and
++                // Right: BAR scissors its 2D to the whole 320x240 screen, which RT64 converts to the
++                // centred 4:3 region, so anything drawn wider than that is clipped straight back to
++                // where it started. Widening the rectangle without widening its scissor is the
++                // "half a change looks identical to no change" trap that
++                // docs/technical/08-diagnostics-and-methodology.md warns about -- it would have
++                // looked exactly like the tag not being applied at all.
++                //
++                // wave-race-64-recomp does not need this for its own stretch class, which is why it
++                // was not here to begin with.
++                drawCall.scissorLeftOrigin = G_EX_ORIGIN_LEFT;
++                drawCall.scissorRightOrigin = G_EX_ORIGIN_RIGHT;
++                state->updateDrawStatusAttribute(DrawAttribute::Scissor);
++                break;
++            case BarHud::Class::Spill:
++                // Placement untouched; only the scissor is widened, for the length of this one
++                // rectangle. For an element that is already the right size in the right place and is
++                // merely being cut off where the 4:3 frame used to end. BAR scissors a race to
++                // x 8..311, so an element drawn from x 0 has eight units hidden even on hardware.
++                drawCall.scissorLeftOrigin = G_EX_ORIGIN_LEFT;
++                drawCall.scissorRightOrigin = G_EX_ORIGIN_RIGHT;
++                state->updateDrawStatusAttribute(DrawAttribute::Scissor);
++                break;
++            case BarHud::Class::Center:
++            default:
++                break;
++            }
+         }
+ 
+         auto &triPosFloats = workload.drawData.triPosFloats;
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -19,6 +19,7 @@
+ #include "preset/rt64_preset_light.h"
+ 
+ #include "rt64_application.h"
++#include "rt64_bar_hud.h"
+ #include "rt64_interpreter.h"
+ 
+ //#define ASSERT_ON_BLENDER_EMULATION
+@@ -1747,6 +1748,16 @@
+             }
+         }
+         
++        // BAR: the end of a full synchronization is the frame boundary for the port's HUD inspector
++        // -- the elements noted since the last one are complete, and may be swapped in for the panel
++        // to read. No-op when the port has installed nothing.
++        //
++        // Deliberately here rather than inside advanceWorkload: the other caller is the paused path,
++        // which re-submits the last workload every frame without any display list having been
++        // processed, so ending a frame there would publish an empty list and blank the panel for as
++        // long as the game stayed paused -- exactly when it is being read.
++        BarHud::endFrame();
++
+         // Advance the workload queue at the end of a full synchronization.
+         advanceWorkload(workload, false);
+         ext.workloadQueue->advanceToNextWorkload();
+@@ -2062,6 +2073,15 @@
+ 
+         // Check the debugger popup regardless of the active inspector mode.
+         bool debuggerSelected = debuggerInspector.checkPopup(workload);
++
++        // BAR: the port's own inspector, drawn into this frame's UI beside RT64's. RT64 owns the
++        // ImGui context, and both halves have to be in one window or the tool is no better than
++        // reading two logs side by side -- RT64 answers "what did the renderer draw here", and the
++        // port answers "which of the game's elements is that, and what class did we give it".
++        // Null unless the port installs it; see src/hle/rt64_bar_hud.h.
++        if (RT64_PortInspectorHook != nullptr) {
++            RT64_PortInspectorHook();
++        }
+ 
+         if (ImGui::Begin("Game editor")) {
+             if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_None)) {
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -2,11 +2,14 @@
+ // RT64
+ //
+ 
++#include <algorithm>
++#include <cstdlib>
+ #include "rt64_workload_queue.h"
+ 
+ #include "common/rt64_thread.h"
+ 
+ #include "rt64_present_queue.h"
++#include "rt64_bar_hud.h"
+ 
+ #define ENABLE_HIGH_RESOLUTION_RENDERER 1
+ 
+@@ -208,6 +211,9 @@
+ 
+         // Build the resolution scale vector from the configuration.
+         workloadConfig.aspectRatioScale = workloadConfig.aspectRatioTarget / workloadConfig.aspectRatioSource;
++        if (RT64_BarCullScale != nullptr) {
++            RT64_BarCullScale(workloadConfig.aspectRatioScale);
++        }
+         workloadConfig.resolutionScale = { resolutionMultiplier * workloadConfig.aspectRatioScale, resolutionMultiplier };
+         workloadConfig.downsampleMultiplier = ext.sharedResources->userConfig.downsampleMultiplier;
+         ext.sharedResources->resolutionScale = workloadConfig.resolutionScale;
+@@ -425,6 +431,29 @@
+                     nativeColorWidth = colorImg.width;
+                     nativeColorHeight = fbPair.drawColorRect.bottom(true);
+ 
++                    // BAR: the height is the lowest pixel any draw in this pair reached, which is too
++                    // little once a layer is magnified past what the game drew. The pause screen's pair
++                    // ends at y=225 (its backdrop quad's bottom, before Cover magnifies it), or lower when
++                    // the orbiting car reaches further, so the pair's target flipped between ~225 and 240
++                    // and the magnified backdrop was cut off at the bottom on those presents. A pair whose
++                    // draws already span most of the VI framebuffer is a full-screen composition; give it
++                    // the whole VI height. Small offscreen targets stay as they were.
++                    //
++                    // Only the render target grows. The Framebuffer objects below keep the drawn height:
++                    // they define the RDRAM range RT64 syncs and watches for this image, and this change
++                    // has no reason to touch that. (FramebufferManager keeps the largest height ever asked
++                    // for per address, and the scene pair asks for 240, so in BAR that range was already
++                    // full height -- this is caution, not a measured need.)
++                    const uint32_t drawnColorHeight = nativeColorHeight;
++                    // BAR_NO_FB_FULL_HEIGHT=1 turns this off (A/B).
++                    static const bool fullHeightEnabled = (std::getenv("BAR_NO_FB_FULL_HEIGHT") == nullptr);
++                    const uint32_t viHeight = workload.viFbSize[1];
++                    if (fullHeightEnabled && (viHeight > 0) && (nativeColorHeight < viHeight) && (nativeColorHeight >= (viHeight * 3) / 4) &&
++                        (colorImg.width == workload.viFbSize[0]))
++                    {
++                        nativeColorHeight = viHeight;
++                    }
++
+                     // When the target is much bigger than the reference height, we reduce the resolution scaling (but clamped to 1.0).
+                     const uint32_t heightThreshold = (workload.viFbSize[1] > 0) ? ((workload.viFbSize[1] * 3) / 2) : 360;
+                     uint32_t downsampleMultiplier = workloadConfig.downsampleMultiplier;
+@@ -435,7 +464,7 @@
+ 
+                     if (fbPair.depthRead || fbPair.depthWrite || fbPair.fastPaths.clearDepthOnly) {
+                         uint32_t depthAddress = fbPair.fastPaths.clearDepthOnly ? colorImg.address : depthImg.address;
+-                        depthFb = &fbManager.get(depthAddress, G_IM_SIZ_16b, nativeColorWidth, nativeColorHeight);
++                        depthFb = &fbManager.get(depthAddress, G_IM_SIZ_16b, nativeColorWidth, drawnColorHeight);
+                         depthFb->everUsedAsDepth = true;
+                     }
+                     else {
+@@ -446,7 +475,7 @@
+                     fbKey = RenderFramebufferKey();
+ 
+                     if (!fbPair.fastPaths.clearDepthOnly) {
+-                        colorFb = &fbManager.get(colorImg.address, colorImg.siz, nativeColorWidth, nativeColorHeight);
++                        colorFb = &fbManager.get(colorImg.address, colorImg.siz, nativeColorWidth, drawnColorHeight);
+                     }
+ 
+                     if (colorFb != nullptr) {
+@@ -706,6 +735,25 @@
+             
+             // Record all framebuffer pairs.
+             uint32_t framebufferIndex = 0;
++
++            // BAR menu clear. BAR's menu pages are composed from a stretched film frame around a panel.
++            // Most panels hold live 3D that widens with the frame, but Track Select's preview is a fixed
++            // 4:3 picture, and the game never draws the strips beside it inside the widened opening. Each
++            // of the two alternating framebuffers kept different leftover pixels there (flicker, measured
++            // with BAR_SHOT_BURST). BAR does not clear these pages every frame, so clear any colour image a
++            // menu frame stretched into, once, before its first pair; the game redraws everything inside
++            // the frame each frame, so only the never-drawn strips change (to black).
++            // BAR_NO_MENU_CLEAR=1 turns it off.
++            static const bool barMenuClearEnabled = (std::getenv("BAR_NO_MENU_CLEAR") == nullptr);
++            std::vector<uint32_t> barMenuClearAddresses;
++            if (barMenuClearEnabled) {
++                for (uint32_t f = 0; f < fbPairCount; f++) {
++                    const FramebufferPair &pair = workload.fbPairs[f];
++                    if (pair.barMenuStretch && (std::find(barMenuClearAddresses.begin(), barMenuClearAddresses.end(), pair.colorImage.address) == barMenuClearAddresses.end())) {
++                        barMenuClearAddresses.push_back(pair.colorImage.address);
++                    }
++                }
++            }
+             for (uint32_t f = 0; f < fbPairCount; f++) {
+                 const FramebufferPair &fbPair = workload.fbPairs[f];
+                 bool validTargets = getTargetsFromPair(f);
+@@ -725,7 +773,12 @@
+                             RenderTarget &otherColorTarget = targetManager.get(otherColorTargetKey);
+                             if (!otherColorTarget.isEmpty()) {
+                                 const FixedRect &r = colorFb->lastWriteRect;
+-                                colorTarget->copyFromTarget(ext.workloadGraphicsWorker, &otherColorTarget, r.left(false), r.top(false), r.width(false, true), r.height(false, true), ext.shaderLibrary);
++                                // BAR_NO_FBCOPY=1: skip target-to-target copies (same probe idea as
++                                // BAR_NO_FBUPLOAD -- whatever goes blank is what this path paints).
++                                static const bool fbCopySkip = std::getenv("BAR_NO_FBCOPY") != nullptr;
++                                if (!fbCopySkip) {
++                                    colorTarget->copyFromTarget(ext.workloadGraphicsWorker, &otherColorTarget, r.left(false), r.top(false), r.width(false, true), r.height(false, true), ext.shaderLibrary);
++                                }
+                                 colorFb->discardLastWrite();
+                                 colorFormatUpdated = true;
+                             }
+@@ -742,10 +795,41 @@
+                                 Framebuffer::Type::Color, colorImg.fmt, f, colorFb->readHeight, readRowCount, ext.shaderLibrary);
+ 
+                             if (colorFbChange != nullptr) {
+-                                colorTarget->copyFromChanges(ext.workloadGraphicsWorker, *colorFbChange, colorFb->width, readRowCount, colorFb->readHeight, ext.shaderLibrary);
++                                // BAR_DBG_FBUPLOAD=1: RDRAM framebuffer content being uploaded into the
++                                // render target. This path is NOT a draw call, so nothing in the
++                                // aspect-ratio or HUD-classification machinery ever sees it -- which is
++                                // the standing hypothesis for the boot splash being stretched across the
++                                // widened frame while the text drawn over it stays 4:3.
++                                // See docs/KNOWN_ISSUES.md.
++                                static const bool fbUpDbg = std::getenv("BAR_DBG_FBUPLOAD") != nullptr;
++                                if (fbUpDbg) {
++                                    static uint32_t lastAddr = 0; static uint32_t lastRows = 0; static int32_t lastW = -1;
++                                    if ((colorImg.address != lastAddr) || (readRowCount != lastRows) || (int32_t(colorFb->width) != lastW)) {
++                                        lastAddr = colorImg.address; lastRows = readRowCount; lastW = int32_t(colorFb->width);
++                                        fprintf(stderr, "[fbupload] addr=%08X fbW=%u fbH=%u readFrom=%u rows=%u\n",
++                                            colorImg.address, colorFb->width, colorFb->height, colorFb->readHeight,
++                                            readRowCount);
++                                        fflush(stderr);
++                                    }
++                                }
++                                // BAR_NO_FBUPLOAD=1: skip the upload entirely. A probe, not a setting --
++                                // whatever region of the screen goes blank is the region this path
++                                // paints, which is the cheapest way to tell it apart from everything
++                                // drawn over it.
++                                static const bool fbUpSkip = std::getenv("BAR_NO_FBUPLOAD") != nullptr;
++                                if (!fbUpSkip) {
++                                    colorTarget->copyFromChanges(ext.workloadGraphicsWorker, *colorFbChange, colorFb->width, readRowCount, colorFb->readHeight, ext.shaderLibrary);
++                                }
+                             }
+ 
+                             colorFb->readHeight = colorFb->height;
++                        }
++
++                        // BAR menu clear (see above): once per colour image, before its first pair's draws.
++                        auto barMenuClearIt = std::find(barMenuClearAddresses.begin(), barMenuClearAddresses.end(), colorImg.address);
++                        if (barMenuClearIt != barMenuClearAddresses.end()) {
++                            colorTarget->clearColorTarget(ext.workloadGraphicsWorker);
++                            barMenuClearAddresses.erase(barMenuClearIt);
+                         }
+                     }
+ 
+@@ -1221,4 +1305,4 @@
+             }
+         }
+     }
+-};
+\ No newline at end of file
++};
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2,6 +2,9 @@
+ // RT64
+ //
+ 
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ #include "rt64_framebuffer_renderer.h"
+ 
+ #include "../include/rt64_extended_gbi.h"
+@@ -49,7 +52,24 @@
+     };
+ };
+ 
++#include "hle/rt64_bar_hud.h"
++
+ namespace RT64 {
++
++namespace {
++    // RT64's projection type as the classifier's own kind, so the identity says what the layer is.
++    inline RT64::BarHud::ProjKind barProjKind(RT64::Projection::Type type) {
++        using RT64::Projection;
++        using RT64::BarHud::ProjKind;
++        switch (type) {
++        case Projection::Type::Perspective:  return ProjKind::Perspective;
++        case Projection::Type::Orthographic: return ProjKind::Orthographic;
++        case Projection::Type::Rectangle:    return ProjKind::Rectangle;
++        default:                             return ProjKind::Other;
++        }
++    }
++}
++
+     // Helper functions.
+     
+     RenderRect convertFixedRect(FixedRect rect, hlslpp::float2 resScale, int32_t fbWidth, float aspectRatioScale, float extOriginPercentage, int32_t horizontalMisalignment, uint16_t leftOrigin, uint16_t rightOrigin) {
+@@ -1435,6 +1455,29 @@
+         const float scissorRatio = static_cast<float>(fbPair.scissorRect.width(false, true)) / static_cast<float>(fbPair.scissorRect.height(false, true));
+         const bool adjustRatio = (abs((scissorRatio / p.aspectRatioSource) - 1.0f) < SimilarityPercentage);
+         const float aspectRatioScale = adjustRatio ? (p.aspectRatioTarget / p.aspectRatioSource) : 1.0f;
++
++        // BAR_DBG_ASPECT=1 reports whether the widescreen adjustment is actually being applied to
++        // this framebuffer, and with what scale. "Expand does nothing on screen X" can mean the
++        // scissor failed the similarity test, or the target ratio collapsed to the source, or the
++        // scale is applied but the game's own projection ignores it -- these look identical on
++        // screen and completely different here. Logged only when the numbers change.
++        {
++            static const bool aspDbg = std::getenv("BAR_DBG_ASPECT") != nullptr;
++            if (aspDbg) {
++                static float lastRatio = -1.0f, lastScale = -1.0f, lastSrc = -1.0f, lastTgt = -1.0f;
++                static bool lastAdjust = false;
++                if ((scissorRatio != lastRatio) || (aspectRatioScale != lastScale) || (adjustRatio != lastAdjust) ||
++                    (p.aspectRatioSource != lastSrc) || (p.aspectRatioTarget != lastTgt)) {
++                    lastRatio = scissorRatio; lastScale = aspectRatioScale; lastAdjust = adjustRatio;
++                    lastSrc = p.aspectRatioSource; lastTgt = p.aspectRatioTarget;
++                    fprintf(stderr, "[aspect] scissor=%.0fx%.0f ratio=%.4f source=%.4f target=%.4f adjust=%d scale=%.4f extPct=%.2f\n",
++                        float(fbPair.scissorRect.width(false, true)), float(fbPair.scissorRect.height(false, true)),
++                        scissorRatio, p.aspectRatioSource, p.aspectRatioTarget, adjustRatio ? 1 : 0,
++                        aspectRatioScale, p.extAspectPercentage);
++                    fflush(stderr);
++                }
++            }
++        }
+         InstanceDrawCall instanceDrawCall;
+         interop::RenderIndices renderIndices;
+         uint32_t globalCallIndex = 0;
+@@ -1483,12 +1526,40 @@
+ 
+             float projInvRatioScale = 1.0f / aspectRatioScale;
+             const int16_t *viewportClipRatios = &drawData.viewportClipRatios[proj.transformsIndex * 4];
+-            const uint16_t viewportOrigin = drawData.viewportOrigins[proj.transformsIndex];
++            // BAR: see the matching call in ProjectionProcessor. The two must ask for the same
++            // question of the same projection and get the same answer, or the orthographic layer is
++            // placed by one rule and transformed by the other. `publish` is false here because that
++            // one already handed this projection to the inspector.
++            uint16_t viewportOrigin = drawData.viewportOrigins[proj.transformsIndex];
++            BarHud::Class barLayerClass = BarHud::Class::Center;
++            if (viewportOrigin == G_EX_ORIGIN_NONE) {
++                barLayerClass = BarHud::classifyProjection(barProjKind(proj.type), proj, drawData.callTiles.data(),
++                    drawData.callTiles.size(), false);
++                viewportOrigin = BarHud::viewportOriginFor(barLayerClass);
++            }
++            const bool barAnchoredViewport = (viewportOrigin != drawData.viewportOrigins[proj.transformsIndex]);
++
++            // BAR: Class::Sides. The layer is placed as a Left-anchored one, and each of its draws is
++            // then moved to the edge of the half it is drawn in (see the per-call step below). Its
++            // clip has to span both edges, or the draws moved right are clipped away.
++            const bool barSides = (barLayerClass == BarHud::Class::Sides) && (viewportOrigin == G_EX_ORIGIN_LEFT) &&
++                (proj.type == Projection::Type::Orthographic);
++            auto barOriginOffsetX = [&](uint16_t origin) {
++                const float centerOffset = ((middleViewport * origin) / G_EX_ORIGIN_CENTER) * extOriginPercentage + middleViewport * (1.0f - extOriginPercentage);
++                return halfPixelOffset.x + ((centerOffset - middleViewport) / halfViewportSize.x);
++            };
+             if (proj.usesViewport()) {
+                 // The call's scissor spans the whole width of the framebuffer pair scissor. Custom origin must not be in use to be able to use the stretched viewport.
+                 const auto &viewport = drawData.rspViewports[proj.transformsIndex];
+                 FixedRect intersectionRect = proj.scissorRect.intersection(viewport.rect(viewportClipRatios));
+-                bool coversWholeWidth = !intersectionRect.isEmpty() && (intersectionRect.ulx <= fbPair.scissorRect.ulx) && (intersectionRect.lrx >= fbPair.scissorRect.lrx);
++                // BAR: this must be the SAME test as the projection processor's, which widens the
++                // projection matrix. When the two disagree the projection is widened but its
++                // viewport and scissor are not, so the wider view is squeezed back into the original
++                // 4:3 rectangle and clipped there -- which is what made BAR's sky end at the
++                // un-widened frame's edges while the world filled the widened one. Both ask
++                // BarHud::coversForWidening.
++                const bool coversWholeWidth = BarHud::coversForWidening(proj.type == Projection::Type::Perspective,
++                    intersectionRect, fbPair.scissorRect);
+                 bool horizontalRatio = !intersectionRect.isEmpty() && (intersectionRect.width(true, true) > intersectionRect.height(true, true));
+                 bool useWideViewport = (viewportOrigin == G_EX_ORIGIN_NONE) && coversWholeWidth && horizontalRatio;
+                 if (useWideViewport) {
+@@ -1503,7 +1574,8 @@
+                     }
+                 }
+ 
+-                viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
++                viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f,
++                    viewportOrigin, barSides ? uint16_t(G_EX_ORIGIN_RIGHT) : viewportOrigin);
+             }
+ 
+             for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
+@@ -1631,6 +1703,27 @@
+                             instanceDrawCall.type = InstanceDrawCall::Type::IndexedTriangles;
+                             triangles.indexStart = triangles.vertexTestZ ? vertexTestZFaceIndicesStart : call.meshDesc.faceIndicesStart;
+                             invRatioScale = projInvRatioScale;
++
++                            // BAR: Class::Sides -- this draw goes to the edge of the half it is in. Its
++                            // centre is taken from the RSP's screen-space vertices, in game pixels.
++                            // Set for every draw of the layer, because `triangles` is shared between
++                            // them and would otherwise carry the previous draw's side.
++                            if (barSides) {
++                                float minX = 1e9f, maxX = -1e9f;
++                                const uint32_t indexCount = call.callDesc.triangleCount * 3;
++                                for (uint32_t v = 0; v < indexCount; v++) {
++                                    const size_t faceIndex = size_t(call.meshDesc.faceIndicesStart) + v;
++                                    if (faceIndex >= drawData.faceIndices.size()) break;
++                                    const uint32_t vertexIndex = drawData.faceIndices[faceIndex];
++                                    if (vertexIndex >= drawData.posScreen.size()) break;
++                                    minX = std::min(minX, float(drawData.posScreen[vertexIndex][0]));
++                                    maxX = std::max(maxX, float(drawData.posScreen[vertexIndex][0]));
++                                }
++                                const BarHud::Class side = (minX <= maxX)
++                                    ? BarHud::resolveSides(BarHud::Class::Sides, (minX + maxX) / 2.0f, int32_t(p.fbWidth))
++                                    : BarHud::Class::Left;
++                                triangles.screenOffset.x = barOriginOffsetX((side == BarHud::Class::Right) ? G_EX_ORIGIN_RIGHT : G_EX_ORIGIN_LEFT);
++                            }
+                             break;
+                         }
+                         case Projection::Type::Rectangle: {
+@@ -1645,7 +1738,80 @@
+                             // The call's scissor spans the whole width of the framebuffer pair scissor. The rect must not be using extended origins.
+                             const bool regularOrigins = (call.callDesc.rectLeftOrigin == G_EX_ORIGIN_NONE) && (call.callDesc.rectRightOrigin == G_EX_ORIGIN_NONE);
+                             const bool coversScissorWidth = regularOrigins && (call.callDesc.rect.ulx <= fbPair.scissorRect.ulx) && (call.callDesc.rect.lrx >= fbPair.scissorRect.lrx);
+-                            if ((tileCopiesUsed || coversScissorWidth || call.callDesc.rectAspect == G_EX_ASPECT_STRETCH) && (call.callDesc.rectAspect != G_EX_ASPECT_ADJUST)) {
++                            // BAR: a full-width rectangle is only a BACKDROP if it is also reasonably
++                            // tall. Spanning the scissor's width is upstream's whole test, and stretching
++                            // such a rect is right for a one-piece backdrop or wipe -- but BAR's boot
++                            // splash draws its photo as full-width strips SIX PIXELS TALL, one per row,
++                            // so every strip matched and was stretched across the widened frame. The
++                            // bottom of the very same picture is drawn as 64x32 tiles, which do not span
++                            // the width, so those were compensated and stayed 4:3: the top of the screen
++                            // widescreen and the bottom pillarboxed, in one frame.
++                            //
++                            // A slice of a picture is not a backdrop. Requiring a quarter of the
++                            // scissor's height separates the two cleanly: a 6/240 strip is 2.5%, while a
++                            // real full-screen backdrop covers all of it. BAR_SLICE_STRETCH=1 restores
++                            // the upstream rule.
++                            //
++                            // TEXTURED RECTANGLES ONLY. Mount Mayhem's haze is a full-width FILL that
++                            // genuinely is a backdrop and genuinely needs the stretch; so are the
++                            // cinematic letterbox bars. Applying the slice rule to those left the haze
++                            // pillarboxed mid-track, and then -- with a first attempt that keyed on
++                            // `racing()` -- still wrong on the pre-race course overview, which is not a
++                            // race either.
++                            //
++                            // Measured with BAR_HUD_TRACE=2 across the boot splash, the overview and a
++                            // race, every full-width rectangle in the game splits cleanly by KIND:
++                            //
++                            //   state 14 (splash/menus)   tex    heights 3, 4, 6     150 rects
++                            //   state 2  (attract/overview) fill heights 147, 46, 48   4 rects
++                            //   state 5  (race)           fill   height 240            1 rect
++                            //
++                            // The picture slices are the only textured ones. Keying on that is
++                            // structural rather than a guess about when a screen is shown, and it
++                            // leaves every fill-cycle backdrop in the game exactly as it was.
++                            // AND ONLY IN THE MENU/BOOT STATE (14). Kind is not enough on its own: the
++                            // pre-race course overview (state 5) draws its haze as a full-width TEXTURED
++                            // rect three pixels tall -- structurally identical to a splash slice -- and
++                            // compensating it left the haze pillarboxed there. Measured with
++                            // BAR_DBG_SLICE=1 on the overview:
++                            //
++                            //   [slice] ... height=3 scissorH=240 kind=tex state=14   <- splash slice
++                            //   [slice] ... height=3 scissorH=240 kind=tex state=5    <- overview haze
++                            //
++                            // The in-race haze is the `fill` at height 240 and was never affected, which
++                            // is why that one looked right while the overview did not. State 14 is the
++                            // boot/menu state (the same one rt64_rdp.cpp keys its menu-stretch flag on),
++                            // so restricting to it leaves races, the overview, the attract demo and the
++                            // battle mode on exactly the path they have always taken.
++                            constexpr uint32_t kBarMenuGameState = 14;
++                            static const bool barSliceStretch = (std::getenv("BAR_SLICE_STRETCH") != nullptr);
++                            const bool barFillCycle = (call.shaderDesc.otherMode.cycleType() == G_CYC_FILL);
++                            const int32_t barRectHeight = call.callDesc.rect.height(false, true);
++                            const int32_t barScissorHeight = fbPair.scissorRect.height(false, true);
++                            const bool barTallEnough = barSliceStretch || barFillCycle ||
++                                (BarHud::gameState() != kBarMenuGameState) || (barScissorHeight <= 0) ||
++                                (barRectHeight * 4 >= barScissorHeight);
++                            const bool barCoversAsBackdrop = coversScissorWidth && barTallEnough;
++
++                            // BAR_DBG_SLICE=1: every draw whose treatment this rule CHANGES -- i.e. a
++                            // full-width rect that upstream would have stretched and we now compensate.
++                            // The check that matters is that nothing but the boot splash's picture
++                            // slices ever appears here; a fill-cycle backdrop showing up would mean the
++                            // haze or the letterbox bars are about to be pillarboxed.
++                            {
++                                static const bool sliceDbg = std::getenv("BAR_DBG_SLICE") != nullptr;
++                                if (sliceDbg && coversScissorWidth && !barTallEnough) {
++                                    static std::set<uint64_t> seenSlice;
++                                    const uint64_t key = (uint64_t(uint16_t(barRectHeight)) << 32) |
++                                        (uint64_t(barFillCycle ? 1 : 0) << 16) | uint64_t(BarHud::gameState() & 0xFF);
++                                    if ((seenSlice.size() < 200) && seenSlice.insert(key).second) {
++                                        fprintf(stderr, "[slice] compensating full-width rect: height=%d scissorH=%d kind=%s state=%u\n",
++                                            barRectHeight, barScissorHeight, barFillCycle ? "FILL" : "tex", BarHud::gameState());
++                                        fflush(stderr);
++                                    }
++                                }
++                            }
++                            if (((tileCopiesUsed && barTallEnough) || barCoversAsBackdrop || call.callDesc.rectAspect == G_EX_ASPECT_STRETCH) && (call.callDesc.rectAspect != G_EX_ASPECT_ADJUST)) {
+                                 invRatioScale = 1.0f;
+                             }
+                             else {
+@@ -1676,7 +1842,14 @@
+                             break;
+                         }
+ 
+-                        triangles.scissor = convertFixedRect(call.callDesc.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin);
++                        // BAR: an anchored layer's scissor has to reach the frame's edges with it. The
++                        // game scissors its HUD to the whole 320x240 screen, which converts to the
++                        // centred 4:3 region, so a layer moved to an edge is drawn outside its own
++                        // scissor and clipped away -- which is exactly how the speedometer's needle
++                        // disappeared while its dial anchored correctly.
++                        const uint16_t scissorLeftOrigin = barAnchoredViewport ? uint16_t(G_EX_ORIGIN_LEFT) : call.callDesc.scissorLeftOrigin;
++                        const uint16_t scissorRightOrigin = barAnchoredViewport ? uint16_t(G_EX_ORIGIN_RIGHT) : call.callDesc.scissorRightOrigin;
++                        triangles.scissor = convertFixedRect(call.callDesc.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), scissorLeftOrigin, scissorRightOrigin);
+ 
+                         bool usesViewport = (proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic);
+                         if (usesViewport) {
+@@ -1917,4 +2090,4 @@
+         unsigned int im3dVertexCount;
+     };
+ };
+-*/
+\ No newline at end of file
++*/
+--- a/src/render/rt64_projection_processor.cpp
++++ b/src/render/rt64_projection_processor.cpp
+@@ -2,9 +2,15 @@
+ // RT64
+ //
+ 
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <set>
++#include <cstdlib>
+ #include "rt64_projection_processor.h"
+ 
+ #include "common/rt64_math.h"
++#include "hle/rt64_bar_hud.h"
+ #include "hle/rt64_workload_queue.h"
+ 
+ namespace RT64 {
+@@ -15,6 +21,20 @@
+         matrix[3][0] *= aspectRatioScale;
+     }
+     
++namespace {
++    // RT64's projection type as the classifier's own kind, so the identity says what the layer is.
++    inline RT64::BarHud::ProjKind barProjKind(RT64::Projection::Type type) {
++        using RT64::Projection;
++        using RT64::BarHud::ProjKind;
++        switch (type) {
++        case Projection::Type::Perspective:  return ProjKind::Perspective;
++        case Projection::Type::Orthographic: return ProjKind::Orthographic;
++        case Projection::Type::Rectangle:    return ProjKind::Rectangle;
++        default:                             return ProjKind::Other;
++        }
++    }
++}
++
+     // ProjectionProcessor
+ 
+     ProjectionProcessor::ProjectionProcessor() { }
+@@ -57,8 +77,61 @@
+             DrawData &drawData = workload.drawData;
+             const FramebufferPair &fbPair = workload.fbPairs[sceneProj.fbPairIndex];
+             const Projection &proj = fbPair.projections[sceneProj.projectionIndex];
+-            const uint16_t viewportOrigin = drawData.viewportOrigins[proj.transformsIndex];
++
++            // BAR: some of the game's 2D is geometry under an orthographic projection rather than
++            // texture rectangles, and those layers are decided here rather than in the RDP. They do
++            // not all want the same thing -- the speedometer's needle has to follow its dial to the
++            // left edge, while the pause screen's backdrop has to cover the whole widened frame --
++            // so the answer is per projection, and taggable by a hash of what the layer draws.
++            // See BarHud::classifyOrtho.
++            //
++            // Only a layer the game left unpinned is ours to decide; one that already carries an
++            // origin is left exactly as it was.
++            uint16_t viewportOrigin = drawData.viewportOrigins[proj.transformsIndex];
++            BarHud::Class orthoClass = BarHud::Class::Center;
++            if (viewportOrigin == G_EX_ORIGIN_NONE) {
++                orthoClass = BarHud::classifyProjection(barProjKind(proj.type), proj,
++                    drawData.callTiles.data(), drawData.callTiles.size(), true);
++                viewportOrigin = BarHud::viewportOriginFor(orthoClass);
++            }
+             assert(proj.transformsIndex > 0);
++
++            // BAR_HUD_TRACE=2: every draw inside an orthographic layer, once, with its screen bounds.
++            // Geometry drawn under an orthographic projection never reaches the rectangle list, so
++            // this is the only listing of what such a layer holds -- the 4-player battle's health
++            // bars live in one, together with whatever else that layer draws.
++            if ((proj.type == Projection::Type::Orthographic) && BarHud::traceAllEnabled()) {
++                static std::set<uint64_t> seen;
++                for (uint32_t c = 0; c < proj.gameCallCount; c++) {
++                    const GameCall &call = proj.gameCalls[c];
++                    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
++                    const uint32_t indexCount = call.callDesc.triangleCount * 3;
++                    for (uint32_t i = 0; i < indexCount; i++) {
++                        const size_t faceIndex = size_t(call.meshDesc.faceIndicesStart) + i;
++                        if (faceIndex >= drawData.faceIndices.size()) break;
++                        const uint32_t vertexIndex = drawData.faceIndices[faceIndex];
++                        if (vertexIndex >= drawData.posScreen.size()) break;
++                        const hlslpp::float3 &screenPos = drawData.posScreen[vertexIndex];
++                        minX = std::min(minX, float(screenPos[0]));
++                        minY = std::min(minY, float(screenPos[1]));
++                        maxX = std::max(maxX, float(screenPos[0]));
++                        maxY = std::max(maxY, float(screenPos[1]));
++                    }
++                    const auto coordinateKey = [](float value) -> uint64_t {
++                        return std::isfinite(value) ? uint16_t(int(std::clamp(value, -32768.0f, 32767.0f))) : 0;
++                    };
++                    const uint64_t key = ((coordinateKey(minX) << 48) | (coordinateKey(minY) << 32) |
++                        (coordinateKey(maxX) << 16) | coordinateKey(maxY)) ^
++                        (uint64_t(call.callDesc.triangleCount) << 40) ^ (uint64_t(BarHud::gameState()) << 56);
++                    if ((seen.size() < 4000) && seen.insert(key).second) {
++                        fprintf(stdout, "[hud-ortho] %s class=%d proj=%u call=%u tris=%u tex=%d screen=(%.1f,%.1f)-(%.1f,%.1f) state=%u\n",
++                            BarHud::lastProjectionIdentity(), int(orthoClass), unsigned(sceneProj.projectionIndex), c,
++                            unsigned(call.callDesc.triangleCount), int(call.callDesc.textureOn),
++                            minX, minY, maxX, maxY, unsigned(BarHud::gameState()));
++                        fflush(stdout);
++                    }
++                }
++            }
+ 
+             // Skip projections that didn't actually draw anything.
+             if (proj.scissorRect.isNull()) {
+@@ -92,9 +165,40 @@
+                 }
+ 
+                 if (!intersectionRect.isEmpty()) {
+-                    bool coversWholeWidth = (intersectionRect.ulx <= fbPair.scissorRect.ulx) && (intersectionRect.lrx >= fbPair.scissorRect.lrx);
++                    // BAR: upstream's strict edge-to-edge test, BAR's inset racing viewport and its
++                    // split-screen tiles are all decided in one place, shared with the framebuffer
++                    // renderer's matching test -- see BarHud::coversForWidening.
++                    const bool coversWholeWidth = BarHud::coversForWidening(proj.type == Projection::Type::Perspective,
++                        intersectionRect, fbPair.scissorRect);
++
+                     bool horizontalRatio = (intersectionRect.width(true, true) > intersectionRect.height(true, true));
+                     adjustAspectRatio = (viewportOrigin == G_EX_ORIGIN_NONE) && coversWholeWidth && horizontalRatio;
++
++                    // BAR: Stretch means "do not compensate this projection's aspect ratio", so the
++                    // layer's own 320-wide space is mapped across the full widened frame and its
++                    // content stretches with it. That is the opposite of what the compensation
++                    // above does, which keeps the content proportional and simply reveals more
++                    // empty space either side of it -- which is what a full-screen backdrop looked
++                    // like before this existed: correctly centred, and still 4:3 wide.
++                    if ((orthoClass == BarHud::Class::Stretch) || (orthoClass == BarHud::Class::Cover)) {
++                        adjustAspectRatio = false;
++                    }
++
++                    // BAR_DBG_PROJ=1 shows, per projection, whether it is being widened and why not.
++                    static const bool projDbg = std::getenv("BAR_DBG_PROJ") != nullptr;
++                    if (projDbg) {
++                        static int32_t lastI = -1, lastF = -1, lastT = -1; static bool lastAdj = false;
++                        const int32_t iw = intersectionRect.width(true, true);
++                        const int32_t fw = fbPair.scissorRect.width(true, true);
++                        const int32_t ty = int32_t(proj.type);
++                        if ((iw != lastI) || (fw != lastF) || (adjustAspectRatio != lastAdj) || (ty != lastT)) {
++                            lastI = iw; lastF = fw; lastAdj = adjustAspectRatio; lastT = ty;
++                            fprintf(stderr, "[proj] type=%d projWidth=%d fbScissorWidth=%d covers=%d horiz=%d origin=%d -> widen=%d\n",
++                                int(ty), int(iw), int(fw), coversWholeWidth ? 1 : 0, horizontalRatio ? 1 : 0,
++                                int(viewportOrigin), adjustAspectRatio ? 1 : 0);
++                            fflush(stderr);
++                        }
++                    }
+                 }
+             }
+  
+@@ -114,6 +218,49 @@
+ 
+             adjustProjectionMatrix(projMatrix, projRatioScale);
+ 
++            // BAR: Cover magnifies the layer's content about its centre, on top of the stretch.
++            //
++            // Stretching a layer maps its own 320x240 space across the frame; it does nothing about
++            // geometry drawn inset WITHIN that space, and BAR authors its full-screen 2D into a
++            // rectangle inset for a television. So the pause screen's backdrop, with its projection
++            // stretched, still stopped about 21 of 240 short at the top -- the inset, exactly. No
++            // scaling of the layer can close that, because the quad is a fixed size inside it.
++            //
++            // Magnifying the projection is what closes it: scale x and y by the ratio that puts the
++            // inset rectangle on the frame's edges, and the quad reaches them. Anything the layer
++            // draws outside that rectangle is pushed off the frame, which is why this is a class to
++            // be tagged onto a backdrop rather than anything applied by default.
++            if (orthoClass == BarHud::Class::Cover) {
++                float coverX = 1.0f;
++                float coverY = 1.0f;
++                // The first call's screen-space bounds, as the RSP transformed them.
++                float quadMinX = 1e9f, quadMinY = 1e9f, quadMaxX = -1e9f, quadMaxY = -1e9f;
++                if (proj.gameCallCount > 0) {
++                    const GameCall &firstCall = proj.gameCalls[0];
++                    const uint32_t indexCount = firstCall.callDesc.triangleCount * 3;
++                    for (uint32_t i = 0; i < indexCount; i++) {
++                        const size_t faceIndex = size_t(firstCall.meshDesc.faceIndicesStart) + i;
++                        if (faceIndex >= drawData.faceIndices.size()) break;
++                        const uint32_t vertexIndex = drawData.faceIndices[faceIndex];
++                        if (vertexIndex >= drawData.posScreen.size()) break;
++                        const hlslpp::float3 &screenPos = drawData.posScreen[vertexIndex];
++                        quadMinX = std::min(quadMinX, float(screenPos[0]));
++                        quadMinY = std::min(quadMinY, float(screenPos[1]));
++                        quadMaxX = std::max(quadMaxX, float(screenPos[0]));
++                        quadMaxY = std::max(quadMaxY, float(screenPos[1]));
++                    }
++                }
++                BarHud::coverScale(orthoClass, quadMinX, quadMinY, quadMaxX, quadMaxY, &coverX, &coverY);
++                projMatrix[0][0] *= coverX;
++                projMatrix[1][0] *= coverX;
++                projMatrix[2][0] *= coverX;
++                projMatrix[3][0] *= coverX;
++                projMatrix[0][1] *= coverY;
++                projMatrix[1][1] *= coverY;
++                projMatrix[2][1] *= coverY;
++                projMatrix[3][1] *= coverY;
++            }
++
+             interop::float4x4 &prevViewTransform = drawData.prevViewTransforms[proj.transformsIndex];
+             interop::float4x4 &prevProjTransform = drawData.prevProjTransforms[proj.transformsIndex];
+             if ((prevProjMatrix != nullptr) && (prevViewMatrix != nullptr) && (rigidBody != nullptr)) {
+@@ -121,6 +268,7 @@
+                 const interop::float4x4 curProjTransform = projMatrix;
+                 interop::float4x4 adjustedPrevProj = *prevProjMatrix;
+                 adjustProjectionMatrix(adjustedPrevProj, projRatioScale);
++
+                 viewMatrix = rigidBody->lerp(p.curFrameWeight, *prevViewMatrix, curViewTransform, true);
+                 prevViewTransform = rigidBody->lerp(p.prevFrameWeight, *prevViewMatrix, curViewTransform, true);
+ 
+@@ -160,4 +308,4 @@
+ 
+         bufferUploader->submit(p.worker, uploads);
+     }
+-};
+\ No newline at end of file
++};
+--- a/src/render/rt64_render_target.cpp
++++ b/src/render/rt64_render_target.cpp
+@@ -303,6 +303,26 @@
+             targetTop = rowStart * resolutionScale.y + ((fbHeight * resolutionScale.y) / 2.0f) - (targetHeight / 2.0f);
+         }
+         
++        // BAR_DBG_FBUPLOAD=1: where RDRAM framebuffer content actually lands in the render target.
++        // This path already centres the upload at 4:3 when the target is widened (the pillarBox branch
++        // above), so if BAR's boot splash still comes out stretched, the question is whether that
++        // branch is taken at all -- i.e. whether this target's resolutionScale is widened.
++        {
++            static const bool fbUpDbg = std::getenv("BAR_DBG_FBUPLOAD") != nullptr;
++            if (fbUpDbg) {
++                const float sx = float(resolutionScale.x), sy = float(resolutionScale.y);
++                static float lastSx = -1.0f, lastSy = -1.0f, lastL = -1.0f, lastW = -1.0f; static uint32_t lastFw = 0;
++                if ((sx != lastSx) || (sy != lastSy) || (targetLeft != lastL) ||
++                    (targetWidth != lastW) || (fbWidth != lastFw)) {
++                    lastSx = sx; lastSy = sy; lastL = targetLeft; lastW = targetWidth; lastFw = fbWidth;
++                    fprintf(stderr, "[fbupload] fb=%ux%u resScale=(%.4f,%.4f) pillarBox=%d -> target left=%.1f width=%.1f (targetFullWidth=%.1f)\n",
++                        fbWidth, fbHeight, sx, sy, pillarBox ? 1 : 0,
++                        targetLeft, targetWidth, fbWidth * sx);
++                    fflush(stderr);
++                }
++            }
++        }
++
+         // Record the drawing command.
+         long scissorLeft = long(floor(targetLeft));
+         long scissorTop = long(floor(targetTop));
+--- a/src/render/rt64_vi_renderer.cpp
++++ b/src/render/rt64_vi_renderer.cpp
+@@ -4,6 +4,13 @@
+ 
+ #include "rt64_vi_renderer.h"
+ 
++#include <chrono>
++#include <cmath>
++#include <mutex>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
+ #include "shared/rt64_hlsl.h"
+ #include "shared/rt64_video_interface.h"
+ 
+@@ -21,6 +28,180 @@
+     inline hlslpp::float2 fromSDtoHD(hlslpp::float2 coordinate, hlslpp::float2 sdSize, hlslpp::float2 hdSize) {
+         const hlslpp::float2 relativeScale = hdSize / sdSize;
+         return coordinate * relativeScale;
++    }
++
++    // BAR: which part of the framebuffer actually holds the picture, per screen.
++    //
++    // BAR does not draw into all of its 320x240 framebuffer on every screen. Racing is rendered into
++    // a 275x207 rectangle inset at (22,17) -- a CRT overscan-safe area that a television bezel used
++    // to cover -- while full-screen 2D (logos, menus) uses the whole 320x240, and the intro
++    // cinematic uses a letterboxed rectangle of its own. Presenting the whole framebuffer shows the
++    // unused margin as black bars; presenting one FIXED crop is wrong too, because it is only
++    // correct for whichever screen it was measured on.
++    //
++    // So the region is observed rather than assumed: the game tells us, every frame, through the
++    // scissor rectangles it emits. Of the rectangles seen in a frame we take the SMALLEST one that
++    // still covers at least BAR_CONTENT_MIN_AREA of the framebuffer (default 50%). Smallest, because
++    // during racing the game sets both its inset rectangle and a full-screen one, and the inset is
++    // the picture; area-gated, because small scissors are used to clip individual elements and must
++    // never be mistaken for the frame.
++    //
++    //   BAR_CONTENT_INSET=0          present the whole framebuffer (bars and all)
++    //   BAR_CONTENT_INSET=l,t,r,b    force a fixed rectangle, in 320x240 pixels
++    //   BAR_CONTENT_MIN_AREA=<0..1>  change the area gate
++    namespace {
++        struct ContentRectPx { float left, top, right, bottom; };
++
++        std::mutex g_contentMutex;
++        // Smallest qualifying rectangle seen in the current sampling window, and the rectangle
++        // currently being presented. Seeded full-screen so the first frames present normally.
++        //
++        // Sampling over a short WINDOW rather than a single frame is deliberate.
++        // getViewportAndScissor runs more than once per presented frame (the present path and the
++        // cursor mapping both call it, and interpolated frames add more), so an earlier version that
++        // consumed the accumulated candidate on every call alternated between the game's two
++        // rectangles on consecutive calls -- the image pulsed between zoomed and unzoomed at frame
++        // rate. Reads must therefore never consume the accumulator; only the window rollover updates
++        // what is presented.
++        ContentRectPx g_windowSmallest{ 0.0f, 0.0f, 320.0f, 240.0f };
++        bool g_windowValid = false;
++        std::chrono::steady_clock::time_point g_windowStart{};
++        ContentRectPx g_contentLatched{ 0.0f, 0.0f, 320.0f, 240.0f };
++        constexpr std::chrono::milliseconds kContentWindow{ 250 };
++
++        float contentMinArea() {
++            static const float v = [] {
++                const char *e = std::getenv("BAR_CONTENT_MIN_AREA");
++                float parsed = 0.0f;
++                if ((e != nullptr) && (sscanf(e, "%f", &parsed) == 1) && (parsed > 0.0f) && (parsed <= 1.0f)) {
++                    return parsed;
++                }
++                return 0.5f;
++            }();
++            return v;
++        }
++
++        // -1 = observe per frame (default), 0 = whole framebuffer, 1 = fixed rectangle in g_forcedRect.
++        ContentRectPx g_forcedRect{ 0.0f, 0.0f, 320.0f, 240.0f };
++        // DEFAULT IS OFF: present the whole framebuffer, exactly as RT64 does upstream.
++        //
++        // Cropping to the game's drawn region is an enhancement layered on top of the aspect-ratio
++        // handling, and it must stay off until plain 4:3 presentation is correct on its own --
++        // otherwise a wrong image cannot be attributed to either mechanism. Turn it on with
++        // BAR_CONTENT_INSET=auto once the baseline is signed off.
++        int contentMode() {
++            static const int mode = [] {
++                const char *e = std::getenv("BAR_CONTENT_INSET");
++                if (e == nullptr) {
++                    return 0;
++                }
++                if (strcmp(e, "auto") == 0) {
++                    return -1;
++                }
++                if (strcmp(e, "0") == 0) {
++                    return 0;
++                }
++                float l, t, r, b;
++                if (sscanf(e, "%f,%f,%f,%f", &l, &t, &r, &b) == 4 &&
++                    std::isfinite(l) && std::isfinite(t) && std::isfinite(r) && std::isfinite(b) &&
++                    l >= 0.0f && t >= 0.0f && r <= 320.0f && b <= 240.0f && r > l && b > t) {
++                    g_forcedRect = { l, t, r, b };
++                    return 1;
++                }
++                return 0;
++            }();
++            return mode;
++        }
++    }
++
++    void VIRenderer::barReportGameScissor(float ulx, float uly, float lrx, float lry) {
++        if (contentMode() != -1) {
++            return;
++        }
++
++        const float w = lrx - ulx;
++        const float h = lry - uly;
++        if ((w <= 0.0f) || (h <= 0.0f)) {
++            return;
++        }
++
++        // Area gate, against the framebuffer this game uses. 320x240 is the reference; a rectangle
++        // is only a candidate for "the frame" if it covers most of it.
++        if ((w * h) < (contentMinArea() * 320.0f * 240.0f)) {
++            return;
++        }
++
++        const std::scoped_lock lock(g_contentMutex);
++        const auto now = std::chrono::steady_clock::now();
++
++        // Roll the window over: whatever was smallest across the last kContentWindow becomes the
++        // rectangle to present, and a fresh window starts. A screen holds its rectangle for many
++        // frames, so this settles immediately and only moves on a real screen change.
++        if ((now - g_windowStart) >= kContentWindow) {
++            if (g_windowValid) {
++                g_contentLatched = g_windowSmallest;
++            }
++            g_windowStart = now;
++            g_windowValid = false;
++        }
++
++        if (!g_windowValid || ((w * h) < ((g_windowSmallest.right - g_windowSmallest.left) * (g_windowSmallest.bottom - g_windowSmallest.top)))) {
++            g_windowSmallest = { ulx, uly, lrx, lry };
++            g_windowValid = true;
++        }
++    }
++
++    // Latches the frame's candidate and returns the rectangle to present, as fractions of the
++    // framebuffer so it stays correct whatever size that is.
++    static ContentRectPx barGetContentRect() {
++        const int mode = contentMode();
++        if (mode == 0) {
++            return { 0.0f, 0.0f, 1.0f, 1.0f };
++        }
++        if (mode == 1) {
++            return { g_forcedRect.left / 320.0f, g_forcedRect.top / 240.0f, g_forcedRect.right / 320.0f, g_forcedRect.bottom / 240.0f };
++        }
++
++        ContentRectPx px;
++        {
++            // Read only -- see the note on g_windowSmallest for why this must not consume.
++            const std::scoped_lock lock(g_contentMutex);
++            px = g_contentLatched;
++        }
++
++        static const bool dbg = std::getenv("BAR_DBG_CONTENT") != nullptr;
++        if (dbg) {
++            static ContentRectPx lastPrinted{ -1.0f, -1.0f, -1.0f, -1.0f };
++            if ((px.left != lastPrinted.left) || (px.top != lastPrinted.top) || (px.right != lastPrinted.right) || (px.bottom != lastPrinted.bottom)) {
++                lastPrinted = px;
++                fprintf(stderr, "[content] presenting (%.1f,%.1f)-(%.1f,%.1f)  %.0fx%.0f\n",
++                    px.left, px.top, px.right, px.bottom, px.right - px.left, px.bottom - px.top);
++                fflush(stderr);
++            }
++        }
++
++        return { px.left / 320.0f, px.top / 240.0f, px.right / 320.0f, px.bottom / 240.0f };
++    }
++
++    // Maps an HD-space point into the window, scaling and centring on `refCenter`/`refSize` -- the
++    // region that should end up filling the window. Passing the whole image as the reference gives
++    // the original behaviour; passing the content rect above crops the game's own black margin.
++    inline hlslpp::float2 fromHDtoWindowRef(hlslpp::float2 coordinate, hlslpp::float2 refCenter, hlslpp::float2 refSize, hlslpp::float2 windowSize, UserConfiguration::PresentFillMode fillMode) {
++        const hlslpp::float2 windowCenter = windowSize / 2;
++        const hlslpp::float2 relativeCoordinate = { coordinate.x - refCenter.x, coordinate.y - refCenter.y };
++
++        const float scaleX = windowSize.x / refSize.x;
++        const float scaleY = windowSize.y / refSize.y;
++
++        if (fillMode == UserConfiguration::PresentFillMode::Stretch) {
++            return { windowCenter.x + relativeCoordinate.x * scaleX, windowCenter.y + relativeCoordinate.y * scaleY };
++        }
++
++        const float minScale = (scaleX < scaleY) ? scaleX : scaleY;
++        const float maxScale = (scaleX > scaleY) ? scaleX : scaleY;
++        const float relativeScale = (fillMode == UserConfiguration::PresentFillMode::Crop) ? maxScale : minScale;
++
++        return windowCenter + relativeCoordinate * relativeScale;
+     }
+ 
+     inline hlslpp::float2 fromHDtoWindow(hlslpp::float2 coordinate, hlslpp::float2 hdSize, hlslpp::float2 windowSize, UserConfiguration::PresentFillMode fillMode) {
+@@ -119,18 +300,55 @@
+         hlslpp::float4 viViewRect = vi.viewRectangle() * sdSize.xyxy;
+         hlslpp::float4 viCropRect = vi.cropRectangle() * sdSize.xyxy;
+ 
++        // The reference region that should fill the window: the part of the framebuffer the game
++        // actually draws into, rather than the whole thing. See getContentInset().
++        const ContentRectPx inset = barGetContentRect();
++        const hlslpp::float2 contentTopLeftHD = fromSDtoHD({ sdSize.x * inset.left, sdSize.y * inset.top }, sdSize, hdSize);
++        const hlslpp::float2 contentBottomRightHD = fromSDtoHD({ sdSize.x * inset.right, sdSize.y * inset.bottom }, sdSize, hdSize);
++        const hlslpp::float2 refSize = contentBottomRightHD - contentTopLeftHD;
++        const hlslpp::float2 refCenter = (contentBottomRightHD + contentTopLeftHD) / 2;
++
+         // Scale all the rectangles to the space of the Window.
+         hlslpp::float2 topLeftViewport = fromSDtoHD({ float(viViewRect.x), float(viViewRect.y) }, sdSize, hdSize);
+         hlslpp::float2 bottomRightViewport = fromSDtoHD({ float(viViewRect.x + viViewRect.z), float(viViewRect.y + viViewRect.w) }, sdSize, hdSize);
+-        topLeftViewport = fromHDtoWindow(topLeftViewport, hdSize, windowSize, fillMode);
+-        bottomRightViewport = fromHDtoWindow(bottomRightViewport, hdSize, windowSize, fillMode);
++        topLeftViewport = fromHDtoWindowRef(topLeftViewport, refCenter, refSize, windowSize, fillMode);
++        bottomRightViewport = fromHDtoWindowRef(bottomRightViewport, refCenter, refSize, windowSize, fillMode);
+ 
+         hlslpp::float2 topLeftScissor = fromSDtoHD({ float(viCropRect.x), float(viCropRect.y) }, sdSize, hdSize);
+         hlslpp::float2 bottomRightScissor = fromSDtoHD({ float(viCropRect.x + viCropRect.z), float(viCropRect.y + viCropRect.w) }, sdSize, hdSize);
+-        topLeftScissor = fromHDtoWindow(topLeftScissor, hdSize, windowSize, fillMode);
+-        bottomRightScissor = fromHDtoWindow(bottomRightScissor, hdSize, windowSize, fillMode);
++        topLeftScissor = fromHDtoWindowRef(topLeftScissor, refCenter, refSize, windowSize, fillMode);
++        bottomRightScissor = fromHDtoWindowRef(bottomRightScissor, refCenter, refSize, windowSize, fillMode);
+ 
+         viewport = RenderViewport(topLeftViewport.x, topLeftViewport.y, bottomRightViewport.x - topLeftViewport.x, bottomRightViewport.y - topLeftViewport.y);
++
++        // BAR_DBG_VI=1 reports how the VI's own rectangles turn into the final on-screen rectangle.
++        // Black bars in 4:3 can come from three different places -- the VI's view rect, its crop rect,
++        // or the window fit -- and they are indistinguishable from a screenshot, so print all three.
++        // Rate-limited to once a second; the values are constant for a given screen.
++        {
++            static const bool viDbg = std::getenv("BAR_DBG_VI") != nullptr;
++            if (viDbg) {
++                static std::chrono::steady_clock::time_point lastPrint{};
++                const auto now = std::chrono::steady_clock::now();
++                if (now - lastPrint > std::chrono::seconds(1)) {
++                    lastPrint = now;
++                    const hlslpp::float4 vr = vi.viewRectangle();
++                    const hlslpp::float4 cr = vi.cropRectangle();
++                    fprintf(stderr,
++                        "[vi] fb=%.0fx%.0f sd=%.0fx%.0f hd=%.0fx%.0f win=%.0fx%.0f | viewRect=(%.4f,%.4f,%.4f,%.4f) "
++                        "cropRect=(%.4f,%.4f,%.4f,%.4f) | viewport=(%.0f,%.0f %.0fx%.0f) scissorPx=(%.0f,%.0f)-(%.0f,%.0f)\n",
++                        float(vi.fbSize().x), float(vi.fbSize().y),
++                        float(sdSize.x), float(sdSize.y), float(hdSize.x), float(hdSize.y),
++                        float(windowSize.x), float(windowSize.y),
++                        float(vr.x), float(vr.y), float(vr.z), float(vr.w),
++                        float(cr.x), float(cr.y), float(cr.z), float(cr.w),
++                        viewport.x, viewport.y, viewport.width, viewport.height,
++                        float(topLeftScissor.x), float(topLeftScissor.y),
++                        float(bottomRightScissor.x), float(bottomRightScissor.y));
++                    fflush(stderr);
++                }
++            }
++        }
+ 
+         // Clamp the scissor to the window bounds. For Crop the image overflows the window, so this
+         // trims the overflow to give a clean fill; for Pillarbox/Stretch the scissor already lies within
+@@ -144,4 +362,4 @@
+             clampToWindow(lround(bottomRightScissor.x), winW),
+             clampToWindow(lround(bottomRightScissor.y), winH));
+     }
+-};
+\ No newline at end of file
++};
+--- a/src/render/rt64_vi_renderer.h
++++ b/src/render/rt64_vi_renderer.h
+@@ -41,6 +41,12 @@
+         VIRenderer();
+         ~VIRenderer();
+         void render(const RenderParams &p);
++        // BAR: report a scissor rectangle the GAME set, in framebuffer pixels, so the present stage
++        // can work out which part of the framebuffer actually holds the picture on this screen.
++        // Different screens draw into different regions (see barGetContentRect), so this has to be
++        // observed per frame rather than assumed.
++        static void barReportGameScissor(float ulx, float uly, float lrx, float lry);
++
+         static void getViewportAndScissor(const RenderSwapChain *swapChain, const VI &vi, hlslpp::float2 resolutionScale, uint32_t downsamplingScale, bool removeBlackBorders, UserConfiguration::PresentFillMode fillMode, RenderViewport &viewport, RenderRect &scissor);
+     };
+ };
+\ No newline at end of file
+--- a/src/shaders/FbReinterpretCS.hlsl
++++ b/src/shaders/FbReinterpretCS.hlsl
+@@ -72,6 +72,29 @@
+     return float4(iFloat, iFloat, iFloat, aFloat);
+ }
+ 
++float4 RGBA16toTLUT16(float4 inputColor) {
++    // BAR: a 16-bit texture sampled with a TLUT indexes the palette with its UPPER byte -- the same
++    // rule sampleTMEM applies on the non-copy path. Beetle Adventure Racing's depth fog (Mount Mayhem)
++    // is exactly this: it reads its Z-buffer as IA16 strips with an IA16 TLUT, so the palette maps
++    // the Z value's high byte (exponent and top mantissa bits) to a fog weight authored by the game.
++    // The source here is either an RGBA16 framebuffer or a depth tile copy, which holds the RGBA16 bit
++    // pattern of the Z value (RtCopyDepthToColorPS); both round-trip exactly through Float4ToRGBA16
++    // with no dither, so the index is the hardware's, taken per pixel from the scaled target.
++    uint nativeColor = Float4ToRGBA16(inputColor, 0, gConstants.usesHDR);
++    uint paletteAddress = RDP_TMEM_PALETTE + ((nativeColor >> 8) << 3);
++    Texture1D<uint> TMEM = gInputTLUT;
++    uint paletteValue = loadTLUT(paletteAddress + 1) | (loadTLUT(paletteAddress) << 8);
++    uint decodedFormat = gConstants.tlutFormat - 1;
++    switch (decodedFormat) {
++    case G_TT_RGBA16:
++        return RGBA16ToFloat4(paletteValue);
++    case G_TT_IA16:
++        return IA16ToFloat4(paletteValue);
++    default:
++        return float4(0.0f, 0.0f, 0.0f, 1.0f);
++    }
++}
++
+ [numthreads(FB_COMMON_WORKGROUP_SIZE, FB_COMMON_WORKGROUP_SIZE, 1)]
+ void CSMain(uint2 coord : SV_DispatchThreadID) {
+     if ((coord.x < gConstants.resolution.x) && (coord.y < gConstants.resolution.y)) {
+@@ -80,6 +103,9 @@
+         float4 outputColor;
+         if ((gConstants.srcFmt == G_IM_FMT_RGBA) && (gConstants.srcSiz == G_IM_SIZ_16b) && (gConstants.dstSiz == G_IM_SIZ_8b) && (gConstants.tlutFormat > 0)) {
+             outputColor = RGBA16toCI8(inputColor, inputCoord, coord);
++        }
++        else if (((gConstants.srcFmt == G_IM_FMT_RGBA) || (gConstants.srcFmt == G_IM_FMT_DEPTH)) && (gConstants.srcSiz == G_IM_SIZ_16b) && (gConstants.dstSiz == G_IM_SIZ_16b) && (gConstants.tlutFormat > 0)) {
++            outputColor = RGBA16toTLUT16(inputColor);
+         }
+         else if ((gConstants.srcSiz == G_IM_SIZ_8b) && ((gConstants.dstFmt == G_IM_FMT_CI) || (gConstants.dstFmt == G_IM_FMT_I)) && (gConstants.dstSiz == G_IM_SIZ_8b)) {
+             outputColor = ANY8toI8(inputColor, inputCoord, coord);

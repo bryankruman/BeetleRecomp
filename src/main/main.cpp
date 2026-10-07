@@ -6,15 +6,15 @@
 // takes a single recomp::Configuration struct. Every type/field below was verified against
 // lib/N64ModernRuntime/{librecomp,ultramodern}/include headers.
 //
-// Status (2026-06-28 night): boots deep. RT64 (D3D12) initializes, the SDL window opens, the ROM
-// is recognized, libultra inits, and the uv module overlay bridge (src/main/overlay_bridge.cpp)
-// registers relocatable modules as they load so recompiled module code runs. It currently crashes
-// on module data-section relocation (a module data/.bss ref reads a garbage address). See
-// docs/STATUS.md ("Next step: module data-section relocation").
+// The overlay bridge registers loaded modules before their entry points run. Build and
+// runtime validation status is recorded in docs/FORK_REVIEW.md; historical investigations
+// remain in the technical reference chapters.
 
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cmath>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <memory>
@@ -38,11 +38,18 @@
 #include "game/input_config.hpp"              // bar::input_config — 4-port controller settings (input.json)
 #include "main/bar_cheats.h"                  // bar_cheats — BAR cheat toggles (host-side RDRAM pokes)
 #include "main/bar_input.hpp"                 // bar::input — live 4-port runtime input path
-
-#ifdef BEETLE_ENABLE_UI
-#include "ui/bar_ui.h"                        // bar_ui — RmlUi launcher + settings + cheats menu (Tier 2)
-#include "gui/rt64_file_dialog.h"            // RT64::FileDialog — native "Open ROM" picker (first-run ROM select)
+#include "main/bar_rumble.hpp"                // bar::rumble — the pulsed Rumble Pak motor model
+#include "main/bar_inspector.h"                // bar::inspector — the F1 HUD debug menu + hud.json
+#include "main/bar_watchdog.h"                // bar::watchdog — all-thread stacks when the SDL pump stalls
+#ifdef BEETLE_ENABLE_FRONTEND
+#include "frontend/bar_frontend.h"            // bar::frontend — RecompFrontend launcher/menus + input
 #endif
+
+// NOTE: BEETLE_ENABLE_UI guarded the bespoke RmlUi launcher that 019305c removed, and nothing
+// defines it any more -- RecompFrontend is the only frontend and its option is
+// BEETLE_ENABLE_FRONTEND. The blocks still written against it below are dead code referring to the
+// deleted src/ui. They are left in place rather than removed here, because deleting them is a
+// separate cleanup; but be aware that NONE of them compile into either build.
 
 // The most-recently selected ROM path, handed to bar_ui for its (non-boot) "Play" request. The game
 // itself boots from the ROM cached in the config dir (see main()'s ROM-source block), not from here.
@@ -126,17 +133,24 @@ static RspUcodeFunc* get_rsp_microcode(const OSTask* task) {
 // ----------------------------------------------------------------------------------------
 // Project metadata / game registration
 // ----------------------------------------------------------------------------------------
-static const std::string version_string = "0.1.0";   // TODO(BAR): real version string
+static const std::string version_string = "0.4.2-alpha";   // shown in the launcher as v0.4.2-alpha; bump per release
 
 // TODO(BAR): rom_hash is XXH3_64bits() of the byteswapped *z64* ROM — NOT the sha1.
 //   Known USA sha1 = e5ab4d226c08d22f68a2edcc48870203e67454b8. Compute the XXH3-64 of the
 //   validated z64 and paste it here (easiest: log XXH3_64bits() once during bring-up).
 static constexpr uint64_t BAR_USA_ROM_XXH3 = 0x56cfec69d7951f9fULL;   // XXH3_64 of the USA z64 (sha1 e5ab4d22…)
 
-static std::vector<recomp::GameEntry> supported_games = {
+// NOT static: recompui's launcher declares `extern std::vector<recomp::GameEntry> supported_games;`
+// (recompui/src/base/ui_launcher.cpp) and links against the consuming project's definition — another
+// of RecompFrontend's implicit project contracts, alongside patches/ui_funcs.h. It reads this table
+// to decide what the launcher can offer and whether a valid ROM is present.
+std::vector<recomp::GameEntry> supported_games = {
     recomp::GameEntry{
         .rom_hash              = BAR_USA_ROM_XXH3,            // TODO(BAR)
         .internal_name         = "Beetle Adventure Rac",      // exact 20 bytes at ROM offset 0x20
+        // Required since the upstream runtime merge: register_game() hard-exits with "Game display
+        // name was not set." if this is empty. It is also what recompui shows in the launcher.
+        .display_name          = "Beetle Adventure Racing!",
         .game_id               = u8"bar.n64.us",             // stable id (arbitrary but fixed)
         .mod_game_id           = "bar",
         .save_type             = recomp::SaveType::None,      // BAR uses the Controller Pak (mempak), which
@@ -164,9 +178,17 @@ bar_create_rt64_render_context(uint8_t* rdram, ultramodern::renderer::WindowHand
 // Signals from rt64_render_context.cpp that gate the deferred start_game() below.
 extern std::atomic<bool> g_bar_renderer_ready;   // RT64 finished setup
 extern std::atomic<bool> g_bar_vi_ticked;        // renderer presented a frame (VI thread seeded a mode)
+extern "C" void bar_set_cull_scale(float scale);
+extern "C" void (*RT64_BarCullScale)(float scale);
 
 // SDL window / gfx (gfx_callbacks_t). RT64 attaches to this window (its native HWND on Windows).
-static SDL_Window* g_window = nullptr;
+// recompui (recompui/src/base/ui_state.cpp) declares `extern SDL_Window* window;` and links against
+// the consuming project's definition, so the window handle must be a non-static global with exactly
+// that name. g_window stays as a reference alias so the existing call sites read unchanged and the
+// two can never drift apart.
+SDL_Window* window = nullptr;
+bool g_bar_had_legacy_input_config = false;
+static SDL_Window*& g_window = window;
 
 // Defined further down (with the first-run ROM helpers): pops a player-facing dialog (SDL message box,
 // works with no window) and logs the same text. Forward-declared here so the window/renderer setup paths
@@ -191,6 +213,19 @@ static void bar_publish_devices() {
 
 static ultramodern::gfx_callbacks_t::gfx_data_t create_gfx() {
     SDL_SetMainReady();
+    // Windows DPI awareness. SDL_WINDOW_ALLOW_HIGHDPI alone is not enough here: unless the PROCESS is
+    // marked DPI-aware before SDL_Init, Windows hands a scaled desktop to the app and lies about
+    // sizes. On a 1920x1080 display at 125% that means SDL sees 1536x864, so the renderer draws at
+    // physical resolution while the window is measured in logical pixels — the UI overflows the
+    // window (its title clips) and, worse, mouse coordinates land about 1.25x off, so clicking a
+    // menu entry activates a different one. Both hints must be set before SDL_Init to take effect.
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+    // DPI_SCALING is deliberately OFF. With it on, SDL reports window geometry and mouse positions
+    // in DPI-scaled logical units while the drawable — and therefore everything RT64 and recompui
+    // lay out — stays in physical pixels. At 125% that is a 1.25x disagreement between where the UI
+    // draws a button and where a click is reported, which shows up as having to click well away
+    // from a menu entry to hit it. Awareness alone keeps both sides in physical pixels.
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO) != 0) {
         std::fprintf(stderr, "[BeetleRecomp] SDL_Init failed: %s\n", SDL_GetError());
     }
@@ -266,7 +301,20 @@ static ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callba
 #endif
 }
 
+// Defined with the audio backend below, which owns the flag it writes; update_gfx is where it is
+// called from, because this is the callback that runs on the thread owning the window.
+static void bar_update_window_focus();
+
 static void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t /*data*/) {
+    // First statement in the callback, so a stall anywhere below -- including inside the pump itself
+    // -- stops the counter and the watchdog times the wedge from the start of the frame that wedged.
+    bar::watchdog::heartbeat();
+#ifdef BEETLE_ENABLE_FRONTEND
+    // recompinput owns the SDL queue and must be its ONLY poller -- a second loop would race it and
+    // each would swallow events the other needed. It is pumped here rather than from input_poll
+    // because this callback runs even with no game started, which is where the launcher lives.
+    bar::frontend::pump_events();
+#else
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (event.type == SDL_QUIT) {
@@ -341,9 +389,33 @@ static void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t /*data*/) {
         }
 #endif
     }
+#endif // BEETLE_ENABLE_FRONTEND
+
+#ifndef BEETLE_ENABLE_FRONTEND
+    // The headless build's own per-frame pad work. In the frontend build recompinput does both of
+    // these -- it samples the pads it opened, and pump_events() ramps and issues the rumble -- and
+    // bar::input has no pads to sample there anyway, because the hotplug events it used to watch for
+    // now go to recompinput's pump.
     bar::input::sample_all_ports();   // refresh every assigned pad's snapshot on this (main) thread
     bar::input::flush_rumble();       // issue SDL rumble for any port that wants it (main thread)
+    // The motor model's output goes to pads only in the frontend build; here it runs for
+    // BAR_RUMBLE_TRACE alone, so a scripted race can measure the duty the game produces.
+    if (std::getenv("BAR_RUMBLE_TRACE") != nullptr) {
+        uint16_t strength[bar::rumble::kPorts];
+        bool send[bar::rumble::kPorts];
+        bar::rumble::step(100.0, false, strength, send);
+    }
+#endif
+    // Shared by BOTH builds, and it must keep running in each: without it, Controller Pak writes --
+    // BAR's records, ghosts and settings -- would never reach disk.
     bar::input::mempak_flush_all();   // persist any Controller Pak writes (cheap no-op when clean)
+
+#ifdef BEETLE_ENABLE_FRONTEND
+    // Mute When Not In Focus, applied here because this is the callback that runs every frame with
+    // the window in hand. queue_samples runs on the game thread and has no business asking SDL about
+    // window state.
+    bar_update_window_focus();
+#endif
 }
 
 // Audio (audio_callbacks_t) — SDL2 queued-audio backend.
@@ -365,6 +437,66 @@ static constexpr int kBarBytesPerFrame = 2 * (int)sizeof(int16_t);   // stereo s
 static std::FILE* g_audio_capture = nullptr;
 static size_t g_audio_capture_bytes = 0;
 
+// ---- The Sound tab's two settings -------------------------------------------------------------
+//
+// Both are applied to the finished buffer in queue_samples, which is the last point this port owns
+// before the samples reach the sound card. That placement is also the limit of what can be done from
+// here: music and effects are already mixed together by the time they arrive, so a music-only volume
+// is not reachable without going into the game's own sequence players.
+//
+// Atomics because queue_samples runs on the game thread while the settings change on the UI thread
+// and the focus flag is written from update_gfx on the main thread. Defaults match what recompui
+// stores for a fresh profile, so the first frame before the Load callback fires is not silent.
+static std::atomic<int>  g_audio_volume{ 100 };         // Main Volume, 0-100
+static std::atomic<bool> g_mute_unfocused{ true };      // Mute When Not In Focus
+static std::atomic<bool> g_window_focused{ true };
+
+// Called once per frame from update_gfx, which is the callback that runs on the thread owning the
+// window. Reading SDL window state from the game thread instead would be a data race.
+static void bar_update_window_focus() {
+    const bool focused = g_window == nullptr ||
+                         (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    g_window_focused.store(focused, std::memory_order_relaxed);
+}
+
+extern "C" void bar_set_audio_volume(double percent) {
+    if (!std::isfinite(percent)) percent = 100.0;
+    const int clamped = (int)std::lround(std::clamp(percent, 0.0, 100.0));
+    const int previous = g_audio_volume.exchange(clamped, std::memory_order_relaxed);
+    if (clamped == previous) {
+        return;
+    }
+    // Worth a line, because this setting used to do nothing at all: anyone who left the slider at
+    // zero while it was inert now has a port that is correctly silent, and this is where that is
+    // explained rather than guessed at.
+    std::fprintf(stderr, "[BeetleRecomp] main volume: %d%%%s\n", clamped,
+                 clamped == 0 ? " -- the game will be silent until the Sound tab's Main Volume is raised" : "");
+    std::fflush(stderr);
+}
+
+extern "C" void bar_set_mute_when_unfocused(bool mute) {
+    g_mute_unfocused.store(mute, std::memory_order_relaxed);
+}
+
+// Whether Mute When Not In Focus is silencing the game right now. The frontend's rumble uses it too:
+// alt-tabbed away with the setting on, the motor stops as well (as in Body Harvest's port).
+extern "C" bool bar_output_silenced(void) {
+    return !g_window_focused.load(std::memory_order_relaxed) && g_mute_unfocused.load(std::memory_order_relaxed);
+}
+
+// How much of the stream BAR_AUDIO_CAPTURE keeps, in MB. The capture starts at the FIRST audio
+// callback, so the budget is spent on the launcher and the menus before the player reaches whatever
+// they are trying to record -- 16 MB is only about two minutes at 32 kHz stereo, which is not enough
+// to navigate to a specific spot on a specific course. BAR_AUDIO_CAPTURE_MB raises it.
+static unsigned bar_audio_capture_mb() {
+    static const unsigned mb = []{
+        const char* e = std::getenv("BAR_AUDIO_CAPTURE_MB");
+        const int v = e ? std::atoi(e) : 0;
+        return (v >= 1 && v <= 2048) ? (unsigned)v : 16u;
+    }();
+    return mb;
+}
+
 static bool bar_audio_play_enabled() {
     // Audio output ON by default; BAR_NO_AUDIO disables the device (and the ucode, see get_rsp_microcode).
     static const bool on = std::getenv("BAR_NO_AUDIO") == nullptr;
@@ -383,7 +515,10 @@ static void bar_open_audio(uint32_t freq) {
         if (!tried) { tried = true;
             const char* cap = std::getenv("BAR_AUDIO_CAPTURE");
             if (cap && *cap) { g_audio_capture = std::fopen(cap, "wb");
-                std::fprintf(stderr, "[BeetleRecomp] audio capture -> %s\n", cap); }
+                // The rate matters as much as the bytes: the dump is headerless stereo s16, so anything
+                // reading it back has to be told the rate, and it is the game that chooses it.
+                std::fprintf(stderr, "[BeetleRecomp] audio capture -> %s (%u Hz stereo s16, cap %u MB)\n",
+                             cap, (unsigned)freq, (unsigned)bar_audio_capture_mb()); }
         }
     }
     if (!bar_audio_play_enabled()) return;          // muted: never open a device, never play
@@ -407,7 +542,7 @@ static void bar_open_audio(uint32_t freq) {
 static void queue_samples(int16_t* samples, size_t count) {
     if (samples == nullptr || count == 0) return;
     // Capture the RAW received stream (no transform) for offline analysis, capped at ~16 MB.
-    if (g_audio_capture && g_audio_capture_bytes < (16u << 20)) {
+    if (g_audio_capture && g_audio_capture_bytes < ((size_t)bar_audio_capture_mb() << 20)) {
         size_t n = std::fwrite(samples, sizeof(int16_t), count, g_audio_capture);
         g_audio_capture_bytes += n * sizeof(int16_t);
     }
@@ -423,14 +558,46 @@ static void queue_samples(int16_t* samples, size_t count) {
     }
     if (chanswap) { for (size_t i = 0; i + 1 < count; i += 2) { int16_t t = out[i]; out[i] = out[i+1]; out[i+1] = t; } }
     { static const bool dbg = std::getenv("BAR_AUDIO_DBG") != nullptr; if (dbg) {
-        extern int g_bar_audio_peak; extern long g_bar_audio_clip;
-        for (size_t i = 0; i < count; i++) { int a = out[i] < 0 ? -(int)out[i] : out[i];
-            if (a > g_bar_audio_peak) g_bar_audio_peak = a; if (a >= 32760) g_bar_audio_clip++; } } }
+        extern std::atomic<int> g_bar_audio_peak;
+        extern std::atomic<long> g_bar_audio_clip;
+        int peak = 0;
+        long clipped = 0;
+        for (size_t i = 0; i < count; i++) {
+            const int amplitude = out[i] < 0 ? -(int)out[i] : out[i];
+            peak = std::max(peak, amplitude);
+            if (amplitude >= 32760) ++clipped;
+        }
+        int previous = g_bar_audio_peak.load(std::memory_order_relaxed);
+        while (peak > previous && !g_bar_audio_peak.compare_exchange_weak(previous, peak, std::memory_order_relaxed)) {}
+        g_bar_audio_clip.fetch_add(clipped, std::memory_order_relaxed);
+    } }
+    // The Sound tab, applied last so the diagnostics above still measure what the game produced
+    // rather than what the player chose to hear. Integer-scaled, and only when the volume is not
+    // full, so the common case is the copy it always was; a percentage of a signed 16-bit sample
+    // cannot overflow it.
+    {
+        int gain = g_audio_volume.load(std::memory_order_relaxed);
+        if (g_mute_unfocused.load(std::memory_order_relaxed) &&
+            !g_window_focused.load(std::memory_order_relaxed)) {
+            gain = 0;
+        }
+        // Silence is queued as zeroes rather than by queueing nothing. get_frames_remaining reports
+        // the depth of this queue, and the game -- and this port's frame limiter -- pace themselves
+        // from that answer, so a muted game that queued nothing would be told it was starving and
+        // would run away from its own clock.
+        if (gain == 0) {
+            std::fill(out.begin(), out.end(), int16_t{ 0 });
+        } else if (gain != 100) {
+            for (size_t i = 0; i < count; i++) {
+                out[i] = (int16_t)((int32_t)out[i] * gain / 100);
+            }
+        }
+    }
     SDL_QueueAudio(g_audio_dev, out.data(), (Uint32)(count * sizeof(int16_t)));
 }
 
-int  g_bar_audio_peak = 0;   // diag (BAR_AUDIO_DBG): peak |sample| + saturation count
-long g_bar_audio_clip = 0;
+std::atomic<int> g_bar_audio_peak{ 0 }; // Producer and queue diagnostics run on separate threads.
+std::atomic<long> g_bar_audio_clip{ 0 };
 
 static size_t get_frames_remaining() {
     if (g_audio_dev == 0) return 0;
@@ -445,9 +612,10 @@ static size_t get_frames_remaining() {
         if (frames < minq) minq = frames; if (frames > maxq) maxq = frames;
         if ((++n % 60) == 0) {
             std::fprintf(stderr, "[BeetleRecomp] audio: queued now=%zu min=%zu max=%zu | peak=%d clipped=%ld%s\n",
-                         frames, minq, maxq, g_bar_audio_peak, g_bar_audio_clip,
+                         frames, minq, maxq, g_bar_audio_peak.exchange(0, std::memory_order_relaxed),
+                         g_bar_audio_clip.exchange(0, std::memory_order_relaxed),
                          (minq == 0) ? "  <<< UNDERRUN" : "");
-            std::fflush(stderr); minq = (size_t)-1; maxq = 0; g_bar_audio_peak = 0; g_bar_audio_clip = 0;
+            std::fflush(stderr); minq = (size_t)-1; maxq = 0;
         } } }
     return frames;
 }
@@ -460,7 +628,48 @@ static void set_frequency(uint32_t freq) {
 // (bar::input); its buttons/stick come from bar_poll_keyboard -> bar::input::resolve_port, resolving
 // the port's assigned device (keyboard or a specific SDL pad) through its rebindable bindings. The
 // Controls dialog (src/ui) edits that config.
+// Which of BAR's four controller ports has something driving it.
+//
+// The two builds answer this from different places, and the difference is the whole point of the
+// frontend build. With the frontend on, recompinput owns the devices: it is the only thing draining
+// SDL's event queue, so it is the only thing that ever learns a pad was plugged in, and its profiles
+// are where the Controls tab's remapping lives. bar::input still exists in that build -- it owns the
+// Controller Pak and the per-port pak type -- but it has no pads, so asking it which ports are
+// occupied would answer "only the keyboard one", forever.
+//
+// Both routes to the game ask this: the high-level callbacks below, and the raw SI/PIF stub in
+// os_unimpl_stubs.cpp -- which is the one BAR actually reads its pads through. That stub used to ask
+// bar::input directly, so in the frontend build a second pad was assigned to player two, polled
+// correctly, and never reached the game: port two answered the joybus with NO_RESPONSE.
+bool bar_port_connected(int port) {
+#ifdef BEETLE_ENABLE_FRONTEND
+    return bar::frontend::port_assigned(port);
+#else
+    return bar::input::port_connected(port);
+#endif
+}
+
+// The accessory in each port, asked by the same two routes as bar_port_connected.
+//
+// Accessories retain the saved per-port settings in both builds. In the frontend,
+// player assignment determines connection, so legacy device presence is not consulted twice.
+bar::input_config::PakType bar_port_pak(int port) {
+    if (!bar_port_connected(port)) {
+        return bar::input_config::PakType::None;
+    }
+#ifdef BEETLE_ENABLE_FRONTEND
+    return bar::input::port_pak(port, false);
+#else
+    return bar::input::port_pak(port);
+#endif
+}
+
 static void input_poll() {
+    // Deliberately empty. wave-race-64-recomp pumps recompinput from here, but ultramodern does not
+    // call this callback until a game is running — and this port sits at the launcher with no game
+    // started, because recompui's "Start Game" owns that. Pumping only from here left nothing
+    // draining SDL's queue at the launcher, so the window stopped answering Windows and went
+    // "Not Responding". The pump therefore lives in update_gfx, which does run pre-game.
 }
 
 // bar_poll_keyboard (defined below) is the single input source — BAR_AUTOPLAY script or live
@@ -470,7 +679,7 @@ static void input_poll() {
 extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y);
 
 static bool input_get(int controller_num, uint16_t* buttons, float* x, float* y) {
-    if (!bar::input::port_connected(controller_num)) {
+    if (!bar_port_connected(controller_num)) {
         return false;   // this N64 port has no controller / device assigned
     }
     int8_t sx = 0, sy = 0;
@@ -481,20 +690,54 @@ static bool input_get(int controller_num, uint16_t* buttons, float* x, float* y)
     return true;
 }
 
+// Both routes to the motor land here: ultramodern's set_rumble callback, and -- the one BAR actually
+// uses -- the joybus motor register served in os_unimpl_stubs.cpp (bar_handle_pak, block 0x600).
+// That handler used to call bar::input::set_rumble directly, which only the headless build reads, so
+// in the frontend build the game's motor writes never reached a pad at all.
+extern "C" void bar_pak_motor(int controller_num, bool rumble);
 static void input_set_rumble(int controller_num, bool rumble) {
+    bar_pak_motor(controller_num, rumble);
+}
+
+extern "C" void bar_pak_motor(int controller_num, bool rumble) {
+    // Every motor write feeds the host motor model (src/main/bar_rumble.cpp): BAR pulses the motor to
+    // set its strength, so what reaches the pad is the duty cycle, not this bool.
+    bar::rumble::motor(controller_num, rumble);
+#ifdef BEETLE_ENABLE_FRONTEND
+    // recompinput owns the motor with the frontend on: it scales the request by the General tab's
+    // Rumble Strength and ramps it, which bar::input cannot do because it never opened the pad --
+    // the SDL hotplug events that would have told it go to recompinput's pump instead.
+    if (bar::rumble::raw_mode()) {
+        bar::frontend::set_port_rumble(controller_num, rumble);   // BAR_RUMBLE_RAW=1: recompinput's on/off path
+    }
+#else
     bar::input::set_rumble(controller_num, rumble);
+#endif
 }
 
 static ultramodern::input::connected_device_info_t input_get_device_info(int controller_num) {
     using namespace ultramodern::input;
-    if (!bar::input::port_connected(controller_num)) {
+    if (!bar_port_connected(controller_num)) {
         return connected_device_info_t{ Device::None, Pak::None };
     }
     // A Rumble Pak is surfaced to the high-level path so ultramodern's osMotorInit succeeds; a
     // Controller Pak is emulated at the SI/joybus level (status bit + mempak), so it reports no
     // high-level pak here (we don't want the runtime treating it as a rumble device).
-    const Pak pak = (bar::input::port_pak(controller_num) == bar::input_config::PakType::RumblePak)
-                    ? Pak::RumblePak : Pak::None;
+    // Report the configured accessory. Controller Pak support needs BOTH halves and neither works
+    // alone (verified by reverting each):
+    //   1. here — ultramodern sets OSContStatus.status = (connected_pak != Pak::None), and BAR gates
+    //      its whole pak path on that status. With None it never even issues an SI pak query.
+    //   2. os_unimpl_stubs.cpp — answers the SHORT-format status query and serves READ_PAK/WRITE_PAK
+    //      against the 32 KiB per-port store, which is where the notes actually live.
+    //
+    // Pak::ControllerPak was added to the ultramodern fork for this: it reports the accessory as
+    // present without osMotorInit accepting the port as a rumble device (it only accepts RumblePak).
+    Pak pak = Pak::None;
+    switch (bar_port_pak(controller_num)) {
+        case bar::input_config::PakType::ControllerPak: pak = Pak::ControllerPak; break;
+        case bar::input_config::PakType::RumblePak:     pak = Pak::RumblePak;     break;
+        case bar::input_config::PakType::None:          pak = Pak::None;          break;
+    }
     return connected_device_info_t{ Device::Controller, pak };
 }
 
@@ -639,10 +882,25 @@ extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y
     // navigation (arrows/enter) doesn't also drive the car.
     if (bar_ui::menu_capturing_input()) return 0;
 #endif
+#ifdef BEETLE_ENABLE_FRONTEND
+    // Same idea, but asked of recompui, which reports whether a context is ACTUALLY capturing input
+    // rather than merely being open. That distinction matters: the legacy check froze game input for
+    // as long as its overlay existed, so a normal launch reached the game with a dead keyboard.
+    if (bar::frontend::menu_capturing_input()) return 0;
+#endif
     // Only read the keyboard while our window actually holds input focus, so we don't drive the car
     // when the user has tabbed away. SDL tracks focus the same way on every platform.
     if (g_window != nullptr && !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)) return 0;
+#ifdef BEETLE_ENABLE_FRONTEND
+    // recompinput's profiles are where the player's own remapping is applied, so the port has to ask
+    // for its buttons here rather than reading SDL itself. bar::input::resolve_port does read SDL --
+    // and it still works for the keyboard, which is global state -- but it knows about no pad at all
+    // in this build, and it applies bar::input_config's bindings rather than the ones the Controls
+    // tab writes. Every rebinding a player made was silently ignored.
+    return bar::frontend::poll_port(port, stick_x, stick_y);
+#else
     return bar::input::resolve_port(port, stick_x, stick_y);
+#endif
 }
 
 // Error handling (error_handling::callbacks_t). ultramodern calls this for FATAL startup errors — most
@@ -684,9 +942,11 @@ void bar_restart_game() {
 // unlike the stderr-only message_box() above (which nobody sees when launched from a GUI/launcher).
 static void bar_user_message(uint32_t sdl_flags, const char* msg) {
     std::fprintf(stderr, "[BeetleRecomp] %s\n", msg);
-#ifdef BEETLE_ENABLE_UI
+#ifdef BEETLE_ENABLE_FRONTEND
+    // The release build is /SUBSYSTEM:WINDOWS, so stderr goes nowhere a player will ever look.
     SDL_ShowSimpleMessageBox(sdl_flags, "Beetle Adventure Racing: Recompiled", msg, nullptr);
 #else
+    // The headless build keeps stderr only: a modal box would hang an automated run.
     (void)sdl_flags;
 #endif
 }
@@ -718,9 +978,13 @@ static bool bar_select_and_report(const std::filesystem::path& path, std::u8stri
 
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
-#ifdef _WIN32
-    { extern void bar_install_crash_handler(); bar_install_crash_handler(); }   // symbolized backtrace on AV
+    RT64_BarCullScale = bar_set_cull_scale;
+#if defined(_WIN32) || defined(__linux__)
+    { extern void bar_install_crash_handler(); bar_install_crash_handler(); }   // backtrace on a fatal fault
 #endif
+    // The companion to the above: a fault raises an exception and the filter catches it, but a hang
+    // raises nothing. BAR_WATCHDOG=1 opts into the diagnostic stack collector.
+    bar::watchdog::install();
 #ifdef _WIN32
     // Raise the Windows timer resolution to 1ms. CRITICAL for menu/sparse-workload framerate: the game's
     // VI-synced RCP scheduler + our runtime's gfx/task threads hand work off via timed waits. At the default
@@ -759,6 +1023,7 @@ int main(int argc, char** argv) {
     // re-inits the full set); the device-level GUID matches what bar_input later opens.
     {
         const bool first_run = !bar::input_config::config_file_exists();
+        g_bar_had_legacy_input_config = !first_run;
         bar::input_config::InputConfig cfg = bar::input_config::load();   // writes keyboard default on first run
         if (first_run) {
             SDL_SetMainReady();
@@ -809,45 +1074,46 @@ int main(int argc, char** argv) {
     bool have_rom = recomp::is_rom_valid(game_id);
 
     // An explicit path (e.g. `BeetleRecomp "C:\path\Beetle.z64"`) wins and is re-validated + cached.
-    if (!have_rom && argc > 1) {
+    if (!have_rom && argc > 1 && argv[1][0] != '-') {
         have_rom = bar_select_and_report(std::filesystem::path(argv[1]), game_id);
     }
 
-#ifdef BEETLE_ENABLE_UI
-    // First run (or the cached ROM went missing / changed hash): ask the player to locate their ROM
-    // with a native file picker (RT64 wraps nativefiledialog-extended). It needs no renderer, so it's
-    // safe here, before recomp::start(). Loop until a valid ROM is chosen or the user cancels.
-    if (!have_rom) {
-        bar_user_message(SDL_MESSAGEBOX_INFORMATION,
-            "Beetle Adventure Racing: Recompiled needs your own copy of the original game.\n\n"
-            "Please select your Beetle Adventure Racing (USA) ROM to continue.");
-    }
-    while (!have_rom) {
-        RT64::FileDialog::initialize();
-        std::filesystem::path picked =
-            RT64::FileDialog::getOpenFilename({ RT64::FileFilter{ "Nintendo 64 ROM", "z64,n64,v64" } });
-        RT64::FileDialog::finish();
-
-        if (picked.empty()) {   // user cancelled the dialog
-            bar_user_message(SDL_MESSAGEBOX_ERROR,
-                "No ROM was selected, so Beetle Adventure Racing: Recompiled will now exit.");
-            return EXIT_FAILURE;
-        }
-        have_rom = bar_select_and_report(picked, game_id);
-    }
-#else
+    // No ROM yet: how that is handled depends on which build this is.
+    //
+    // The frontend build must NOT bail out here. Its launcher already owns the decision --
+    // add_start_game_or_load_rom_option() (see src/frontend/bar_frontend.cpp) shows "Load ROM" until
+    // librecomp reports a valid ROM, runs the picker, and calls start_game() itself. Exiting here
+    // would run before the launcher ever appeared, so a fresh install could never reach it: the whole
+    // first-run experience of a released build was a message box saying to pass a path on the command
+    // line. This block used to be guarded on BEETLE_ENABLE_UI, which the bespoke-UI removal in 019305c
+    // left defined by nothing, so the frontend fell through to the headless branch.
+    //
+    // The headless build has no launcher and nothing else will ask, so there it is still a hard stop.
+#ifndef BEETLE_ENABLE_FRONTEND
     if (!have_rom) {
         message_box("No ROM configured. Pass the ROM path as the first argument "
                     "(this build has the in-game picker disabled).");
         return EXIT_FAILURE;
     }
 #endif
+    (void)have_rom;
 
     // Coordinator: the game thread blocks in wait_for_game_started() until start_game() runs. The VI
     // thread only seeds a dummy OSViMode while !is_game_started(); starting before its first tick
     // makes update_vi() deref a null mode — so we wait for g_bar_vi_ticked (renderer presented a
     // frame, which also means the launcher can draw over it). recomp::start() below blocks the main
     // thread, so this runs on a detached thread.
+#ifndef BEETLE_ENABLE_FRONTEND
+    // Auto-start, for builds WITHOUT the RecompFrontend launcher.
+    //
+    // Not used with the frontend, for two reasons. Correctness: recompui's
+    // add_start_game_or_load_rom_option() calls recomp::start_game() itself once librecomp reports a
+    // valid ROM (and runs the ROM picker when it does not), so the launcher owns that decision and
+    // auto-starting would race it. And safety: the wait below is on g_bar_vi_ticked, which is set by
+    // src/main/rt64_render_context.cpp -- the context the frontend REPLACES. Nothing would ever set
+    // it, so this fell through the full 5s timeout and started the game before the VI thread had
+    // ticked, which is exactly the null-mode deref the comment below warns about. That was a silent
+    // crash roughly nine seconds after launch.
     std::thread([game_id]() {
         using namespace std::chrono_literals;
         for (int i = 0; i < 500 && !g_bar_vi_ticked.load(); i++) {
@@ -861,18 +1127,29 @@ int main(int argc, char** argv) {
         // launcher stays shown over the (booting) game until the user clicks Play (which hides it);
         // F1 reopens the menu in-game. BAR_SKIP_LAUNCHER starts with the overlay hidden (headless).
 
-        recomp::start_game(game_id);
+        // Upstream added game modes: start_game now takes a mode id alongside the game id. BAR has
+        // no alternate modes, so it starts in the default (empty) mode.
+        recomp::start_game(game_id, "");
 #ifdef BEETLE_ENABLE_UI
         bar_ui::on_game_started();   // mark game started (enables F1); the launcher stays as an overlay
 #endif
     }).detach();
+#endif // !BEETLE_ENABLE_FRONTEND
 
     // ---- Assemble callbacks (field names verified against the vendored headers) ----
     recomp::rsp::callbacks_t rsp_callbacks{};                  // MANDATORY
     rsp_callbacks.get_rsp_microcode = get_rsp_microcode;
 
     ultramodern::renderer::callbacks_t renderer_callbacks{};   // MANDATORY
+#ifdef BEETLE_ENABLE_FRONTEND
+    // recompui draws its menus over the game, so it supplies its own RT64 context; use that instead
+    // of src/main/rt64_render_context.cpp. bar::frontend::create_render_context adapts the runtime's
+    // 3-argument callback to recompui's 4-argument factory, and pins Console presentation so the
+    // main-menu film-roll (a VI-origin pan that never redraws) still animates.
+    renderer_callbacks.create_render_context = bar::frontend::create_render_context;
+#else
     renderer_callbacks.create_render_context = bar_create_rt64_render_context;
+#endif
 
     ultramodern::gfx_callbacks_t gfx_callbacks{};
     gfx_callbacks.create_gfx    = create_gfx;
@@ -897,6 +1174,10 @@ int main(int argc, char** argv) {
     threads_callbacks.get_game_thread_name = get_game_thread_name;
 
     recomp::Configuration config{};
+    // The runtime handles --game/--game-mode after initializing the renderer and game thread.
+    // Forward the actual arguments so scripted launches can use that established start path.
+    config.argc                     = argc;
+    config.argv                     = argv;
     config.project_version          = project_version;
     config.rsp_callbacks            = rsp_callbacks;
     config.renderer_callbacks       = renderer_callbacks;
@@ -921,6 +1202,19 @@ int main(int argc, char** argv) {
     extern void bar_start_preempt_timer();
     extern void bar_stop_preempt_timer();
     bar_start_preempt_timer();
+
+#ifdef BEETLE_ENABLE_FRONTEND
+    // Program identity, primary font and the launcher layout. Must precede recomp::start(), which
+    // brings up the renderer — recompui builds its menus during that bring-up, and throws if no
+    // primary font has been registered by then.
+    bar::frontend::install();
+#endif
+
+    // The HUD inspector. Both calls must precede recomp::start(), which brings the renderer up: the
+    // classifier in the RT64 fork consults the tag table and the element hook from the very first
+    // display list it sees.
+    bar::inspector::init();
+    bar::inspector::install();
 
     // Blocks until the game exits.
     recomp::start(config);

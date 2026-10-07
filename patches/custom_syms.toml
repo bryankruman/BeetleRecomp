@@ -1,6 +1,18 @@
-# Custom symbols defined by your patches, consumed by patches.toml's
-# data_reference_syms_files. Empty to start.
+# Custom data symbols defined by this project's patches, consumed by patches.toml's
+# data_reference_syms_files.
 #
-# [[symbol]]
-# name = "my_custom_global"
-# vram = 0x81000000
+# NOTE THE SHAPE. N64Recomp parses this with the same reader as the generated reference files, so
+# symbols are grouped into SECTIONS — a bare list of `[[symbol]]` entries is not valid and the
+# recompiler rejects the whole file with "Invalid symbols array":
+#
+#     [[section]]
+#     name    = "custom"
+#     rom     = 0x0
+#     vram    = 0x81000000
+#     size    = 0x1000
+#     symbols = [
+#         { name = "my_custom_global", vram = 0x81000000 },
+#     ]
+#
+# This file is currently EMPTY OF SECTIONS, which the parser also rejects, so patches.toml does not
+# reference it yet. Add a section above and re-add the path to data_reference_syms_files together.

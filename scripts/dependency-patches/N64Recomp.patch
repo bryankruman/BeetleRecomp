@@ -1,0 +1,74 @@
+diff --git a/src/config.cpp b/src/config.cpp
+index 1066aff..1c7b3f8 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -104,11 +104,11 @@ std::vector<std::string> get_ignored_funcs(const toml::table* patches_data) {
+     return ignored_funcs;
+ }
+ 
+-std::vector<std::string> get_renamed_funcs(const toml::table* patches_data) {
++std::vector<std::string> get_renamed_funcs(const toml::table* patches_data, const char* key = "renamed") {
+     std::vector<std::string> renamed_funcs{};
+ 
+     // Check if the renamed funcs array exists.
+-    const toml::node_view renamed_funcs_data = (*patches_data)["renamed"];
++    const toml::node_view renamed_funcs_data = (*patches_data)[key];
+ 
+     if (renamed_funcs_data.is_array()) {
+         const toml::array* renamed_funcs_array = renamed_funcs_data.as_array();
+@@ -456,6 +456,8 @@ N64Recomp::Config::Config(const char* path) {
+ 
+             // Renamed funcs array (optional)
+             renamed_funcs = get_renamed_funcs(table);
++            // Explicitly retain selected original SDK implementations instead of host stubs.
++            original_funcs = get_renamed_funcs(table, "original");
+ 
+             // Single-instruction patches (optional)
+             instruction_patches = get_instruction_patches(table);
+diff --git a/src/config.h b/src/config.h
+index 7d6db23..cfa0db8 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -58,6 +58,7 @@ namespace N64Recomp {
+         std::vector<std::string> stubbed_funcs;
+         std::vector<std::string> ignored_funcs;
+         std::vector<std::string> renamed_funcs;
++        std::vector<std::string> original_funcs;
+         std::vector<InstructionPatch> instruction_patches;
+         std::vector<FunctionTextHook> function_hooks;
+         std::vector<FunctionSize> manual_func_sizes;
+diff --git a/src/main.cpp b/src/main.cpp
+index ce73201..29d8b71 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -520,6 +520,30 @@ int main(int argc, char** argv) {
+ 
+     fmt::print("Working dir: {}\n", std::filesystem::current_path().string());
+ 
++    // Games that emulate the raw controller bus need the original filesystem and
++    // accessory probes, rather than the runtime's no-pak implementations. Resolve
++    // both parsed spellings and use a distinct name to avoid host symbol collisions.
++    for (const std::string& original : config.original_funcs) {
++        auto found = context.functions_by_name.find(original);
++        if (found == context.functions_by_name.end()) {
++            found = context.functions_by_name.find(original + "_recomp");
++        }
++        if (found == context.functions_by_name.end()) {
++            exit_failure(fmt::format("Original function {} does not exist!\n", original));
++        }
++        const size_t index = found->second;
++        auto& function = context.functions[index];
++        const std::string name = "original_" + original;
++        if (function.words.empty() || context.functions_by_name.contains(name)) {
++            exit_failure(fmt::format("Original function {} has no code or conflicts with {}!\n", original, name));
++        }
++        context.functions_by_name.erase(found);
++        function.name = name;
++        function.ignored = false;
++        function.reimplemented = false;
++        context.functions_by_name.emplace(name, index);
++    }
++
+     // Stub out any functions specified in the config file.
+     for (const std::string& stubbed_func : config.stubbed_funcs) {
+         // Check if the specified function exists.

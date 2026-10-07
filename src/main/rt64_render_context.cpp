@@ -142,6 +142,20 @@ void set_application_user_config(RT64::Application* app, const ultramodern::rend
     app->userConfig.divotFilter         = to_rt64(config.divot_option);   // BAR seam fix (2B): live VI divot toggle
     app->userConfig.presentFillMode     = to_rt64(config.pfm_option);     // BAR letterbox: live window-fit (pillarbox/crop/stretch)
     app->userConfig.displayBuffering    = RT64::UserConfiguration::DisplayBuffering::Triple;
+
+    // BAR_DBG_GFX=1 reports what actually reached RT64. Widescreen depends on aspectRatio==Expand
+    // (1) surviving into RT64's userConfig, so print it rather than trusting the JSON on disk.
+    if (std::getenv("BAR_DBG_GFX") != nullptr) {
+        std::fprintf(stderr,
+            "[gfx] aspectRatio=%d extAspectRatio=%d extAspectTarget=%.4f resolution=%d resMult=%.2f "
+            "downMult=%d presentFillMode=%d antialiasing=%d refreshRate=%d\n",
+            int(app->userConfig.aspectRatio), int(app->userConfig.extAspectRatio),
+            app->userConfig.extAspectTarget, int(app->userConfig.resolution),
+            app->userConfig.resolutionMultiplier, int(app->userConfig.downsampleMultiplier),
+            int(app->userConfig.presentFillMode), int(app->userConfig.antialiasing),
+            int(app->userConfig.refreshRate));
+        std::fflush(stderr);
+    }
 }
 
 ultramodern::renderer::SetupResult map_setup_result(RT64::Application::SetupResult r) {
@@ -174,6 +188,10 @@ public:
                        const ultramodern::renderer::GraphicsConfig& new_config) override;
     void enable_instant_present() override;
     void send_dl(const OSTask* task) override;
+    // Added as a pure virtual by an upstream N64ModernRuntime change: the runtime asks the renderer
+    // to emit a minimal RDP workload targeting a framebuffer address, so a game that has not yet
+    // submitted a display list still produces something presentable.
+    void send_dummy_workload(uint32_t fb_address) override;
     void update_screen() override;
     void shutdown() override;
     uint32_t get_display_framerate() const override;
@@ -289,7 +307,60 @@ RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::WindowHandle win
     std::fprintf(stderr, "[BeetleRecomp] RT64 initialized (graphics api %d)\n", static_cast<int>(chosen_api));
 }
 
+// BAR_DBG_DLIST=1 -- how close each frame comes to the game's display-list budget.
+//
+// uvgfxmgr_rom allocates TWO command buffers of D_uvgfxmgr_rom_0040244C Gfx entries each, back to
+// back at 0x80300000 (uvgfxmgr_rom.c:278-281), and builds each frame with a bare `sGfxDisplayListHead++`
+// that is NEVER bounds-checked. So a frame that submits more than the buffer holds runs straight into
+// the other buffer -- still valid RDRAM, so RT64's walk-out-of-RDRAM guard never fires and nothing is
+// reported. The port's Draw Distance setting pushes the far plane to 4x by default, which submits
+// everything between the game's own 300 units and 1200, so this is the budget most at risk.
+//
+// Capacity is not a symbol we can reach (the module is relocatable), but it does not have to be: the
+// two buffers alternate frame to frame and are adjacent, so the gap between the two distinct data_ptr
+// values IS the capacity in bytes.
+static void barTraceDlistBudget(const OSTask *task) {
+    static const bool enabled = std::getenv("BAR_DBG_DLIST") != nullptr;
+    if (!enabled) {
+        return;
+    }
+
+    const uint32_t ptr = static_cast<uint32_t>(task->t.data_ptr) & 0x3FFFFFF;
+    const uint32_t bytes = static_cast<uint32_t>(task->t.data_size);
+
+    static uint32_t bufA = 0, bufB = 0, capacity = 0, peak = 0;
+    static uint32_t frames = 0, overflows = 0;
+    frames++;
+
+    if (bufA == 0) {
+        bufA = ptr;
+    } else if ((bufB == 0) && (ptr != bufA)) {
+        bufB = ptr;
+        capacity = (bufA < bufB) ? (bufB - bufA) : (bufA - bufB);
+        std::fprintf(stderr, "[dlist] buffers %08X / %08X -> capacity %u bytes (%u cmds)\n",
+                     bufA, bufB, capacity, capacity / 8);
+        std::fflush(stderr);
+    }
+
+    if (bytes > peak) {
+        peak = bytes;
+        std::fprintf(stderr, "[dlist] new peak %u bytes (%u cmds) on frame %u%s\n", peak, peak / 8, frames,
+                     ((capacity != 0) && (peak > capacity)) ? "  *** OVER BUDGET ***" : "");
+        std::fflush(stderr);
+    }
+
+    if ((capacity != 0) && (bytes > capacity)) {
+        overflows++;
+        if (overflows <= 16) {
+            std::fprintf(stderr, "[dlist] OVERFLOW frame %u: %u bytes into a %u byte buffer (%u over)\n",
+                         frames, bytes, capacity, bytes - capacity);
+            std::fflush(stderr);
+        }
+    }
+}
+
 void RT64Context::send_dl(const OSTask* task) {
+    barTraceDlistBudget(task);
     app->state->rsp->reset();
     app->interpreter->loadUCodeGBI(task->t.ucode & 0x3FFFFFF, task->t.ucode_data & 0x3FFFFFF, true);
     app->processDisplayLists(app->core.RDRAM, task->t.data_ptr & 0x3FFFFFF, 0, true);
@@ -309,6 +380,19 @@ void RT64Context::shutdown() {
     if (app != nullptr) {
         app->end();
     }
+}
+
+void RT64Context::send_dummy_workload(uint32_t fb_address) {
+    // Mirrors recompui's RT64Context: a fill of the whole 320x240 framebuffer through the RDP, so
+    // the VI has real content to present before the game submits its first display list.
+    app->state->listProcessBegin();
+    app->state->rdp->setColorImage(G_IM_FMT_RGBA, G_IM_SIZ_16b, 320, fb_address);
+    // G_AD_DISABLE | G_CD_MAGICSQ | G_CK_NONE | G_TC_FILT | G_TF_BILERP | G_TT_NONE | G_TL_TILE |
+    // G_TD_CLAMP | G_TP_PERSP | G_CYC_FILL | G_PM_NPRIMITIVE, then G_AC_NONE | G_ZS_PIXEL | G_RM_NOOP.
+    app->state->rdp->setOtherMode(0x382C30, 0);
+    app->state->rdp->fillRect(0, 0, 320 << 2, 240 << 2);
+    app->state->fullSync();
+    app->state->listProcessEnd();
 }
 
 bool RT64Context::update_config(const ultramodern::renderer::GraphicsConfig& old_config,
@@ -388,7 +472,20 @@ float RT64Context::get_resolution_scale() const {
 // Factory wired into main.cpp's renderer_callbacks.create_render_context.
 std::unique_ptr<ultramodern::renderer::RendererContext>
 bar_create_rt64_render_context(uint8_t* rdram, ultramodern::renderer::WindowHandle window_handle, bool developer_mode) {
-    auto context = std::make_unique<RT64Context>(rdram, window_handle, developer_mode);
+    // RT64's developer mode, on unconditionally.
+    //
+    // Every path to RT64's debug UI is gated on it: the F1 key handler, the event filter RT64
+    // installs for itself, and State::inspect() at the other end -- which is also where the port's
+    // HUD inspector is drawn. A debug menu that only exists in a build made for it is a debug menu
+    // nobody has when they need it; the person looking at a misplaced HUD element is running the
+    // game they downloaded.
+    //
+    // Nothing is drawn until F1 is pressed: RT64 creates its inspector on the keystroke and
+    // State::inspect() returns immediately while there is none, so the cost of leaving this on is a
+    // null check per frame. F2 is unbound in the fork for the same reason -- see
+    // lib/rt64/src/hle/rt64_application.cpp.
+    (void)developer_mode;
+    auto context = std::make_unique<RT64Context>(rdram, window_handle, true);
     if (context->valid()) {
         g_bar_renderer_ready.store(true);
     }

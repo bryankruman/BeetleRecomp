@@ -2,27 +2,20 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
-function Add-Sub($url, $path) {
-  if ((Test-Path (Join-Path $path "CMakeLists.txt")) -or (Test-Path (Join-Path $path ".git"))) {
-    Write-Host ">> $path already present, skipping"
-  } else {
-    git submodule add -f $url $path
-  }
-}
-
-Write-Host ">> Adding submodules..."
-Add-Sub "https://github.com/N64Recomp/N64ModernRuntime.git" "lib/N64ModernRuntime"
-Add-Sub "https://github.com/rt64/rt64.git"                  "lib/rt64"
-Add-Sub "https://github.com/mikke89/RmlUi.git"              "lib/RmlUi"
-Add-Sub "https://github.com/sammycage/lunasvg.git"          "lib/lunasvg"
-Add-Sub "https://github.com/N64Recomp/N64Recomp.git"        "lib/N64Recomp"
-
+# Use only the dependency registrations and pins committed in this repository.
 Write-Host ">> Updating submodules recursively..."
 git submodule update --init --recursive
+if ($LASTEXITCODE -ne 0) { throw "Submodule update failed" }
+python scripts/apply-dependency-patches.py
+if ($LASTEXITCODE -ne 0) { throw "Reviewed dependency patches failed" }
 
 Write-Host ">> Building N64Recomp + RSPRecomp (Release)..."
 cmake -S lib/N64Recomp -B lib/N64Recomp/build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build lib/N64Recomp/build --config Release
+if ($LASTEXITCODE -ne 0) { throw "Recompiler configuration failed" }
+$jobs = if ($env:BEETLE_BUILD_JOBS) { [int]$env:BEETLE_BUILD_JOBS } else { 4 }
+if ($jobs -lt 1) { throw "BEETLE_BUILD_JOBS must be positive" }
+cmake --build lib/N64Recomp/build --config Release --parallel $jobs
+if ($LASTEXITCODE -ne 0) { throw "Recompiler build failed" }
 
 Write-Host ">> Copying recompiler executables to repo root..."
 Get-ChildItem -Path lib/N64Recomp/build -Recurse -Include N64Recomp.exe,RSPRecomp.exe |

@@ -10,11 +10,17 @@ symbol/function data it derives from. Vendored dependencies retain their own lic
 | N64Recomp (+ RSPRecomp) | static recompiler | **MIT** | https://github.com/N64Recomp/N64Recomp/blob/main/LICENSE |
 | N64ModernRuntime (librecomp, ultramodern) | runtime | **GPL-3.0** | https://github.com/N64Recomp/N64ModernRuntime/blob/main/COPYING |
 | RT64 | renderer (D3D12 / Vulkan) | **MIT** (formerly restrictive; now MIT) | https://github.com/rt64/rt64/blob/main/LICENSE |
+| RecompFrontend | launcher, settings and controller profiles | Notices retained in vendored source | https://github.com/N64Recomp/RecompFrontend |
+| GamepadMotionHelpers | controller support | **MIT** | https://github.com/JibbSmart/GamepadMotionHelpers |
 | RmlUi | UI | **MIT** | https://github.com/mikke89/RmlUi/blob/master/LICENSE.txt |
 | lunasvg | SVG icons | **MIT** | https://github.com/sammycage/lunasvg |
 | SDL2 / SDL3 | platform / input | **Zlib** | https://www.libsdl.org/license.php |
 | miniaudio | audio backend | **Unlicense / MIT-0** | https://github.com/mackron/miniaudio/blob/master/LICENSE |
 | BeetleDecomp | symbol / function data | **AGPL-3.0** | https://github.com/bryankruman/BeetleDecomp |
+
+The frontend integration and BAR rendering improvements were imported from Daniel Gomes Vieira's
+[Beetle Adventure Racing recomp fork](https://github.com/danielgomesvieira2000/beetle-adventure-racing-recomp)
+at commit `6497e672`. Existing project and dependency notices remain with their source files.
 
 ## Why AGPL-3.0 for this repo
 
@@ -42,6 +48,13 @@ symbol/function data it derives from. Vendored dependencies retain their own lic
 ---
 
 ### Notes on the recompiler's generated code
+The frontend, BAR renderer/HUD improvements, Controller Pak and rumble work, build tooling,
+and imported technical notes include contributions from
+[Daniel Gomes Vieira's fork](https://github.com/danielgomesvieira2000/beetle-adventure-racing-recomp)
+through `6497e672`. See `docs/FORK_REVIEW.md` for integration corrections and excluded changes.
+RecompFrontend's nested dependency notices and license files remain with its vendored source
+and are included in release packaging.
+
 N64Recomp (MIT) imposes no license on the C it generates; that output's effective license is
 governed by its **inputs** — here, the AGPL-3.0 decomp data. Do not treat `RecompiledFuncs/` as
 permissive.

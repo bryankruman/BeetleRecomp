@@ -11,7 +11,7 @@
 //   __osEnqueueThread / __osPopThread        N64 thread queue (ultramodern uses native threads)
 //   __osViSwapContext                        VI framebuffer swap (RT64 owns presentation)
 //   __osSiGetAccess/RelAccess/RawStartDma    controller (SI) bus + DMA
-//   osPiReadIo / __osPiRawReadIo             cartridge (PI) IO
+// Cartridge reads are implemented in bar_pi.cpp, and controller DMA is handled below.
 //   __osTimerInterrupt                       timer/scheduler tick
 // TODO(BAR): during runtime bring-up, give these real behavior (or reimplement the higher-level
 // callers so these are never reached). See docs/recomp notes.
@@ -23,15 +23,39 @@
 #include <cstring>  // BAR_BURST_ON_ROLL: memcpy/strchr/strcmp for the burst-capture spec parse
 
 #include "main/bar_cheats.h"   // bar_cheats::apply_frame (host-side RDRAM cheat pokes)
-#include "main/bar_input.hpp"  // bar::input::{port_connected, port_pak} (per-port SI responses)
+#include "main/bar_input.hpp"  // bar::input::mempak_{read,write} (per-port Controller Pak store)
 
 // Per-port input resolution lives in main.cpp / bar_input (they own the Win32 window / focus + SDL).
 extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y);
+// Which ports are occupied and what accessory each holds (main.cpp). Ask these, never bar::input
+// directly: in the frontend build bar::input knows no pads, so ports two to four would answer the
+// joybus NO_RESPONSE however many controllers are plugged in and assigned.
+bool bar_port_connected(int port);
+bar::input_config::PakType bar_port_pak(int port);
+// A motor start/stop written to a port's Rumble Pak (main.cpp): feeds the motor model and the build's rumble sink.
+extern "C" void bar_pak_motor(int port, bool on);
 
 // R6 diagnostic (env-gated BAR_DBG_SLIDE): trace the menu page-transition slide. Called from the
 // recompiled transition-start (func_selection_00402E98) and slide-draw (func_selection_00418800) to
 // see, per navigation, whether the slide draws over many frames or just 1-2 (instant). Remove after R6.
 extern "C" void bar_rt64_start_burst(const char *dir, int count);
+
+// Widescreen HUD anchoring (RT64 fork, src/hle/rt64_bar_hud.cpp): RT64 has to know when the game is
+// racing, because anchoring the HUD to the edges of the widened frame is right for the race HUD and
+// wrong for the menus, which are authored as whole 4:3 compositions. Only this side can read the
+// game's state out of RDRAM, so it pushes the answer in.
+extern "C" void bar_rt64_set_hud_anchor(int racing);
+
+// The same bridge, for the game state itself. The HUD inspector shows it in its header so that a
+// list of elements can be tied to the screen it came from -- 14 is the front-end menus, 2 the boot
+// attract, 5 a race.
+extern "C" void bar_rt64_set_game_state(unsigned int state);
+
+// And the pause flag. A paused race still reads currentGameState == 5, but the two screens want
+// opposite things from the orthographic layer: during a race it is the speedometer needle and is
+// pinned to the left edge, while the pause menu draws its darkened backdrop there and needs it
+// widened to the frame. See BarHud::orthoViewportOrigin.
+extern "C" void bar_rt64_set_hud_paused(int paused);
 extern "C" void bar_dbg_slide(const char* tag) {
     // Deterministic burst-capture trigger for the film-roll transition: when the animation loop
     // (func_filmroll_00400170) is entered, tell RT64 to capture the next N presents to dir/fNNNN.png.
@@ -117,6 +141,50 @@ uint8_t pak_data_crc(const uint8_t* data) {
 // Per-port RAM-echo cell for a Controller Pak's accessory-detect / bank-select region (block 0x400):
 // __osPfsSelectBank writes the bank byte here and reads it back, and the mempak detect is RAM-like.
 uint8_t g_detect_cell[4][32] = {};
+
+// TEMPORARY (BAR_DBG_PAK=1): trace Controller Pak detection. The game reports "No Controller Pak
+// present" even with a pak configured, so log every SI frame's command triple plus each pak
+// transaction, to find where osPfsInit's probe diverges from what we answer. Remove once fixed.
+bool bar_dbg_pak() {
+    static const bool on = std::getenv("BAR_DBG_PAK") != nullptr;
+    return on;
+}
+
+// What a Rumble Pak's identify register reads as.
+constexpr uint8_t kRumbleIdentify = 0x80;
+}
+
+// BAR_NO_RUMBLE_PAK=1: the pre-rumble behaviour, for A/B -- the identify register is a plain echo
+// again, and scripts/fix-recompiled.sh rule (I) leaves the game's accessory classifier unpatched.
+// Exported because that rule's injected C calls it too.
+extern "C" int bar_rumble_pak_enabled(void) {
+    static const bool on = [] {
+        const char* v = std::getenv("BAR_NO_RUMBLE_PAK");
+        return v == nullptr || *v == '\0' || *v == '0';
+    }();
+    return on ? 1 : 0;
+}
+
+// BAR_DBG_PAK diagnostic for rule (I): the uvcont classifier reports where its port-0 accessory record
+// and OSPfs live (overlay addresses are only known to the recompiled code), and the SI path below
+// logs the flags byte, pfs->status and pfs->activebank whenever one of them changes.
+static int32_t g_dbg_rec0 = 0;
+static int32_t g_dbg_pfs0 = 0;
+extern "C" void bar_rumble_dbg_addrs(int32_t rec0, int32_t pfs0) {
+    g_dbg_rec0 = rec0;
+    g_dbg_pfs0 = pfs0;
+}
+static void bar_rumble_dbg_state(uint8_t* rdram, const char* where) {
+    if (!bar_dbg_pak() || g_dbg_rec0 == 0) return;
+    static int last_flags = -1, last_status = -1, last_bank = -1;
+    const int flags  = (int)(uint8_t)MEM_BU(0x16, (int64_t)g_dbg_rec0);
+    const int status = (int)MEM_W(0x0, (int64_t)g_dbg_pfs0);
+    const int bank   = (int)(uint8_t)MEM_BU(0x65, (int64_t)g_dbg_pfs0);
+    if (flags != last_flags || status != last_status || bank != last_bank) {
+        std::fprintf(stderr, "[BAR_DBG_PAK] state(%s) flags=0x%02X pfs.status=0x%X pfs.activebank=0x%02X\n",
+                     where, flags, status, bank);
+        last_flags = flags; last_status = status; last_bank = bank;
+    }
 }
 
 // Handle a single READ_PAK/WRITE_PAK block for `port` at PIF format base `fb` (sign-extended). Uses the
@@ -125,7 +193,7 @@ static void bar_handle_pak(uint8_t* rdram, int64_t fb, int port, unsigned cmd) {
     const unsigned addr  = ((unsigned)(uint8_t)MEM_BU(4, fb) << 8) | (uint8_t)MEM_BU(5, fb);
     const int      block = (int)(addr >> 5);
     const bool     is_write = (cmd == 3);
-    const bar::input_config::PakType pak = bar::input::port_pak(port);
+    const bar::input_config::PakType pak = bar_port_pak(port);
 
     uint8_t data[32];
     if (is_write) {
@@ -134,21 +202,62 @@ static void bar_handle_pak(uint8_t* rdram, int64_t fb, int port, unsigned cmd) {
         for (int i = 0; i < 32; i++) data[i] = 0;                            // default read response
     }
 
-    if (pak == bar::input_config::PakType::RumblePak) {
-        if (block == kBlockDetect) {
-            if (!is_write) { for (int i = 0; i < 32; i++) data[i] = 0x80; }   // rumble-pak identify
-        } else if (block == kBlockRumble) {
-            if (is_write) bar::input::set_rumble(port, data[0] != 0);         // 0x01.. = motor on, 0x00 = off
+    // Serve BOTH accessories from the same transaction stream, rather than branching on the
+    // configured pak type. On real hardware the slot holds one accessory and BAR even prompts the
+    // player to swap ("Please remove the Rumble Pak and insert the Controller Pak"), but the two do
+    // not actually collide in the address space:
+    //
+    //   block <  0x400 (addr < 0x8000)  Controller Pak data   -> 32 KiB per-port save store
+    //   block == 0x400 (addr   0x8000)  bank-select / identify -> see below
+    //   block == 0x600 (addr   0xC000)  rumble motor on/off    -> host rumble
+    //
+    // So a single port can present a working Controller Pak and a working Rumble Pak at once, with
+    // no manual switching. Deliberate deviation from hardware.
+    //
+    // The identify register is where the two collide, and a plain echo is NOT enough. BAR's
+    // osMotorInit (func_8000EA94) selects bank 0xFE and returns PFS_ERR_DEVICE if 0xFE reads back,
+    // then selects 0x80 and requires 0x80. As in Hybrid Heaven (its src/si_pak.cpp): remember what
+    // was written, but read 0x80 whenever the last byte written is >= 0x80, which is how a Rumble
+    // Pak's identify register behaves. The Controller Pak's bank select writes small bank numbers,
+    // which still echo, and a Transfer Pak probe (0xFE, then 0x84 must read back) still fails.
+    //
+    // This alone changes nothing in BAR: the game's accessory classifier skips the motor probe on a
+    // port that already holds a Controller Pak. scripts/fix-recompiled.sh rule (I) patches that.
+    if (block == kBlockDetect) {
+        if (is_write) {
+            std::memcpy(g_detect_cell[port], data, 32);
+        } else {
+            std::memcpy(data, g_detect_cell[port], 32);
+            if (bar_rumble_pak_enabled() && g_detect_cell[port][31] >= kRumbleIdentify)
+                std::memset(data, kRumbleIdentify, 32);
         }
-    } else if (pak == bar::input_config::PakType::ControllerPak) {
-        if (block == kBlockDetect) {
-            if (is_write) std::memcpy(g_detect_cell[port], data, 32);         // bank-select / detect echo
-            else          std::memcpy(data, g_detect_cell[port], 32);
-        } else if (block < kBlockDetect) {
-            if (is_write) bar::input::mempak_write(port, block, data);        // 32 KiB save store
-            else          bar::input::mempak_read(port, block, data);
+    } else if (block < kBlockDetect) {
+        // Only a Controller Pak has a data area. A port holding just a Rumble Pak (players two to
+        // four) answers the way the real accessory does -- zeros, writes ignored -- so BAR's
+        // osPfsInitPak finds no filesystem there, its classifier falls through to the motor probe,
+        // and no mempak_pN.pak is created for a port that has no save pak.
+        if (pak == bar::input_config::PakType::ControllerPak) {
+            const bool ok = is_write ? bar::input::mempak_write(port, block, data)
+                                     : bar::input::mempak_read(port, block, data);
+            if (!ok) {
+                MEM_B(2, fb) = static_cast<int8_t>((MEM_BU(2, fb) & 0x3F) | 0x80);
+                return; // Report a channel error instead of acknowledging an unreadable save.
+            }
         }
-        // blocks between the pak data area and the accessory region: leave zero (out of range).
+    } else if (block == kBlockRumble && bar_rumble_pak_enabled()) {
+        if (is_write) {
+            bar_pak_motor(port, data[0] != 0);   // main.cpp: motor model, then the build's own sink
+            if (bar_dbg_pak())
+                std::fprintf(stderr, "[BAR_DBG_PAK] *** RUMBLE motor write port=%d value=0x%02X ***\n",
+                             port, data[0]);
+        }
+    }
+    // Blocks between the data area and the accessory region are out of range: leave zero.
+
+    if (bar_dbg_pak()) {
+        std::fprintf(stderr, "[BAR_DBG_PAK] %s port=%d addr=0x%04X block=0x%X pak=%d data[0..3]=%02X%02X%02X%02X\n",
+                     is_write ? "WRITE" : "READ", port, addr, block, (int)pak,
+                     data[0], data[1], data[2], data[3]);
     }
 
     if (!is_write) {
@@ -183,7 +292,22 @@ extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
     // BAR sometimes calls __osSiRawStartDma with a corrupt a1 (observed pifram=0x????21F0 — low bits of
     // the real PIF RAM but a garbage high half) -> MEM_BU faults reading it. Only touch the buffer when
     // a1 is a sane RDRAM (KSEG0, 8 MiB) address; otherwise just post the SI event so we never AV.
-    const bool valid_pifram = ((pifram - 0x80000000u) < 0x00800000u);
+    const bool valid_pifram = ((pifram - 0x80000000u) <= 0x00800000u - 64u);
+    bar_rumble_dbg_state(rdram, direction == 0 ? "si-read" : "si-write");
+
+    // TEMPORARY (BAR_DBG_PAK=1): dump every DISTINCT SI frame shape, both directions, before any
+    // classification. The pak-frame classifier below may simply be failing to recognise BAR's pak
+    // frames; this shows the raw truth. Deduped against the last logged signature so the per-frame
+    // button poll doesn't flood the log.
+    if (bar_dbg_pak() && valid_pifram) {
+        const int64_t pf = (int32_t)ctx->r5;
+        char sig[80]; int n = 0;
+        n += std::snprintf(sig + n, sizeof(sig) - n, "d%d:", (int)direction);
+        for (int k = 0; k < 24 && n < (int)sizeof(sig) - 3; k++)
+            n += std::snprintf(sig + n, sizeof(sig) - n, "%02X", (unsigned)MEM_BU(0, pf + k));
+        static std::string last;
+        if (last != sig) { last = sig; std::fprintf(stderr, "[BAR_DBG_SI] %s\n", sig); }
+    }
     // Drive the state machine for testing: BAR_FORCESTATE="frame:state frame:state ..." writes
     // gGameSettings->gameStateFlag (@0x08) once at each listed SI-frame; the game's main loop then
     // calls uvSetGameState(state). Lets us reach later screens / a race without the (unread) buttons.
@@ -212,6 +336,147 @@ extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
           ++n; if (t0 == 0) t0 = ms;
           if (ms - t0 >= 1000) { std::fprintf(stderr, "[BAR_DBG_FPS] %lu SI-polls/sec (== menu loop rate)\n", n); n = 0; t0 = ms; }
       } }
+    // TEMPORARY (BAR_DBG_DIV=1): log BAR's whole-frame divider D_8001F7C0 alongside the game state.
+    // The timeline system is delta-timed and measured correct (~1/60), so anything running fast must
+    // advance a fixed amount per RENDERED frame. If the console runs menus at divider 2 (30 fps) and
+    // we render every frame (divider 1), those animations play at double speed. Base-game address, so
+    // it is plain RDRAM and readable directly. Remove once diagnosed.
+    { static const bool dbg = std::getenv("BAR_DBG_DIV") != nullptr;
+      if (dbg) {
+          static int32_t last_div = -0x7FFF, last_st = -0x7FFF;
+          const int32_t div = (int32_t)MEM_W(0, (int64_t)(int32_t)0x8001F7C0);
+          const int32_t st  = (int32_t)MEM_W(0XA4, (int64_t)(int32_t)0x80025CF0);
+          if (div != last_div || st != last_st) {
+              std::fprintf(stderr, "[BAR_DBG_DIV] frame divider = %d   (currentGameState = %d)\n", div, st);
+              last_div = div; last_st = st;
+          }
+      } }
+    // Tell RT64 whether the racing HUD is on screen, so it anchors it to the edges of the widened
+    // frame (see the extern above). Two fields of gGameSettings (0x80025CF0) are needed, both
+    // measured by running the headless race recipe with BAR_HUD_TRACE=1:
+    //
+    //   currentGameState (+0xA4) is 14 through the Controller Pak prompts and every front-end menu,
+    //   2 for the boot attract sequence, and 5 for a race.
+    //
+    //   raceState (+0x88) is the race's phase. State 5 alone is not enough: it also covers the
+    //   track-loading screen ("Coventry Cove", with its wipe tiles and its record-time text) and the
+    //   "Get Ready" card, which are full 4:3 compositions and come apart if pulled to the edges.
+    //
+    // The game reads raceState as an s16 -- the word's high half, so the values that arrive here as
+    // 0x10000 and 0x30000 are phases 1 and 3 -- and func_plyr_00402268 in the decomp runs the player
+    // update for phase 0 OR phase 3. That is the game's own grouping for "the car is on the track",
+    // and it is exactly the condition wanted here: phase 1 is the loading and "Get Ready" cards with
+    // no HUD, phase 3 is the countdown with the HUD already drawn, phase 0 is the race running.
+    // Anchoring only phase 0 left the HUD at its 4:3 positions through the whole countdown and then
+    // snapped it out to the edges the moment the player got control.
+    {
+        const int64_t GS = (int64_t)(int32_t)0x80025CF0;
+        const int32_t st = (int32_t)MEM_W(0XA4, GS);          // currentGameState
+        const int32_t phase = (int32_t)MEM_H(0X88, GS);       // raceState, as the game reads it
+        const int32_t paused = (int32_t)MEM_H(0X86, GS);      // pauseFlag
+        static const bool trace = std::getenv("BAR_HUD_TRACE") != nullptr;
+        if (trace) {
+            static int32_t lastS = -0x7FFF, lastR = -0x7FFF, lastP = -0x7FFF, lastRp = -0x7FFF, lastCars = 0x7FFF;
+            const int32_t rp = (int32_t)MEM_H(0X9C, GS);          // introReplayState
+            const int32_t cars = (int32_t)MEM_W(0X98, GS);        // per-car "still racing" bytes (inferred)
+            if ((st != lastS) || (phase != lastR) || (paused != lastP) || (rp != lastRp) || (cars != lastCars)) {
+                lastS = st; lastR = phase; lastP = paused; lastRp = rp; lastCars = cars;
+                std::fprintf(stdout, "[hud] state=%d racePhase=%d paused=%d replay=%d cars=%08X players=%d\n", st, phase,
+                             paused, rp, (unsigned)cars, (int)MEM_W(0X24, GS));
+                std::fflush(stdout);
+            }
+        }
+        // Phase 0 is also what the field still reads at the moment currentGameState becomes 5, before
+        // the race has set it -- a stale value from before, over the film-roll wipe out of the Rumble
+        // Pak prompt. So phase 0 only counts once this race has been seen setting up (phase 1 or 3),
+        // which is reset whenever the game state changes.
+        static int32_t lastState = -0x7FFF;
+        static bool sawSetup = false;
+        if (st != lastState) {
+            lastState = st;
+            sawSetup = false;
+        }
+        if ((phase == 1) || (phase == 3)) {
+            sawSetup = true;
+        }
+
+        // The results screen is state 5 / raceState 0 as well -- the same pair as a running race --
+        // because it plays a replay of the race behind it, and the replay runs the race's own
+        // countdown and race phases again (3, then 0). Anchoring it pulled the results layout apart:
+        // "New Record" and "You set a new track record!" split into pieces, row 5 thrown to both
+        // edges. introReplayState (+0x9C, s16) is what tells them apart. Measured 2026-09-19 with a
+        // logger over gGameSettings (BAR_DBG_GS, removed): 0 through loading, countdown and race;
+        // 0 -> 1 when the results screen appears, and 1 throughout it; 1 and 2 in the attract
+        // sequence, which is also a replay. So: no HUD anchoring while a replay is playing.
+        const int32_t replay = (int32_t)MEM_H(0X9C, GS);      // introReplayState
+        //
+        // The race result screen comes BEFORE the replay starts, so it needs a second condition. The
+        // same logger showed gGameSettings + 0x98 set to 01010101 during loading, then clearing one
+        // byte at a time as the race ends (00010101, then 00000000), and only after that did the
+        // replay flag rise. Inferred, not decoded: one "still racing" byte per car, byte N being
+        // player N+1 -- byte 0 cleared first in a race Daniel won. So the HUD is anchored while any
+        // human player (the first numPlayers bytes, numPlayers at +0x24) is still racing.
+        const int32_t numPlayers = (int32_t)MEM_W(0X24, GS);
+        bool humanRacing = false;
+        for (int i = 0; (i < numPlayers) && (i < 4); i++) {
+            humanRacing |= (MEM_BU(0X98 + i, GS) != 0);
+        }
+        bar_rt64_set_hud_anchor(((st == 5) && sawSetup && ((phase == 0) || (phase == 3)) && (replay == 0) && humanRacing) ? 1 : 0);
+        bar_rt64_set_game_state((unsigned int)st);
+        bar_rt64_set_hud_paused((paused != 0) ? 1 : 0);
+
+        // Attract/intro frame cap -- using the game's OWN frame limiter.
+        //
+        // currentGameState 2 is the boot attract sequence: a canned replay run through the game's
+        // race simulation. Here its cars drive at double speed and miss their scripted events, which
+        // is what a per-frame-stepped simulation does when handed twice the frames it was authored
+        // for.
+        //
+        // D_8001F7C0 is BAR's own minimum frame length, in VI fields, and it is the right lever. In
+        // the scheduler (lib/bar-decomp/src/sched.c), _uvScDoneGfx defers the buffer swap when fewer
+        // than D_8001F7C0 retraces have elapsed since the last frame was released:
+        //
+        //     if (D_8001F7C4 < D_8001F7C0) { D_8002F250 = (D_8001F7C0 - D_8001F7C4) + 1; }
+        //     else                         { D_8002F250 = 1; osViSwapBuffer(...); }
+        //
+        // with D_8001F7C4 counting retraces and the countdown releasing the frame. It ships as 0, so
+        // nothing is ever deferred and the sequence advances as fast as our tasks complete -- 60 Hz,
+        // where the console's heavier RCP gave it 30.
+        //
+        // Mind the trailing "+ 1": the field is not a field COUNT, it is one less than the frame
+        // length. A frame lasts D_8001F7C0 + 1 fields, which is why the stock 0 gives 60 Hz rather
+        // than stalling. So 30 Hz is 1, not 2 -- writing 2 yields three fields, i.e. 20 Hz, which is
+        // visibly too slow. Hence the -1 below.
+        //
+        // Critically this gates the GFX path only. _uvScDoneAud is a separate completion path, so the
+        // audio task, its buffer generation and the music sequencer's tempo all keep running at full
+        // rate. That is the whole reason this is preferred over dividing the VI retrace itself
+        // (ultramodern::set_vi_divider), which slowed the game loop as a whole and therefore halved
+        // the music's tempo and starved the audio queue -- see docs/KNOWN_ISSUES.md.
+        //
+        // BAR_ATTRACT_HZ overrides the target (60 disables the cap).
+        {
+            static const int attract_frames = [] {
+                const char* e = std::getenv("BAR_ATTRACT_HZ");
+                const int hz = (e != nullptr) ? std::atoi(e) : 30;
+                // Frame length in fields is the stored value + 1, so subtract one; 0 is stock 60 Hz.
+                return (hz > 0 && hz < 60) ? ((60 / hz) - 1) : 0;
+            }();
+
+            // Only write on a change: the value is the game's, and there is no reason to fight it
+            // every frame.
+            const int want = (st == 2) ? attract_frames : 0;
+            static int applied = -1;
+            if (want != applied) {
+                applied = want;
+                MEM_W(0, (int64_t)(int32_t)0x8001F7C0) = want;
+                if (std::getenv("BAR_DBG_STATE") != nullptr) {
+                    std::fprintf(stderr, "[BeetleRecomp] frame limiter D_8001F7C0 -> %d "
+                                         "field(s) in state %d\n", want, st);
+                }
+            }
+        }
+    }
     // R6 tooling (env-gated BAR_DBG_STATE): log currentGameState (gGameSettings+0xA4) transitions so a
     // BAR_AUTOPLAY script can be tuned/verified headlessly (boot -> logos -> intro -> menu=0xE -> race=2).
     { static const bool dbg = std::getenv("BAR_DBG_STATE") != nullptr;
@@ -240,6 +505,65 @@ extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
         // __OSContRamReadFormat block at offset `channel`. Identify it by the (cmd, txsize, rxsize)
         // triple + all-zero leading filler, then service the pak (mempak / rumble) and skip the button
         // loop (a pak transaction carries no button blocks).
+        // SHORT-format single command (libultra's __OSContRequesFormatShort / the pak request path):
+        // txsize@0, rxsize@1, cmd@2, payload@3 — i.e. NO leading dummy byte, unlike the 8-byte
+        // per-port button/status blocks handled below (dummy@0, txsize@1, rxsize@2, cmd@3).
+        //
+        // BAR issues its Controller Pak status query in this layout ("01 03 00 FF FF FF FE"). Reading
+        // cmd at offset 3 sees 0xFF, so the old code skipped it and left the 0xFF response placeholders
+        // untouched — the game then reports the pak unusable ("error creating game note"). Answer it
+        // here, and route short-format READ_PAK/WRITE_PAK through the same handler by passing a base
+        // one byte earlier, which realigns its dummy-relative offsets (addr@4,5 -> 3,4; data@6 -> 5).
+        //
+        // The status query is per port: __osPfsRequestOneChannel writes one 0x00 skip byte per channel
+        // before it ("00 01 03 00 ..." is port two). Only channel 0 used to be recognised, so ports two
+        // to four read back the 0xFF placeholders -- CARD_ON together with ADDR_CRC_ER, which
+        // __osPfsGetStatus reports as PFS_ERR_CONTRFAIL -- and their Rumble Paks were never found.
+        // Count the skip bytes to find the port. The 8-byte button/status blocks cannot be mistaken
+        // for this: their dummy byte is CONT_CMD_NOP (0xFF), never 0x00.
+        {
+            int s_ch = 0;
+            while (s_ch < 3 && MEM_BU(s_ch, pifram_se) == 0x00) s_ch++;
+            const unsigned s_tx  = (unsigned)MEM_BU(s_ch + 0, pifram_se);
+            const unsigned s_rx  = (unsigned)MEM_BU(s_ch + 1, pifram_se);
+            const unsigned s_cmd = (unsigned)MEM_BU(s_ch + 2, pifram_se);
+
+            if (s_cmd == 0 && s_tx == 0x01 && s_rx == 0x03) {
+                if (bar_port_connected(s_ch)) {
+                    const bool has_pak = bar_port_pak(s_ch) != bar::input_config::PakType::None;
+                    MEM_B(s_ch + 3, pifram_se) = 0x05;                   // typeh
+                    MEM_B(s_ch + 4, pifram_se) = 0x00;                   // typel -> CONT_TYPE_NORMAL
+                    MEM_B(s_ch + 5, pifram_se) = has_pak ? (int8_t)0x01 : (int8_t)0x00;   // CONT_CARD_ON
+                    if (bar_dbg_pak()) std::fprintf(stderr, "[BAR_DBG_PAK] short STATUS port=%d -> pak=%d\n", s_ch, (int)has_pak);
+                } else {
+                    MEM_B(s_ch + 1, pifram_se) = (int8_t)(0x80 | 0x03);  // rxsize: CHNL NO_RESPONSE error
+                    if (bar_dbg_pak()) std::fprintf(stderr, "[BAR_DBG_PAK] short STATUS port=%d -> no controller\n", s_ch);
+                }
+                ultramodern::send_si_message();
+                return;
+            }
+        }
+        {
+            int port = 0;
+            while (port < 3 && MEM_BU(port, pifram_se) == 0x00) ++port;
+            const unsigned s_tx  = (unsigned)MEM_BU(port, pifram_se);
+            const unsigned s_rx  = (unsigned)MEM_BU(port + 1, pifram_se);
+            const unsigned s_cmd = (unsigned)MEM_BU(port + 2, pifram_se);
+            const bool has_pak = bar_port_connected(port) &&
+                bar_port_pak(port) != bar::input_config::PakType::None;
+
+            if ((s_cmd == 2 && s_tx == 0x03 && s_rx == 0x21) ||         // READ_PAK
+                (s_cmd == 3 && s_tx == 0x23 && s_rx == 0x01)) {
+                if (has_pak) {
+                    bar_handle_pak(rdram, pifram_se + port - 1, port, s_cmd);
+                } else {
+                    MEM_B(port + 1, pifram_se) = static_cast<int8_t>(s_rx | 0x80);
+                }
+                ultramodern::send_si_message();
+                return;
+            }
+        }
+
         int pak_ch = -1; unsigned pak_cmd = 0;
         for (int ch = 0; ch < 4; ch++) {
             const int64_t fb = pifram_se + ch;
@@ -253,9 +577,25 @@ extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
             }
         }
 
+        if (bar_dbg_pak()) {
+            // Log the raw command triples for all four 8-byte slots plus the first bytes, so a pak
+            // frame we FAILED to classify still shows up here (that is the suspected failure mode).
+            std::fprintf(stderr, "[BAR_DBG_PAK] pak_ch=%d cmd=%u |", pak_ch, pak_cmd);
+            for (int ch = 0; ch < 4; ch++) {
+                const int64_t fb = pifram_se + (int64_t)(ch * 8);
+                std::fprintf(stderr, " [%d]tx=%02X rx=%02X c=%02X", ch,
+                             (unsigned)MEM_BU(1, fb), (unsigned)MEM_BU(2, fb), (unsigned)MEM_BU(3, fb));
+            }
+            std::fprintf(stderr, " | raw:");
+            for (int k = 0; k < 12; k++) std::fprintf(stderr, "%02X", (unsigned)MEM_BU(0, pifram_se + k));
+            std::fprintf(stderr, "\n");
+        }
+
         if (pak_ch >= 0) {
-            if (bar::input::port_pak(pak_ch) != bar::input_config::PakType::None) {
+            if (bar_port_connected(pak_ch) && bar_port_pak(pak_ch) != bar::input_config::PakType::None) {
                 bar_handle_pak(rdram, pifram_se + pak_ch, pak_ch, pak_cmd);
+            } else {
+                MEM_B(pak_ch + 2, pifram_se) = static_cast<int8_t>(MEM_BU(pak_ch + 2, pifram_se) | 0x80);
             }
         } else {
             // The button/status poll packs one 8-byte block per port (all four, cmd 0/1). Answer each port
@@ -265,12 +605,12 @@ extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
                 const int64_t blk = pifram_se + (int64_t)(i * 8);
                 const unsigned cmd = (unsigned)MEM_BU(3, blk);   // CONT_CMD_* the game packed
                 if (cmd != 0 && cmd != 1) continue;              // not status/button -> leave as-is
-                if (!bar::input::port_connected(i)) {            // unplugged / no device assigned
+                if (!bar_port_connected(i)) {            // unplugged / no device assigned
                     MEM_B(2, blk) = (int8_t)0x80;                // rxsize: CHNL NO_RESPONSE error
                     continue;
                 }
                 if (cmd == 0) {                  // CONT_CMD_REQUEST_STATUS (controller detect)
-                    const bool has_pak = bar::input::port_pak(i) != bar::input_config::PakType::None;
+                    const bool has_pak = bar_port_pak(i) != bar::input_config::PakType::None;
                     MEM_B(2, blk) = 0x03;        // rxsize=3, no channel error
                     MEM_B(4, blk) = 0x05;        // typeh  -> type = typel<<8|typeh = 0x0005 (CONT_TYPE_NORMAL)
                     MEM_B(5, blk) = 0x00;        // typel
@@ -291,7 +631,6 @@ extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
     ultramodern::send_si_message();
 }
 
-BAR_OS_STUB(osPiReadIo_recomp)
-BAR_OS_STUB(__osPiRawReadIo_recomp)
+// Cartridge reads, including the recovered SDK spelling, live in bar_pi.cpp.
 BAR_OS_STUB(__osPopThread_recomp)
 BAR_OS_STUB(__osEnqueueThread_recomp)

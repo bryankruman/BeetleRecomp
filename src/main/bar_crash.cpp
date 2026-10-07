@@ -2,9 +2,9 @@
 // an access violation, walks the faulting thread's stack via DbgHelp (needs BeetleRecomp.pdb next to the exe)
 // and prints symbol names to stderr. Used to locate where the cooperative-preemption yield faults.
 //
-// Windows-only: this uses DbgHelp + SetUnhandledExceptionFilter, which have no portable equivalent.
-// CMake compiles this TU on every platform, so the whole body is guarded — on non-Windows it becomes
-// an empty object, and main.cpp only calls bar_install_crash_handler() under #ifdef _WIN32.
+// Windows uses DbgHelp + SetUnhandledExceptionFilter. Linux has its own handler below (a fatal-signal
+// handler printing backtrace_symbols_fd offsets for addr2line). Other platforms get an empty object, and
+// main.cpp calls bar_install_crash_handler() only on Windows and Linux.
 #ifdef _WIN32
 #include <cstdio>
 #include <windows.h>
@@ -48,4 +48,37 @@ static LONG WINAPI bar_crash_filter(EXCEPTION_POINTERS* ep) {
 void bar_install_crash_handler() {
     SetUnhandledExceptionFilter(bar_crash_filter);
 }
-#endif // _WIN32
+#elif defined(__linux__)
+// Linux: a fatal-signal handler printing the faulting address and a backtrace. backtrace_symbols_fd
+// writes "exe(function+0x..)" or "exe(+0x..)"; the offsets resolve to function and line with
+//     addr2line -f -C -e BeetleRecomp 0x<offset>
+// (or llvm-symbolizer). Only async-signal-tolerant calls in the handler, then the default action runs.
+#include <csignal>
+#include <cstdio>
+#include <cstring>
+#include <execinfo.h>
+#include <initializer_list>
+#include <unistd.h>
+
+static void bar_crash_signal(int sig, siginfo_t *info, void *) {
+    char line[160];
+    int n = std::snprintf(line, sizeof(line), "\n[BeetleRecomp] *** CRASH signal=%d (%s) addr=%p ***\n",
+        sig, strsignal(sig), (info != nullptr) ? info->si_addr : nullptr);
+    if (n > 0) { ssize_t ignored = write(STDERR_FILENO, line, size_t(n)); (void)ignored; }
+    void *frames[48];
+    int count = backtrace(frames, 48);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void bar_install_crash_handler() {
+    struct sigaction action {};
+    action.sa_sigaction = bar_crash_signal;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&action.sa_mask);
+    for (int sig : { SIGSEGV, SIGBUS, SIGILL, SIGFPE }) {
+        sigaction(sig, &action, nullptr);
+    }
+}
+#endif // _WIN32 / __linux__

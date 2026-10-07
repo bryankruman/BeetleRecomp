@@ -17,6 +17,9 @@
 #include <vector>
 
 #include <SDL.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "game/config.hpp"   // bar::config::get_app_config_directory (mempak file location)
 
@@ -288,12 +291,32 @@ void flush_rumble() {
     const PadResolution res = resolve_pads(*cfg);
     for (int port = 0; port < 4; port++) {
         const PortConfig& pc = cfg->ports[port];
-        if (!(pc.connected && pc.device.type == DeviceType::Gamepad && pc.pak == PakType::RumblePak)) continue;
+        // Any connected gamepad may rumble, regardless of which pak the port is configured with.
+        // The SI layer serves the Controller Pak data area and the rumble motor register from the
+        // same transaction stream (see bar_handle_pak), so a port presents both accessories at once
+        // and the player never has to swap. A pad that cannot rumble is simply a no-op below.
+        if (!(pc.connected && pc.device.type == DeviceType::Gamepad && pc.pak != PakType::None)) continue;
         const int idx = res.port_pad[port];   // same routing the sampler uses (uid-exact, GUID fallback)
         if (idx < 0) continue;
         touched[idx] = true;
         if (g_rumble_want[port].load(std::memory_order_relaxed)) want[idx] = true;
     }
+
+    // Auto pad: mirror the input auto-fold above. A keyboard-driven port 0 with an unclaimed
+    // controller also receives port 0's rumble, so simply plugging a pad in gives both steering and
+    // vibration with no assignment step — which matters now that a port presents a Controller Pak
+    // and a Rumble Pak at once, and doubly so while there is no Controls UI to assign devices in.
+    if (cfg->ports[0].connected && cfg->ports[0].device.type == DeviceType::Keyboard
+        && cfg->ports[0].pak != PakType::None) {
+        for (int i = 0; i < (int)g_pads.size() && i < 16; i++) {
+            if (!res.claimed[i]) {
+                touched[i] = true;
+                if (g_rumble_want[0].load(std::memory_order_relaxed)) want[i] = true;
+                break;
+            }
+        }
+    }
+
     for (int i = 0; i < (int)g_pads.size() && i < 16; i++) {
         if (!touched[i]) { last_on[i] = false; continue; }
         if (want[i] != last_on[i]) {
@@ -364,11 +387,11 @@ bool port_connected(int port) {
     return pc.connected && pc.device.type != DeviceType::None;
 }
 
-PakType port_pak(int port) {
+PakType port_pak(int port, bool require_connected) {
     if (port < 0 || port >= 4) return PakType::None;
     auto cfg = cfg_snapshot();
     const PortConfig& pc = cfg->ports[port];
-    if (!(pc.connected && pc.device.type != DeviceType::None)) return PakType::None;
+    if (require_connected && !(pc.connected && pc.device.type != DeviceType::None)) return PakType::None;
     return pc.pak;
 }
 
@@ -392,6 +415,7 @@ std::mutex g_mempak_mutex;
 std::array<std::vector<uint8_t>, 4> g_mempak;       // empty until first touched
 std::array<bool, 4> g_mempak_loaded{};
 std::array<bool, 4> g_mempak_dirty{};
+std::array<bool, 4> g_mempak_valid{};
 
 // __osSumcalc / __osIdCheckSum ported from lib/bar-decomp tools/ultralib/src/io/{contpfs.c} (2.0I).
 uint16_t pfs_sumcalc(const uint8_t* p, int len) {
@@ -440,27 +464,52 @@ fs::path mempak_path(int port) {
     return bar::config::get_app_config_directory() / ("mempak_p" + std::to_string(port) + ".pak");
 }
 
-void mempak_ensure_loaded(int port) {   // caller holds g_mempak_mutex
-    if (g_mempak_loaded[port]) return;
+bool persist_mempak(int port) {   // caller holds g_mempak_mutex
+    const fs::path path = mempak_path(port);
+    fs::path temp = path;
+    temp += ".tmp";
+    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(g_mempak[port].data()), kMempakSize);
+    out.flush();
+    if (!out) return false;
+    out.close();
+    if (!out) return false;
+#ifdef _WIN32
+    return MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    std::error_code ec;
+    fs::rename(temp, path, ec);
+    return !ec;
+#endif
+}
+
+bool mempak_ensure_loaded(int port) {   // caller holds g_mempak_mutex
+    if (g_mempak_loaded[port]) return g_mempak_valid[port];
     g_mempak[port].assign(kMempakSize, 0);
     const fs::path p = mempak_path(port);
     std::error_code ec;
-    bool ok = false;
-    if (fs::exists(p, ec)) {
-        std::ifstream in(p, std::ios::binary);
-        if (in) {
-            in.read(reinterpret_cast<char*>(g_mempak[port].data()), kMempakSize);
-            if (in.gcount() == kMempakSize) ok = true;
-        }
-    }
-    if (!ok) {
-        format_empty_mempak(g_mempak[port]);
-        std::ofstream out(p, std::ios::binary | std::ios::trunc);
-        if (out) out.write(reinterpret_cast<const char*>(g_mempak[port].data()), kMempakSize);
-        std::fprintf(stderr, "[BeetleRecomp] created Controller Pak \"%s\"\n", p.string().c_str());
-    }
+    const bool exists = fs::exists(p, ec);
+    if (ec) return false;
     g_mempak_loaded[port] = true;
-    g_mempak_dirty[port] = false;
+    if (exists) {
+        std::ifstream in(p, std::ios::binary);
+        const auto size = fs::file_size(p, ec);
+        if (in && !ec && size == kMempakSize) {
+            in.read(reinterpret_cast<char*>(g_mempak[port].data()), kMempakSize);
+            g_mempak_valid[port] = in.good() && in.gcount() == kMempakSize;
+        }
+        if (!g_mempak_valid[port]) {
+            std::fprintf(stderr, "[BeetleRecomp] cannot read 32 KiB Controller Pak %s; existing file preserved\n", p.string().c_str());
+            return false;
+        }
+    } else {
+        format_empty_mempak(g_mempak[port]);
+        g_mempak_valid[port] = true;
+        g_mempak_dirty[port] = true;
+        if (persist_mempak(port)) g_mempak_dirty[port] = false;
+    }
+    return true;
 }
 
 } // namespace
@@ -468,23 +517,29 @@ void mempak_ensure_loaded(int port) {   // caller holds g_mempak_mutex
 namespace bar::input {
 
 bool mempak_read(int port, int block, uint8_t out[32]) {
-    if (port < 0 || port >= 4 || block < 0) return false;
+    if (port < 0 || port >= 4 || block < 0 || block >= kMempakSize / 32 || out == nullptr) return false;
     const int off = block * 32;
     if (off + 32 > kMempakSize) return false;
     std::lock_guard<std::mutex> lk(g_mempak_mutex);
-    mempak_ensure_loaded(port);
+    if (!mempak_ensure_loaded(port)) return false;
     std::memcpy(out, &g_mempak[port][off], 32);
     return true;
 }
 
 bool mempak_write(int port, int block, const uint8_t in[32]) {
-    if (port < 0 || port >= 4 || block < 0) return false;
+    if (port < 0 || port >= 4 || block < 0 || block >= kMempakSize / 32 || in == nullptr) return false;
     const int off = block * 32;
     if (off + 32 > kMempakSize) return false;
     std::lock_guard<std::mutex> lk(g_mempak_mutex);
-    mempak_ensure_loaded(port);
-    std::memcpy(&g_mempak[port][off], in, 32);
-    g_mempak_dirty[port] = true;
+    if (!mempak_ensure_loaded(port)) return false;
+    // Only a real change marks the pak dirty (as Hybrid Heaven's controller_pak.cpp does). With the
+    // Rumble Pak served on the same slot the game re-runs osPfsInitPak repeatedly (docs/technical/05), and its
+    // inode-backup repair rewrites identical bytes each time; without this the file was rewritten
+    // on every flush.
+    if (std::memcmp(&g_mempak[port][off], in, 32) != 0) {
+        std::memcpy(&g_mempak[port][off], in, 32);
+        g_mempak_dirty[port] = true;
+    }
     return true;
 }
 
@@ -492,12 +547,8 @@ void mempak_flush_all() {
     std::lock_guard<std::mutex> lk(g_mempak_mutex);
     for (int port = 0; port < 4; port++) {
         if (!g_mempak_loaded[port] || !g_mempak_dirty[port]) continue;
-        const fs::path p = mempak_path(port);
-        std::ofstream out(p, std::ios::binary | std::ios::trunc);
-        if (out) {
-            out.write(reinterpret_cast<const char*>(g_mempak[port].data()), kMempakSize);
-            g_mempak_dirty[port] = false;
-        }
+        // Clear dirty only after a complete write and atomic replacement; retry failures later.
+        if (persist_mempak(port)) g_mempak_dirty[port] = false;
     }
 }
 

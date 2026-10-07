@@ -1,0 +1,966 @@
+> Integration note (October 6, 2026): the findings below are Daniel’s historical fork evidence. This working tree is still awaiting full game verification; see [FORK_REVIEW.md](FORK_REVIEW.md).
+
+# Known Issues
+
+Open defects with what has already been ruled out, so nobody re-runs a dead experiment.
+Add the negative results, not just the leads — they are the expensive part.
+
+## Resolved during integration — permanently black fast startup
+
+A cached game could start before the runtime's first video interrupt. BAR checks the
+current framebuffer once during graphics-module initialization and only unblanks for
+`0x100000`; the failing build returned zero. The game still generated correct display
+lists and accepted input, so successful builds and graphics-command traces did not
+establish visible output. Disabling generated-C inlining did not repair the failure.
+
+The runtime now initializes both video states before starting its worker threads and
+uses its existing mutex for retrace state swaps and framebuffer getters. The actual
+Windows executable returned the required initial address, rendered five independent
+fast starts, drove Coventry Cove and rendered pause in a 190-second run. The original
+save hash stayed unchanged. See `FORK_REVIEW.md` for proof locations and broader gates.
+
+---
+
+## RESOLVED -- the boot splash was half widescreen, half 4:3
+
+Reported by Daniel 2026-09-20: during the boot logo sequence, the **Volkswagen** splash between the
+Nintendo 64 and Electronic Arts logos rendered with the top of the picture filling the 16:9 frame while
+a band at the bottom stayed pillarboxed 4:3, in the same frame.
+
+**Root cause.** `rt64_framebuffer_renderer.cpp`, the per-rectangle aspect decision:
+
+```c
+const bool coversScissorWidth = (rect.ulx <= scissor.ulx) && (rect.lrx >= scissor.lrx);
+if ((tileCopiesUsed || coversScissorWidth || rectAspect == STRETCH) && (rectAspect != ADJUST)) {
+    invRatioScale = 1.0f;          // treat as a backdrop: stretch across the widened frame
+}
+```
+
+BAR draws the splash photo as **full-width strips six pixels tall**, one per row
+(`px=(0.0,0.0)-(320.0,6.0)`). Every strip spans the scissor, so every strip matched "this is a
+backdrop" and was stretched. The bottom of the **same picture** is drawn as 64x32 tiles, which do not
+span the width, so those were compensated and stayed 4:3. Hence half the frame widescreen and half not.
+
+**The fix.** A slice of a picture is not a backdrop. A full-width **textured** rectangle
+in **state 14** (boot/menu) loses automatic backdrop stretching when it is less than a
+quarter of the scissor height. A 6/240 strip is 2.5%; a full-screen backdrop spans the
+whole scissor. Fill-cycle rectangles and rectangles outside the boot/menu state retain
+the previous rule, so course haze and letterbox bars still stretch. Explicit aspect
+overrides still apply. `BAR_SLICE_STRETCH=1` restores the upstream rule.
+
+**THREE discriminators were tried before that, and Daniel found each one broken on the next screen he
+checked. Do not retry them:**
+
+| Attempt | What it fixed | What it broke |
+|---|---|---|
+| height only | the splash | Mount Mayhem's haze, pillarboxed mid-race |
+| `+ !racing()` | the in-race haze | the haze on the **pre-race course overview**, which is not a race either |
+| `+ tex only` (dropping `racing()`) | -- | the haze in **both** the race and the overview |
+
+The measurement that settled it, with `BAR_DBG_SLICE=1` on the overview:
+
+```
+[slice] ... height=3 scissorH=240 kind=tex state=14   <- a splash slice
+[slice] ... height=3 scissorH=240 kind=tex state=5    <- the overview/race haze
+```
+
+**The overview's haze is a full-width TEXTURED rectangle three pixels tall -- structurally identical to
+a splash slice.** Height and kind cannot tell them apart; only the game state can. The in-race haze that
+looked correct under the `racing()` gate was the separate `fill` at height 240, which was never
+affected -- which is exactly why the kind test looked sufficient and was not.
+
+**Why the automated check kept saying it was fine.** `BAR_DBG_SLICE=1` over a scripted run reported
+only `kind=tex` draws and no fills, and that was read as proof the haze was safe. It was not: the
+scripted run reaches the boot logos, the menus and the attract demo and **never reaches the course
+overview or a real race**, so the one draw that mattered was never in the sample. Daniel: *"You cant
+reach the regression with your current method: The regression is clear on the map overview screen,
+which you never reach."* An invariant proved over incomplete coverage is not the invariant claimed.
+
+**What took six failed attempts, and the lesson.** Every widening mechanism was attacked first --
+projection classes, the projection processor's aspect compensation, the framebuffer pair's similarity
+test, the RDRAM upload path -- because the symptom looked like "something widens the picture". The
+decision was one level below all of it, per RECTANGLE. The probe that cracked it was `BAR_SKIP_WIDE=100`,
+which blanked the entire stretched region and proved it was ordinary wide rectangles rather than
+framebuffer content. **Reach for a probe that removes a class of draws before reasoning about the
+renderer's control flow.** Refuted along the way, each verified as actually applied and each
+byte-identical on screen: `Class::Pillarbox` via `G_EX_ORIGIN_CENTER`; keeping the projection
+compensation on for it; re-judging a full-width scissor slice as 4:3; and skipping the RDRAM framebuffer
+upload and target-to-target copy entirely (`BAR_NO_FBUPLOAD`, `BAR_NO_FBCOPY`), which changed nothing and
+cleared that whole path.
+
+**Regression-testing gap worth knowing.** The headless frame-hash sweep could not catch either
+regression this fix caused: the attract demo drifts a frame or two between runs, so hashes cannot tell a
+real change from timing noise, and the haze needs a real race on a specific course. Daniel found both by
+eye within seconds. For a renderer rule, log which draws the rule *changes* (`BAR_DBG_SLICE`) rather than
+diffing frames.
+
+---
+
+## Original behavior retained here — Wicked Woods haunted-door loop
+
+The fork fix described below is excluded from this integration; R1 [Wicked Woods door sound] in FORK_REVIEW.md records the fidelity decision.
+
+Reported to Daniel via GitHub 2026-09-20: crashing through the haunted door on **Wicked Woods** starts
+a looping "cracking" sound that never stops for the rest of the race.
+
+**This is an ORIGINAL-HARDWARE glitch**, and the decomp says so itself --
+`lib/bar-decomp/include/snd.h:193`:
+
+```c
+SLAMDOOR,   // Haunted door slamming loop (infamous glitch)
+```
+
+Daniel confirmed it reproduces on the real game, so the fix is a **deliberate divergence from the N64**,
+requested explicitly: play once, then stop. Always on, not optional.
+
+**Measured** with `BAR_AUDIO_CAPTURE` (raw 48 kHz stereo s16) rather than by ear:
+
+* A **~31.19 ms fragment repeating at 32.06 Hz**, with harmonics at 62.40 / 93.63 / 124.83 / 156.10 /
+  187.19 ms -- i.e. one short fragment looping, far shorter than any door-slam sample.
+* It **latches at a single instant** (t = 68.5 s in the capture, the moment of the crash) and never
+  recovers: discontinuity rate jumps from ~2/s to ~55/s and stays at 35-45/s for the remaining 290 s.
+* **Not** a host-side audio problem. Click positions are uniform modulo every plausible chunk size
+  (1440, 1024, 960, 512 ... all ~2.4%, i.e. flat), so the output queue, buffering and underrun handling
+  are all cleared -- which is where this would normally be chased first.
+
+**Cause and fix.** `track2` (Wicked Woods) binds the voice in its entrypoint:
+
+```
+0x847003F4: addiu $a1, $zero, 0xBE     # SfxId 190 = SLAMDOOR
+0x847003F8: addiu $a2, $zero, 0x1B58   # priority 7000
+0x84700400: addiu $a3, $zero, 0x8      # "type", fed to emitter->unk50(slot, 5, TYPE, 2, 100.0, ...)
+```
+
+**`type = 8` is unique to this sound.** The generic play path (`func_snd_00400750`) passes `0x30`, snd's
+own default is `0x18`, and DRAGONFIRE -- the other Wicked Woods ambience, bound by an identical block
+0x160 bytes later at `0x84700570`, which behaves -- uses `0x18`. `fix-recompiled.sh` rule (J) rewrites
+SLAMDOOR's type to `0x18`, matching its well-behaved neighbour. One immediate, two sites (the delay slot
+is emitted on both paths of the `jalr`), address-anchored and self-verifying.
+
+**Verified by re-measuring the same way, not by ear:**
+
+| | before | after |
+|---|---|---|
+| discontinuities | 33.3/s | **6.1/s** |
+| 2 s windows above 20 cracks/s | 174 of 204 | **3 of 42** (transient) |
+| autocorrelation @ 31.19 ms | 0.312 | **-0.087** |
+| autocorrelation @ 62.40 ms | 0.342 | **0.027** |
+| strongest period | 62.40 ms | 5.29 ms (ordinary pitch content) |
+
+Daniel confirmed on the course: the door slams **once** and does not loop.
+
+**Not verified:** whether `type` carries other meaning that matters elsewhere on this course -- only the
+door and the surrounding race were played. If something else on Wicked Woods sounds wrong, this rule is
+the first thing to revert.
+
+**Tooling added:** `BAR_AUDIO_CAPTURE_MB=<n>` raises the capture cap (was a hard 16 MB, only ~2 minutes
+at 48 kHz -- not enough to reach a specific spot on a specific course), and the capture banner now
+prints the sample rate, since the dump is headerless.
+
+---
+
+## OPEN (mitigated, cause UNKNOWN) -- extending the far plane drops dynamic objects on Wicked Woods
+
+Reported by Daniel 2026-09-20: on **Wicked Woods**, on one of the big jumps, the player's car vanishes
+completely while airborne, and **trees vanish with it**, while the track and the HUD stay put. It does
+not happen on original hardware.
+
+**What is established, by experiment:**
+
+* It is caused by the **camera-channel** far-plane write in `src/main/bar_frustum.cpp`, not the
+  projection-matrix one. Gating off only the channel write (`BAR_FAR_CHANNEL=0`) at 4x stops it
+  completely with everything else unchanged.
+* It is **progressive, not a cliff.** Bisected with Daniel on the failing jump:
+
+  | Far multiplier | Result |
+  |---|---|
+  | 1.05x | clean |
+  | **1.5x** | **clean, and the extra scenery is visible** |
+  | 1.75x | the car vanishes on the *approach to landing*, but survives the rest of the jump |
+  | 2x, 4x | the car is gone for most of the time it is airborne |
+
+  Raising the far plane makes the car vanish *earlier in the jump*, rather than switching the bug on.
+
+**The root cause is NOT known.** Nine hypotheses are refuted, each by measurement. Do not re-run these:
+
+| Hypothesis | How it died |
+|---|---|
+| The game's frustum **culling planes** move with `far` | They cannot. `func_uvchannel_rom_00401658` builds the side planes as cross products of the far-plane corner vectors, which are `far x (extent/near, 1, extent/near)` -- a uniform scale, so `F` factors out. Worked out explicitly: right plane `1.1422*F^2*(1, -1.3428, 0)`, bottom `2R*(0, B, -F)`. Identical at 300, 600, 1200 |
+| The **far distance test** rejects the car | It only ever LOOSENS as `far` grows: reject iff `dot(fwd,p) > far + r` (`func_uvchannel_rom_004014E8`) |
+| **Perspective normalization** (recomputed from the inflated far, 435 -> 109) | Real on hardware, inert here: RT64's `RSP::setPerspNorm` is an empty `// TODO` (`lib/rt64/src/hle/rt64_rsp.cpp:965`) |
+| **Depth precision / z-fighting** | `m[2][2]` -1.00669 -> -1.00167; a car ~20 units out moves from window z 0.9532 to 0.9508 |
+| A **different camera** at that jump | `BAR_DBG_FRUSTUM=1`: the racing frustum is byte-identical on all 5,411 race frames |
+| The **display list** overflows | `BAR_DBG_DLIST=1`: 1,586 of 7,500 commands. Also refuted on screen -- the HUD is built last, so a truncated list would lose the HUD first, and it survives |
+| The **vertex pool** (`uvdgeom`) is exhausted | Measured at the moment of failure: **232 / 1000**, `0 frames over` |
+| The **matrix stack** (`uvimtx`) is exhausted | Measured at the moment of failure: **103 / 200**, `0 frames over` |
+| The **terrain visible-tile list** (`uvterra`, unguarded append) overflows | Raised 64 -> 512 -> 4096. Still vanishes at all three |
+| RT64's **HUD/widescreen layer classification** misplaces it | `BAR_HUD_ANCHOR=0` at 4x: still vanishes |
+
+**Why the demand counters were the wrong instrument, and what that implies.** `BAR_DBG_POOLS` counted
+calls to `uvVtx` and `uvIMtxPush` per frame. But **a refused object stops consuming** -- whatever drops
+the car does so *before* it emits geometry, so the counters see demand FALL, not rise. Any pool whose
+failure mode is "silently do nothing" is therefore invisible to them.
+
+**The leading untested lead** is `uvsort_rom`'s depth-sorted buckets -- **4 buckets x 50 entries**, and a
+full bucket is a silent no-op (`uvsort_rom.c:235-248`) that drops the object before any geometry is
+emitted. That matches every surviving fact: quantity-dependent, progressive, invisible to the counters,
+and the car is submitted after the trees so it is what gets squeezed out. To test it, raise the defaults
+at the constants in `uvsort_rom`'s entrypoint (NOT via system prop 0x10 -- see the trap below).
+
+**Mitigation shipped: a PER-COURSE cap.** `src/main/bar_frustum.cpp` clamps the far multiplier to
+**1.5x** when `currentTrack` (`gGameSettings + 0x44` = `0x80025D34`) is Wicked Woods. Every other course
+keeps the full range the menu offers. A **1.5x** option was added to the Graphics menu and is the new
+default in Daniel’s fork. This integration defaults to 1x. `BAR_DRAW_DIST` bypasses the cap, which is how the ceiling was bisected.
+
+**Traps this cost, all verified the hard way:**
+
+* **Read an index off the running game before keying behaviour on it.** The cap first used Wicked Woods
+  `== 5`, taken from the zero-based order of the course list in `lib/bar-decomp/tools/checkModuleHash.py`
+  -- a hashing helper, not a runtime source. It compiled, the logic was right, and it silently never
+  fired. Measured with `BAR_DBG_FRUSTUM=1` on the course, `currentTrack` is **6**: the field is 1-based.
+* **A default is not a setting.** Changing the frontend default did nothing, because a default only
+  applies to a *fresh* config; and editing `graphics.json` by hand did not stick either, because the
+  frontend rewrites that file from its own state. The clamp has to live where the value is consumed.
+  Verify the APPLIED value: `BAR_DBG_FRUSTUM=1` prints the pushed setting and the applied scale on
+  separate lines, and the applied line re-prints whenever it changes.
+* **Changing how much memory an engine pool takes breaks the main-menu widescreen.** Three for three:
+  6x pools, a 1024-entry tile prop write, and a 4096-entry tile capacity (64 KB) all broke it; 512
+  entries (8 KB) did not. Most likely RT64's BAR HUD identities are content hashes of a layer's first
+  draw call (`sBuiltinTags`, `<kind>#<hash>`), so anything that perturbs allocation or batching changes
+  the hashes and the promoted tags stop matching. **Growing engine pools in this port is not free.**
+* **System prop 0x11 is not a safe way to size the terrain list.** Its block's first word is 0, which
+  `uvterra` reads as "use my default of 64" (`0x87E003BC`). Writing a non-zero count there does raise
+  the capacity, but also switches the module onto its other branch, which then consumes the block's
+  second field -- that took the race to a black screen. Raise the default constant instead.
+* **An intermittent pre-existing crash will be blamed on whatever is being tested.** The "game closed
+  by itself" during one experiment was the known `_uvScDoneAud` boot crash (below), not the experiment.
+
+**Not verified:** whether any other course fails above 1.5x. Daniel tested the other courses at 4x
+without seeing it, but not exhaustively, and only Wicked Woods' jump is a known failure. If another
+course turns out to drop objects, add its index beside `kTrackWickedWoods`.
+
+**Wanted (Daniel, 2026-09-20):** this is accepted as a *stable workaround*, not the end state -- the
+draw distance should eventually work properly on every course. Tracked in `docs/TODO.md`.
+
+---
+
+## RESOLVED -- Mount Mayhem's atmospheric haze was missing: depth-buffer fog read through a TLUT
+
+Reported by Daniel 2026-09-19: no haze on Mount Mayhem, with Draw Distance at 1x as well (confirmed in
+`graphics.json`; at 1x `bar_frustum.cpp` leaves the projection matrix untouched). Parked after five
+measurement rounds, then resolved the same day; the traces and rejected experiment are on the local
+branch `wip/mayhem-fog`.
+
+**Root cause and fix.** The fog draws sample the Z-buffer as a 16-bit IA texture **with the TLUT
+enabled** (`otherMode.H = 0010CCAF`: `textLUT` = IA16). The RDP then indexes the palette with each
+texel's **upper byte** -- here the Z value's exponent and top mantissa bits -- and the game's palette
+maps that to its fog weight. RT64's TMEM decoder (`sampleTMEM`) already does this, which is why the
+haze appeared with Copy with GPU off. The GPU tile-copy path goes through `FbReinterpretCS` instead,
+which had a TLUT branch only for 16-bit to 8-bit (CI8) and passed a 16-bit-to-16-bit read with a TLUT
+through unchanged. `RGBA16toTLUT16` adds that case, for an RGBA16 or DEPTH source: the copy
+round-trips exactly through `Float4ToRGBA16` with no dither, the palette entry at `value >> 8` is
+returned, and the lookup runs per pixel on the scaled target -- smooth at 2x and in widescreen.
+Verified by eye on Mount Mayhem with Copy with GPU on (Daniel, 2026-09-19), and Daniel checked the
+other courses and the menus afterwards with nothing changed. A screen that reads a **colour**
+framebuffer as a 16-bit texture with a TLUT now gets the palette lookup the hardware would do, where
+it used to get the colour unchanged; none has been seen to change.
+
+The investigation, kept because each step was a measurement:
+
+**What the haze is.** Not N64 hardware fog. Measured with RT64-side traces (`BAR_DBG_FOG`, on the wip
+branch):
+
+* The game's fog setter `func_uvgfxstate_rom_00401F54(start, end)` (sets `G_FOG` + `gSPFogFactor`) is
+  called thousands of times, always with `start = 0`, i.e. off. No `G_MW_FOG` ever reaches RT64, and 0
+  draws per frame have `G_FOG`. The fog **colour** is set (`B9C5D7FF`, the blue-grey of the sky).
+* The game's own profiler (`uvdbg_rom`) lists `FOG` and `FOGOVER` as separate render stages.
+* In a Mount Mayhem race, ~81 draws per frame use a 2-cycle render mode (`L=3C184348/9`,
+  `H=0010CCAF`) whose second cycle blends **fog colour over memory by the combined alpha**, with a
+  combiner of colour 0 and alpha = `TEXEL0` alpha (`cc=FCFFFFFF FFFFF238`).
+* Those draws are **80 full-width texture rectangles, 3 rows each, top to bottom**, textured with a
+  320x3 **IA16** tile (`fmt=3 siz=2 line=80`) whose image addresses step through `0x3DA800-0x3FFFFF` --
+  **the game's own Z-buffer** (`zImg = 0x3DA800`, 320x240x2 bytes). The game reads its depth buffer
+  back as a texture and blends the fog colour by it.
+
+**Why it does not show, and what was tried.**
+
+* With RT64's default **Copy with GPU** on, a texture that points into a framebuffer is served by a
+  GPU tile copy. For a depth buffer the copy holds the RGBA16 bit pattern of the N64 Z value
+  (`RtCopyDepthToColorPS`), and `checkTileCopyTMEM` asks for reinterpretation because the tile's
+  format (`G_IM_FMT_DEPTH`) differs from the texture's (IA). `FbReinterpretCS` has no branch for a DEPTH
+  source, so the copy passed through unchanged and the game's IA16 alpha was the one-bit alpha of an
+  RGBA16 texel: no fog.
+* **Copy with GPU off** (F1 → Emulator Configuration, not persistent): the game reads the Z-buffer
+  from RDRAM, which Render to RAM (on by default) writes back. **The haze appears**, but blocky and
+  offset -- the mask is the native 320x240 depth, and it does not line up with the widened picture.
+  Confirmed by Daniel.
+* **Experiment (on `wip/mayhem-fog`): let `FbReinterpretCS` treat a DEPTH source like RGBA16.** The fog
+  then appears on the GPU path, but the whole frame is banded and blocky -- rejected by eye. Reason
+  found afterwards: `RGBA16toIA16` is deliberately **not bit-exact**; it re-encodes the colour as a
+  fake 10-10-10-2 value and reads it back as 16/16 to keep precision for colour effects, so a depth
+  value comes out as a sawtooth rather than as its two bytes.
+
+**What resolved it.** Re-reading the logged other mode: the combiner's `TEXEL0` alpha is the alpha of
+the **palette entry**, not of the raw texel, because the TLUT is on. The "low byte would be a
+sawtooth" objection in the first write-up was the clue.
+
+---
+
+## RESOLVED -- Players three and four: input and Rumble Pak
+
+Verified 2026-09-19 in the headless build with all four ports on the keyboard (a seeded `input.json`,
+ports 1-3 `RumblePak`), `BAR_DBG_PAK=1`, one 4-player battle driven by hand: all four cars respond;
+`short STATUS port=0..3 -> pak=1`; ports 2 and 3 run the same Rumble Pak detection as port 1 (id
+blocks 1/3/4/6 read zeros, identify handshake); motor-on writes per port 860 / 356 / 584 / 823; no
+`mempak_p1..3.pak` created. Two players were verified earlier the same day in the launcher build
+(pad + keyboard, see [05](technical/05-runtime-host.md#multiplayer-every-route-asks-bar_port_connected-and-bar_port_pak)).
+
+Still open for split-screen: the 2D layer (health bars, dividers) -- see
+[06, open items](technical/06-graphics.md#open-graphics-items).
+
+---
+
+## OPEN -- The game freezes leaving the results screen: the audio manager spins in `alEvtqNextEvent`
+
+**Measured 2026-09-19, on a live frozen process** (0.3.0-alpha + watchdog build, pid 11212, frozen
+~40 min). This is a **game-logic freeze, not a pump stall**: `Responding=True` throughout, so Windows
+logged nothing and the hang watchdog correctly did not fire -- `update_gfx` was still running and the
+renderer kept presenting the last frame. The picture is frozen; the process is not.
+
+**The two threads that matter.** Walked from outside with DbgHelp (no debugger is installed; the
+walker is `scratchpad/walk.ps1`, kept in the session scratchpad -- re-create it from this entry if
+needed):
+
+```
+--- thread 16980 "Game 3"   <- audio manager, RUNNING, burning a full core
+  # 0 alEvtqNextEvent +0x1ae   (RecompiledFuncs/funcs_45.c:11256)
+  # 1 func_8000C12C +0x27f     (RecompiledFuncs/funcs_57.c:9452)
+  # 2 alAudioFrame +0x452      (RecompiledFuncs/funcs_4.c:12350)
+  # 3 uvAudioMgrHandleFrameMesg +0x43a
+  # 4 uvAudioMgrThreadFunc +0x535
+
+--- thread 12396 "Game 6"   <- app thread, PARKED, CPU not advancing
+  # 2 wait_for_resumed          (ultramodern/src/threads.cpp:164)
+  # 3 uvClkGetSec +0x1e
+  # 4 func_uvcmidi_rom_00400940 +0x18b   <- the documented MIDI teardown spin
+  # 5 func_uvcmidi_rom_004003B4 +0xbb
+  # 6 uvFreeFile +0xec
+  # 7 uvUnloadFile +0x42b
+  # 8 uvUnloadModule +0x67
+  # 9 uvSetGameState +0x1b3               <- leaving the results screen
+  #10 func_80000450 +0xd8f
+  #11 Thread_App +0x4c
+```
+
+**Three samples 700 ms apart** put thread 16980's PC at `func_8000C12C +0x27f` / inside
+`alEvtqNextEvent` every time, with `TotalProcessorTime` climbing 3:35 -> 6:23 while frozen: it is
+spinning in a tight loop, not blocked. Thread 12396's CPU time did **not** move between samples
+(3:48.765 both times): it is parked, not spinning.
+
+**Why that wedges everything.** Two mechanisms already documented in
+[`technical/05`](technical/05-runtime-host.md) combine:
+
+1. `func_uvcmidi_rom_00400940` "stops the MIDI sequence player then **spins** until it reports
+   stopped, or 2.0 s", and the player's state only advances when the audio thread runs. Leaving the
+   results screen unloads that module, which runs exactly this teardown.
+2. The cooperative preemption only yields for threads with priority **below 100**, so the audio
+   manager (~110) never yields on its own work. `bar_consume_yield` is visible in its stack doing
+   precisely that check and declining.
+
+So the audio manager holds the token, loops forever in the audio event queue, and never advances the
+sequence player to "stopped". The app thread's 2.0 s timeout never even gets evaluated, because its
+yield inside `uvClkGetSec` never gets resumed. Everything downstream of the app thread stops.
+
+**Root cause is therefore the `alEvtqNextEvent` loop, and it is NOT yet explained.** `alEvtqNextEvent`
+pops libultra audio events by time; an infinite loop there suggests a corrupted or circular event
+list, or an event with a delta that never retires (**inferred** -- the queue's contents were not read).
+That is the next thing to measure.
+
+**Relationship to the six AppHangs below: plausible, unproven.** The symptoms differ --
+`Responding=True` here, pump stalled there -- so they are not obviously the same defect. One way they
+could be: a player who tries to close a frozen window makes the shutdown path wait on these wedged
+game threads, which would stall the pump and produce exactly an AppHang. **Inference, not measured.**
+
+**Reproduced a second time, same session day, different process (pid 9604, 10:06 launch).** The two
+stacks are identical down to the call offsets -- `uvSetGameState +0x1b3`, `uvUnloadModule +0x67`,
+`uvUnloadFile +0x42b`, `uvFreeFile +0xec`, `func_uvcmidi_rom_004003B4 +0xbb`,
+`func_uvcmidi_rom_00400940 +0x18b`, `uvClkGetSec +0x1e` on the app thread; `func_8000C12C` ->
+`alAudioFrame +0x452` -> `uvAudioMgrHandleFrameMesg +0x43a` -> `uvAudioMgrThreadFunc +0x535` on the
+audio thread. Measured over a 3.0 s window while frozen: the audio thread gained **3.03 s** of CPU
+(a full core, `Running`, PC moving inside the loop) while the app thread gained **0.000 s** (`Wait`,
+stuck at 3:17.828). **This defect is deterministic, not a race.**
+
+**The loop is libultra's sequence player.** `func_8000C12C` is the recompiled
+`__seqpVoiceHandler`/`_seqpPostNextSeqEvent` body; the decomp shows its shape in
+[`lib/bar-decomp/tools/ultralib/src/audio/seqplayer.c:329`](../lib/bar-decomp/tools/ultralib/src/audio/seqplayer.c):
+
+```c
+do {
+    switch (seqp->nextEvent.type) { ... }
+    seqp->nextDelta = alEvtqNextEvent(&seqp->evtq, &seqp->nextEvent);
+} while (seqp->nextDelta == 0);
+```
+
+So an infinite loop here means the event queue keeps handing back **delta-0 events forever**: either
+events are posted as fast as they are drained, or the queue's list has become circular. The stop
+handshake that the teardown drives runs through this same switch -- `AL_SEQP_STOPPING_EVT`
+(seqplayer.c:243) sets `AL_STOPPING` and posts `AL_SEQP_STOP_EVT`, which at :217 sets `AL_STOPPED` --
+so a cycle in that handshake is the first place to look. **Inferred from the decomp's shape; the
+queue's actual contents have not been read.**
+
+Note the app thread cannot be feeding the queue while frozen: it is parked, gaining no CPU. Whatever
+sustains the 0-delta cycle is already inside the queue by then.
+
+**Next, in order:**
+1. Read `seqp->state` and the `ALEventQueue` list when the freeze is live (F3 RDRAM viewer, or a
+   host-side dump keyed off the audio thread). That is the one measurement that names the cause.
+2. Control: `BAR_NO_PREEMPT=1`. Expected to still freeze -- the audio thread's loop is over its own
+   queue and does not need the scheduler -- which would confirm the preemption priority rule only
+   explains why nothing *recovers*, not why it wedges. A cheap, falsifiable prediction.
+3. Only then consider a mitigation. A bounded-iteration guard on that loop (the shape of
+   `fix-recompiled.sh` rule E) would convert the freeze into a dropped note, but it treats the
+   symptom and must not be landed as if it were the fix.
+
+---
+
+## OPEN -- The window goes "Not Responding" and Windows closes it (AppHang), six times since 7 Sep
+
+**Status (2026-09-19):** reported from playtesting -- the game stopped responding while Daniel was
+**looking at the race results after finishing a championship race**, and Windows closed it. The
+port's own crash handler produced nothing, correctly: `src/main/bar_crash.cpp` installs an
+*unhandled-exception* filter, and a hang raises no exception. Release is `/SUBSYSTEM:WINDOWS`, so
+stderr went nowhere either (`BAR_DBG_UI=1` was not set).
+
+**It is one hang, not six coincidences.** Windows Error Reporting has six `AppHangB1` reports for
+this exe, and every one carries the identical hang-stack hash, across five different builds:
+
+| Local time | Build (exe PE stamp, UTC) | Hang stack hash |
+|---|---|---|
+| 2026-09-07 08:10 | 09-07 06:00:06 | `170f3bf0b8952de987768585f9009d4b` |
+| 2026-09-11 15:15 | 09-11 13:07:04 | `170f3bf0b8952de987768585f9009d4b` |
+| 2026-09-11 15:42 | 09-11 13:37:27 | `170f3bf0b8952de987768585f9009d4b` |
+| 2026-09-11 15:57 | 09-11 13:54:10 | `170f3bf0b8952de987768585f9009d4b` |
+| 2026-09-14 19:22 | 09-11 13:54:10 | `170f3bf0b8952de987768585f9009d4b` |
+| 2026-09-19 08:35 | 09-17 14:48:40 (0.3.0-alpha) | `170f3bf0b8952de987768585f9009d4b` |
+
+Every report also has `Hang Signature = 170f` and `Hang Type = 67246080` (`0x04020000`). A constant
+stack hash across five builds and twelve days means the main thread stops pumping at the *same* place
+every time -- so this is reproducible in principle, and worth catching rather than guessing at.
+
+**Re-derive it:** the reports live in `C:\ProgramData\Microsoft\Windows\WER\{ReportArchive,ReportQueue}\Critical_beetle-adventure_*`
+(admin-only; copy with `robocopy`, not `Copy-Item` -- the folder names overrun `MAX_PATH`). Each holds
+only `Report.wer`; **there is no `.hdmp`/`.mdmp`, so no thread stacks exist for any of the six.**
+`Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Application Hang'}` lists them
+without elevation.
+
+**The mechanism this port is already known to have.** `docs/technical/05-runtime-host.md` ("SDL event
+ownership") records that recompinput is the sole `SDL_PollEvent` caller and is pumped from
+`update_gfx`; when nothing drained SDL's queue the window "stopped answering Windows and went Not
+Responding". Anything that blocks the `update_gfx` thread reproduces an AppHang by that route.
+
+**Lead, NOT yet measured -- do not treat as the cause.** `main.cpp:406` calls
+`bar::input::mempak_flush_all()` every frame on that same thread. It takes `g_mempak_mutex` and, when
+dirty, writes the full 32 KiB synchronously (`bar_input.cpp:517-530`), while `mempak_write()` takes
+the same mutex from the SI stub (`os_unimpl_stubs.cpp:230`) on the game thread. The results screen is
+where BAR saves standings and records to the Controller Pak, which puts peak traffic through that
+mutex on the screen where the hang was seen.
+
+**Against that lead:** `mempak_p0.pak` had mtime 08:22:41 and was an intact 32768 bytes, while the
+hang was at 08:35:23. A flush that stalled mid-write should have left a newer mtime or a short file.
+So the last *completed* flush was 13 minutes earlier, and nothing shows a write in progress at the
+hang. The lead survives only in the form "blocked acquiring the mutex, before writing anything".
+
+**Ruled out:** the `BlueScreen` / `LiveKernelEvent` WER records stamped in the same second as the
+2026-09-19 hang are unrelated -- their dumps are dated 2025-10-09 and 2026-08-16, i.e. WER flushing an
+old queue, not a machine fault that day. Also unrelated: the seven `AppCrash_BeetleRecomp.exe` BEX64
+reports (4-5 Sep, `c0000409` in `ucrtbase.dll`) -- those predate the exe rename and are a different,
+older binary.
+
+**Instrumented (2026-09-19), not yet fixed.** Nothing can symbolize the six past hangs, because no
+dump was ever written for any of them. So the next occurrence is now made to produce a stack instead:
+`src/main/bar_watchdog.cpp` watches the per-frame counter that `update_gfx` increments and, after 5 s
+of no frames, walks every thread and writes a symbolized report to
+`%LOCALAPPDATA%\BeetleRecomp\hang-report-<timestamp>-<n>.txt`. It reports recovered
+stalls as well as fatal ones. Verified by injecting a stall (`BAR_WATCHDOG_SELFTEST`); see
+[`technical/08`](technical/08-diagnostics-and-methodology.md#catching-a-hang).
+
+**So the next step is a repro, not more code reading.** Play a championship race to the results
+screen and, if it hangs, attach the `hang-report-*.txt`. The pump thread's stack in that file says
+directly whether the Controller Pak lead above is right -- `mempak_flush_all` blocked on
+`g_mempak_mutex` would be unmistakable -- or whether it is something else entirely.
+
+## OPEN -- Linux: the game crashes during boot (WSLg, llvmpipe)
+
+**Status (2026-09-17):** the Linux build (`scripts/build-linux.sh`, clang-21, Ubuntu 26.04 under WSL2)
+compiles, links and starts: Vulkan comes up on WSLg's llvmpipe and the launcher menu is built. The
+no-frontend build, started with the ROM path, crashes during boot. Not yet tested on native Linux with
+a GPU. Linux is therefore not shipped in 0.3.0-alpha.
+
+Measured (backtraces from the Linux crash handler in `src/main/bar_crash.cpp`, resolved with addr2line):
+
+| Run | Fault address | Where |
+|---|---|---|
+| default | `0x705e67a00000` | `uvMat4FCopy` <- `func_uvdobj_rom_00400770` <- `func_caranim_004003AC` <- `func_selection_004008B0` <- `uvLoadModule`, before the first input frame |
+| `BAR_NO_PREEMPT=1` | `0x7bedd5a00003` | `mio0Decode` <- `uvFileReadBlock`, before input frame 250 |
+
+Both faults land on a 2 MiB boundary, consistent with a guest pointer just past the 512 MiB that
+librecomp makes readable (inferred). Ruled out: the ROM (the cached Linux copy is byte-identical to the
+Windows one), the cooperative preemption (crashes with it off), a different RDRAM reservation per
+platform (librecomp's code is the same), and an obvious `long`-width bug in the port's host files. The
+crash point varies between runs, so timing under software rendering, which is far slower than a GPU, is a
+suspect (inferred) -- as is anything Beetle-specific, since Hybrid Heaven and Body Harvest boot on the
+same WSLg setup. Next: repeat runs to characterise, log the offending guest pointer, and test on native
+Linux.
+
+## OPEN -- Intermittent crash at boot in `_uvScDoneAud` -> `osSendMesg`
+
+**Seen once, 11 Sep 2026**, on a launch of the frontend build that had started cleanly on the
+immediately preceding and following attempts with the same binary and the same settings folder. The
+crash handler caught it during bring-up, after `create_render_context: ok` and before the game had
+been started from the launcher:
+
+```
+*** CRASH code=0xc0000005 addr=00007FF72498D4BA ***
+  # 0 do_send +0x3a
+  # 1 osSendMesg +0x4b
+  # 2 osSendMesg_recomp +0x18
+  # 3 _uvScDoneAud +0xd5
+  # 4 _uvScHandleRSP +0x97
+  # 5 _uvScMain +0x21b
+  # 6 run_thread_function +0x1fc
+```
+
+An access violation inside `do_send`, on the scheduler's own thread, delivering the message that
+retires a finished audio task. **Not reproduced**, so there is nothing measured here beyond the
+stack -- it is written down because an intermittent crash with a stack is exactly the thing that gets
+lost, and the next person to see it should not have to establish that it has been seen before.
+
+What was and was not going on at the time: this was the first launch after the HUD inspector landed,
+and a controller was connected where earlier launches that day had none, so the input path through
+`recompinput` was live. Neither is evidence — the inspector's hooks are on the display-list thread
+and touch nothing in this stack, and the port's audio changes that day are host-side, downstream of
+the game's scheduler. **Do not treat either as the cause without measuring.**
+
+The neighbourhood is known to be delicate: `_uvScDoneAud` sits under the cooperative-preemption and
+audio-starvation work described in [`technical/05`](technical/05-runtime-host.md#threading-and-the-audio-starvation-problem),
+and `BAR_NO_PREEMPT=1` is the first switch to try if it recurs.
+
+---
+
+## RESOLVED -- Widescreen: the picture sat in a 275x207 island even with a full-frame scissor and viewport
+
+**Resolved (6 Sep 2026), rt64 `cebfce7`.** The island was not a transform at all: it was the game's
+own **overscan mask** painted on top of a picture that already covered the whole frame. BAR draws
+four opaque black fill rectangles that are the complement of the rectangle it renders into -- during
+a race `(0,0)-(320,17)`, `(0,224)-(320,240)`, `(0,17)-(21,223)` and `(296,17)-(320,223)`, measured
+with the new `BAR_DBG_RECT`. In Expand the top and bottom ones span the whole scissor width so RT64
+stretches them across the widened frame, while the side ones do not and stay at their 4:3 positions:
+black columns standing inside the picture with widened world visible outside them, which is exactly
+what the "island" looked like. `RDP::drawRect` now drops such a rectangle when it hugs a scissor edge
+and is no thicker than a tenth of it (`BAR_KEEP_OVERSCAN=1` restores it); the intro's cinematic
+letterbox is ~20% of the height and is kept.
+
+A second defect surfaced once the mask was gone -- the sky ended at the un-widened frame's edges --
+and had a separate cause, also fixed in that commit: RT64 was applying two different coverage tests,
+so BAR's racing projection had its matrix widened but its viewport and scissor left at 4:3. See
+`docs/RACING_DRAW_MAP.md` for both, and for what each class of draw puts on screen.
+
+The original investigation is kept below, because its negative results are still worth having.
+
+### Original entry
+
+
+**REVERTED (rt64 back to `b39a680`).** The rt64 commit `aad5142` that followed the verified build --
+the horizontal-coverage widening qualifier (`BAR_ASPECT_FB_COVER`, default 90), the diagnostics and
+the opt-in projection compensation -- was found by Daniel to reintroduce the fast intro and to put a
+black bar over the HUD. The verified build (superproject `e69eb44`, rt64 `b39a680`) has the intro at
+the correct speed and no HUD bar, and it is the checkpoint to build on. The reverted work is kept on
+the rt64 branch `bar/widescreen-diagnostics`; of it, the coverage qualifier is the only behavioural
+change and is the prime suspect, since it makes the unscissored boot-buffer pair and the letterboxed
+intro pair render widened. Do not re-apply it without re-checking the intro speed first.
+
+
+**What is landed.** Framebuffer pairs whose scissor is full-width but not 4:3-shaped -- the intro's
+letterboxed `320x147` pair, and a pair drawn with no scissor (RT64's unbounded `2048x2048`) -- used to
+fail RT64's per-pair aspect test and were drawn unwidened and centred. They now qualify by
+horizontal coverage (`BAR_ASPECT_FB_COVER`, default 90%). Measured: `adjust=1 scale=1.3333` on those
+pairs afterwards.
+
+**What is not.** In plain 4:3, with `patches/viewport_patch.c` making the game's scissor and viewport
+cover the whole 320x240 (confirmed with `BAR_DBG_SCISSOR`: the only rects emitted are `(0,0)-(320,240)`
+and the intro's `(0,47)-(320,194)`), the picture STILL occupies a 275x207 island: content spans
+225..1050 of the 160..1120 4:3 region in a 1280x720 window, i.e. exactly 22px and ~17px of the
+framebuffer on each side. In Expand the same island appears with widened slivers of world outside it
+and black columns between -- the "glitched widescreen" look. The 2D HUD also sits inside the island,
+but that is layout (it is authored inside the safe area), not a transform.
+
+**Ruled out, with evidence:**
+
+- *The RDP scissor and RSP viewport.* Full-frame after the viewport patch; `BAR_DBG_PROJ` reports the
+  projection's scissor-and-viewport intersection as 319-320 wide.
+- *A CPU/RDRAM copy being presented instead of the widened render.* `BAR_DBG_VI` shows the VI
+  presenting `0x1DA800`/`0x200000`, and `BAR_DBG_ASPECT` shows those same buffers receiving widened
+  passes (`adjust=1 scale=1.3333`).
+- *The projection matrix alone.* The inset was assumed to be baked into the perspective matrix
+  (`BAR_DBG_PROJ` shows BAR's 3D projections with `[3][3]=0`, `[2][3]=-0.2955`, tiny `[0][0]`).
+  `barCompensateProjectionInset` (rt64, opt-in `BAR_PROJ_INSET=1`) scales every such matrix by
+  320/275 x 240/207 and the log confirms it runs on all of them -- yet the island's extent does not
+  change at all. A game-side patch of `func_uvimtx_rom_004004D8(Mtx)` was also tried; passing `Mtx`
+  by value through a recompiled patch corrupted the matrix (the world vanished) and was dropped.
+- *The last-clip-rect globals* (`D_uvgfxmgr_rom_00402408..0E`): zero-initialised `.bss`, only read
+  by two fill routines; cannot shape the 3D.
+
+**Remaining candidates, untested:** the game's own frustum culling and sky/terrain construction
+(`uvterra`, `uvdyn`, `motion` -- all still assembly) building geometry to the inset frustum, so that
+nothing exists to draw outside it; or a second transform between the projection and the RSP. The
+next diagnostic is to log, per draw call, the NDC extent of submitted vertices rather than the
+matrix, which tells whether geometry outside the island is ever submitted.
+
+**Note:** in the meantime `BAR_CONTENT_INSET=auto` (renderer-side crop to the game's drawn region)
+still removes the island's margins for presentation, at the cost described in that code.
+
+---
+
+## RESOLVED — HUD anchoring in widescreen
+
+**Resolved (6 Sep 2026)** by a different mechanism, so the display-list rewriter below was never
+brought back. The racing HUD now anchors to the widened frame's edges — speedometer and needle left,
+timer, lap, map and position right — and races do not glitch, because nothing copies display lists any
+more. RT64 already places 2D elements from per-element extended-GBI origins and BAR simply never
+emits any, so the fork classifies BAR's draws in `RDP::drawRect` and supplies the origins itself
+(`lib/rt64/src/hle/rt64_bar_hud.cpp`). See `docs/RACING_DRAW_MAP.md`, "Anchoring the HUD to the
+widened frame", for the measurements, the gate (`currentGameState == 5 && raceState == 0` — state 5
+alone also covers the track-loading screen) and the run-time switches.
+
+Two traps found on the way, worth keeping:
+
+- **`FixedRect::fullyInside(r)` reads backwards.** It returns true when *`r` is inside the receiver*,
+  not when the receiver is inside `r`, so `rect.fullyInside(screen)` silently rejected every draw.
+- **`graphics.json` has two writers that disagree about one field.** `src/game/config.cpp` writes it
+  through ultramodern's `NLOHMANN_JSON_SERIALIZE_ENUM` tables; RecompFrontend's settings menu writes
+  the same path through librecomp's `Config` (`<tab id>.json`, and the tab's id is `graphics`) using
+  the menu's own display names. Every enum's names agree except `HUDRatioMode::Full`, which is
+  `"Full"` to the first and `"Expand"` to the second. Neither side throws on a name it does not know
+  — both fall back to a default — so the failure is silent in both directions, and both directions
+  were observed: with `"Expand"` in the file the loader read HUD Ratio as *Original*, which collapses
+  every origin back to the frame's centre and disables anchoring; with `"Full"` in the file the menu
+  reset HUD Placement to its own default, *Clamp16x9*. `src/game/config.cpp` now accepts either
+  spelling and writes the menu's, since the menu is the writer that wins while the frontend runs.
+
+The parked investigation is kept below, because its diagnosis of the rewriter's flicker is still the
+best account of it and the branch still exists.
+
+### Original entry — the display-list rewriter, parked
+
+**Status.** The main branch is the pre-anchoring widescreen build (tree of `b7aae3e`, rt64 `b39a680`):
+Expand widens the 3D world in menus and races, the menus do not flicker, the intro runs at the right
+speed, and the HUD is drawn as RT64 draws it by default (2D rectangles stretched about the centre,
+orthographic triangles centred). Daniel verified this state and asked to return to it after the
+anchoring work turned out to glitch races. **Nothing from the anchoring work is compiled in.**
+
+**What was built** (the `wip/hud-anchoring` branch, commit `55e93af`, with the raw experiments that
+followed on `wip/island-experiments`; both branches were removed from this repository when it was
+published, and survive only on the fork it came from,
+[danielgomesvieira2000/BeetleRecomp](https://github.com/danielgomesvieira2000/BeetleRecomp)).** A host-side F3DEX2 display-list rewriter, `src/main/dlrewrite.cpp`
+plus `dlrewrite.h`, modelled on `wave-race-64-recomp/src/dlrewrite.cpp`. It wraps the renderer
+context (`bar::dlrewrite::wrap(...)` around both `create_render_context` calls in `src/main/main.cpp`),
+copies each root display list the game submits into a scratch region at `0x80C00000` (above the 8 MB
+the game is told it has, so the game can never allocate over it), and while copying:
+
+- tracks segments, the modelview stack, projection loads (also inside called sub-lists), viewport,
+  scissor and the current texture;
+- classifies every 2D draw: full-width draws under a non-perspective projection are tagged *stretch*;
+  draws under a perspective projection are left alone; during a race (`seen_world && seen_ortho`,
+  sticky across the several lists BAR submits per frame) a draw whose centre is in the left third is
+  anchored *left*, in the right third *right*, and the rest are centred;
+- emits `gEXEnable`, `gEXSetViewportAlign` (plus a re-issued viewport), `gEXSetRectAlign` /
+  `gEXSetRectAspect` for texture and fill rectangles, and `gEXMatrixGroup` for projections, so RT64
+  places each element against the widened frame;
+- is switched on only when the frontend's HUD ratio option is not *Original* (`hr_option !=
+  HUDRatioMode::Original`), and can be disabled or traced at run time with `BAR_NO_REWRITE`,
+  `BAR_HUD_OFF`, `BAR_HUD_NOEMIT`, `BAR_HUD_NO_ANCHORS`, `BAR_HUD_TRACE`.
+
+It needs one rt64 change, commit `0203ffb` on our rt64 fork ("Bound the runaway-list guard at RT64's
+16 MB address space"): without it RT64 refuses the scratch copy above 8 MB and the screen goes black.
+`CMakeLists.txt` adds `src/main/dlrewrite.cpp` to the sources and `lib/rt64/include` to the include
+directories (for `rt64_extended_gbi.h`; `F3DEX_GBI_2` must be defined before including it so the hook
+opcode is `0xE0`).
+
+**What was verified.** In a race with HUD ratio set to Expand, the speedometer and lap counter sit at
+the left edge and the timer, map and position at the right edge, on the widened frame. Daniel: *"the
+HUD is anchored now, besides the black columns."*
+
+**Why it is parked.** With the rewriter enabled, races glitch: the car and the background flicker and
+move around. This happens with the plain verified rewriter (`ba236b5` / `55e93af`), not only with the
+later experiments, so the cause is in the rewriter itself, not in the island experiments. It was not
+diagnosed. Candidates to check first when this is resumed, in order:
+
+1. *The scratch copy is reused while RT64 may still be reading it.* The rewriter writes every list of
+   every frame into the same `0x80C00000..+0x40000` region, on the game thread, while the renderer
+   consumes lists on its own thread. If RT64 reads a list after the next one has been written over it,
+   geometry from two frames mixes, which is what flicker and "moving around" look like. Fix to try:
+   ring-buffer the scratch (several slots, advance per list) or copy only what must change.
+2. *The projection group / matrix rewriting.* `gEXMatrixGroup` on the world projection (or the
+   re-issued viewport after `gEXSetViewportAlign`) may disturb RT64's per-frame matrix interpolation,
+   which is exactly what would make the car and background jitter. Test: `BAR_HUD_NO_ANCHORS=1` (keeps
+   the copy, drops the anchors) and `BAR_HUD_NOEMIT=1` (copy only, no extended commands) to see which
+   layer introduces the glitch.
+3. *Race classification bleeding into 3D draws.* Anything classified as a HUD element that is really
+   part of the world (car shadow, skybox rectangles) would be pinned to an edge and appear to move.
+   `BAR_HUD_TRACE=1` prints the classification of every draw.
+
+**How to bring it back.** On a branch: `git cherry-pick ddf8ac1 ba236b5` (rewriter and its race fix),
+set `lib/rt64` to `0203ffb`, rebuild, then work through the candidates above with the run-time
+switches before touching anything else. Keep the main branch on the verified build until a race is
+confirmed clean with anchoring on.
+
+**Separately parked: the black columns beside the world** (see the island section above). They come
+from a full-frame backdrop layer BAR draws each frame as two texture rectangles carrying the overscan
+margins. Dropping the layer (`BAR_HUD_SKIP_BLIT=1` on `wip/island-experiments`) removed the top and
+bottom bars and moved the side bars to the frame edges, but the layer also erases the previous frame,
+so dropping it causes ghosting. Cropping and pinning the rectangles at the list root had no effect,
+most likely because in a race they are issued from a called sub-list the rewriter does not copy. The
+viewport and projection were ruled out (all viewport loads are full-frame; scaling the projection
+only magnifies the island's contents).
+
+## Intermittent crash in the audio thread
+
+Seen twice while capturing automated runs, roughly 50 seconds into the attract sequence, on builds
+both before and after the presentation changes -- so it is not caused by them.
+
+```
+*** CRASH code=0xc0000005 addr=... ***
+  # 0 func_8000DA6C +0x2ac
+  # 1 alAudioFrame +0x452
+  # 2 uvAudioMgrHandleFrameMesg +0x43a
+  # 3 uvAudioMgrThreadFunc +0x535
+```
+
+An access violation inside libultra's audio library (`alAudioFrame`), reached from Paradigm's audio
+manager thread. `func_8000DA6C` is the unnamed leaf, and is the place to start. Not yet
+investigated; recorded so the stack trace is not lost, and so a future crash here is recognised as a
+recurrence rather than a new regression.
+
+---
+
+## RESOLVED — Intermittent permanent black screen (game boots, audio plays, no picture)
+
+Fixed in the N64ModernRuntime fork, branch `controller-pak`, commit `9503a9b`. Recorded here
+because the symptom is misleading and the mechanism is worth knowing before touching VI code again.
+
+**Symptom.** The game boots and audio plays normally, but nothing is ever drawn. Crucially it was
+*intermittent*: the same binary would run correctly once and then stay black on the next launch,
+which makes it look like a configuration or GPU problem rather than a code defect.
+
+**Cause.** `osViGetCurrentFramebuffer()` returns the current `ViState`'s `framebuffer` field
+verbatim. BAR boots with `osViBlack(TRUE)` and un-blacks *only* once its gfx manager observes that
+value equal to `0x100000` (`uvgfxmgr_rom.c`); until then RT64 has nothing to present, because
+`VI_STATE_BLACK` forces `hStart == 0`.
+
+An earlier change (`0c1bf21`) had made the pre-game dummy VI alternate that framebuffer field
+between `0x100000` and `0x125800`, so RT64 would see a changing origin and keep presenting while the
+launcher is up — without which recompui's `draw_hook` never runs and the launcher paints once and
+then ignores all input. But `set_dummy_vi` only runs while `!is_game_started()`, so whichever value
+it wrote *last* is what the game reads back. Whether BAR ever un-blacked therefore came down to the
+parity of the final dummy frame — a coin toss, hence the intermittency.
+
+**Fix.** `update_vi()` computes `VI_ORIGIN_REG` as `framebuffer + fldRegs[field].origin`, so the
+alternation was moved into the mode's field origin (a second dummy mode, `dummy_mode_alt`). The
+scanout address still changes every frame, so the launcher keeps presenting; the address the game
+reads back is pinned at `0x100000`, so BAR always un-blacks.
+
+**If you touch this again:** the two requirements genuinely conflict, and satisfying only one of
+them produces a different bug — pin the framebuffer and the launcher goes inert; alternate it and
+the picture dies at random. Test *both* paths: the no-frontend auto-start build must reach gameplay,
+and the frontend build's launcher must still respond to input.
+
+**Ruled out along the way** (do not re-run these):
+
+- `RecompiledPatches/patches.c` / `PatchesLib` — disabling it entirely still produced a black screen.
+- The graphics config (`ar_option`, `hr_option`, `rr_option`, `wm_option`) — the fault reproduces on
+  conservative windowed values and the fix holds on fullscreen `Expand`.
+- The `scripts/fix-recompiled.sh` rewrite — its end-state verification passes and rendering is
+  correct with it in place.
+
+---
+
+## Intro / boot sequence runs too fast
+
+**Status 5 Sep 2026 (parked at Daniel's request).** Daniel reported the intro at the correct speed on
+the build at superproject `e69eb44` / rt64 `b39a680`, then fast again on a source-identical rebuild.
+Measured before parking, all on that source: the attract sequence reaches the same screens at the
+same seconds windowed and fullscreen, idle and under 8 busy threads, and in the frontend build versus
+the auto-start build; the frontend build creates its renderer with `rr_option=Original` (the
+frontend uses RecompFrontend's *own* `recompui::renderer::create_render_context`, not
+`src/main/rt64_render_context.cpp`, so our mapping there never applies to it -- a real difference
+worth remembering); and `BAR_FPS=1` shows the game swapping at ~59-60/s through the logos, prompt
+and cinematic and ~30/s in the race demo, identically in both builds. If the intro runs at 30 Hz on
+hardware, that 60 is the bug itself and the game's VI retrace request is the place to look. No
+configuration or build difference that reproduces "fixed" vs "fast" was found.
+
+
+**Status:** open, deferred. **Severity:** cosmetic but immediately visible.
+
+The boot sequence plays noticeably faster than a reference emulator running the same USA ROM —
+"seconds too fast", verified by side-by-side comparison. Races feel correct.
+
+### Ruled out (with evidence)
+
+| Hypothesis | Verdict |
+|---|---|
+| RT64 frame interpolation speeding the simulation | **Refuted.** `rr_option` `Display` vs `Original` both hold 60–61 SI polls/sec. |
+| Game loop periodically tripling (~180 polls/sec bursts) | **Refuted.** The bursts are Controller Pak I/O inflating the counter — every spike coincides with ~60 pak transactions, every quiet second has zero. The loop is a steady 60. |
+| Emulated CPU counter running fast | **Refuted.** `counter_per_ms = 46'875` is exactly the N64's 46.875 MHz count rate, and `speed_multiplier == 1`. |
+| Fixed delta-time override (`D_uvgfxmgr_rom_00402480`) | **Refuted.** Probed at both return sites of `func_uvgfxmgr_rom_00401004`: the override branch is **never** taken. |
+| Measured delta-time being wrong | **Refuted.** Measured delta averages **0.0163 s ≈ 1/61**, i.e. correct. ~1020 calls/sec ≈ 17 active sequences × 60 fps. |
+| Whole-frame divider (`D_8001F7C0`) | **Refuted.** Reads 0 in both the menu (state 14) and a race (state 2). |
+| SI completion pacing (`requeue_si`) | **Refuted.** `BAR_REQUEUE_SI=1` restores stock re-queueing: the menu becomes choppy but the animation speed is unchanged — the signature of correct delta-timing. |
+| PAL/NTSC confusion (PAL runs ~17% slower) | **Refuted** by the user's side-by-side against the same USA ROM. |
+
+### The attract's motion and its length are on two different clocks (7 Sep 2026)
+
+Daniel asked for the attract sequence to be capped at 30 Hz, on the theory that a game loop handed
+60 frames where the console's retrace request gave it 30 would run frame-counted content at double
+speed. `ultramodern::set_vi_divider()` was added to test it: it delivers VI retrace messages to the
+game once every N fields, so the game's own loop -- which blocks on those messages -- runs at 60/N.
+
+The attract sequence (`currentGameState` 2) was then timed end to end from `BAR_DBG_STATE`, headless,
+using the autoplay recipe in docs/HEADLESS_TESTING.md:
+
+| Configuration | Attract duration |
+|---|---|
+| Stock | **72.45 s** |
+| Game loop capped to 30 Hz (`BAR_ATTRACT_HZ=30`) | **72.76 s** (+0.4%) |
+| UV timeline delta halved (`BAR_TIME_SCALE=0.5`) | **72.46 s** (+0.01%) |
+
+**Neither lever moves the length.** That measurement was, however, aimed at the wrong quantity.
+Daniel then specified the actual complaint: it is not that the sequence is short, it is that *the
+demo cars drive too fast and miss their scripted events* -- the attract loses sync with itself. The
+attract is a canned replay run through the game's own race simulation, so what matters is the rate
+that simulation steps at, not how long the segment lasts.
+
+Capturing the demo at the same wall-clock offset into the attract, with and without the cap, shows
+the car at visibly different points on the lap -- further along uncapped, still approaching the same
+landmark capped. **So the cap does slow the driving**; the duration metric simply could not see it.
+
+The two results together give the shape of the thing: **the attract's motion and its length are on
+different clocks.** Motion steps with the game loop (and with the UV delta, per the older
+`BAR_TIME_SCALE` observation); the segment's length is on the wall clock or the VI count, neither of
+which the divider touches -- `total_vis`, the VI registers and the host's present rate all keep
+advancing at 60 regardless. A consequence worth knowing: with the cap on, the demo drives at the
+right speed but is still cut off after the same number of real seconds, so it covers less of the lap
+than it used to.
+
+The cap is therefore **on by default for state 2 only** (`ultramodern::set_vi_divider`, gated in
+`src/main/os_unimpl_stubs.cpp`). Menus, races and the front end keep the full 60.
+`BAR_ATTRACT_HZ=60` disables it; `BAR_VI_DIVIDER=<n>` forces a divider in every state.
+
+**The cap fixes the speed but breaks the audio (7 Sep 2026).** Daniel confirmed the capped build
+runs every part of the sequence at the correct speed -- and that the sound is then slowed and
+glitched. Measured during the attract, the host audio queue:
+
+| | queue floor | queue ceiling | `audio LOW` warnings |
+|---|---|---|---|
+| Capped to 30 Hz | **64** | 1088 | 1 |
+| Uncapped | 448-480 | ~1568 | 0 |
+
+So the queue runs at about half the headroom and dips to nearly empty. Starvation explains the
+glitching, but not the *slowing*; that comes from the same root cause. BAR's audio engine -- buffer
+generation and the music sequencer's tempo -- is advanced by the game loop, which is exactly what the
+divider halves, so the music plays at half tempo and the buffers arrive half as often.
+
+**This makes the VI divider the wrong lever in principle.** It cannot be tuned or buffered out of the
+problem: a sequencer stepping at half rate is half-tempo no matter how deep the queue is. The divider
+was removed again (reverted in the N64ModernRuntime fork) once the right lever was found.
+
+### Fixed: the game's own frame limiter, D_8001F7C0
+
+`D_8001F7C0` -- dismissed earlier in this document as a *cause* because it reads 0 -- turns out to be
+the *mechanism*. It is BAR's own minimum frame length, and `lib/bar-decomp/src/sched.c` shows exactly
+how it works. In `_uvScDoneGfx`, when the gfx task completes:
+
+```c
+if (D_8001F7C4 < D_8001F7C0) { D_8002F250 = (D_8001F7C0 - D_8001F7C4) + 1; }  // defer the swap
+else                         { D_8002F250 = 1; osViSwapBuffer(...); }         // swap now
+```
+
+`D_8001F7C4` counts retraces since the last frame was released; the countdown `D_8002F250` releases
+the frame and resets it. It ships as 0, so nothing is ever deferred and the sequence advances as fast
+as our tasks complete -- 60 Hz, where the console's heavier RCP gave it 30.
+
+Two things make this the right lever where the VI divider was not:
+
+* **It gates the gfx path only.** `_uvScDoneAud` is a separate completion path, so the audio task,
+  its buffer generation and the music sequencer's tempo all keep full rate. Measured during the
+  attract with the limiter engaged: queue floor 416-480 and **zero** `audio LOW` warnings, matching
+  the uncapped baseline rather than the divider's starved floor of 64.
+* **It is the game's own knob**, not something imposed from outside the simulation.
+
+**Mind the `+ 1`.** The field is not a frame count, it is one less than the frame length: a frame
+lasts `D_8001F7C0 + 1` fields, which is why the stock 0 yields 60 Hz rather than stalling. Writing 2
+gives three fields (20 Hz) and was reported as visibly too slow; **30 Hz is 1**. With 1 written during
+state 2, the measured loop rate is 33-38 SI polls/sec during the attract against 52-59 in the menu.
+
+Applied in `src/main/os_unimpl_stubs.cpp` for `currentGameState == 2` only. `BAR_ATTRACT_HZ` overrides
+the target; 60 disables it.
+
+**It does not actually fix the speed.** Daniel tested it: the audio is healthy again, but the demo is
+back to running fast. The reason is visible in the code above -- `_uvScDoneGfx` defers the *buffer
+swap*, not the simulation. The game keeps stepping its logic at full rate and simply presents fewer
+frames, so the cars still drive at 60 Hz speeds. That is also why the audio is fine, and it is the
+same distinction the VI divider got right for the wrong price: the divider slowed the loop (fixing
+speed, wrecking audio), the limiter slows presentation (keeping audio, not fixing speed).
+
+So the state of this issue is: **neither lever found so far slows the simulation alone.** What is
+needed is whatever advances the demo's physics per frame -- the replay playback step -- rather than
+either the swap rate or the retrace rate. Parked here at Daniel's request; the limiter is left in
+place because it is harmless and is the correct pacing mechanism should the simulation side be found.
+
+**Why 30 is believed to be the right target:** an actual race in this port runs its loop at ~30/s
+while the attract runs at ~60/s (the `BAR_FPS` measurement recorded above). The demo is a race, so
+the game's own race rate is the reference. That reasoning has not been checked against hardware, and
+a headless recipe that reaches a real race would let the two loop rates be compared directly with
+`BAR_DBG_FPS` -- worth doing before treating 30 as settled.
+
+**Still open:** whether the segment being cut off at the same wall-clock length (now covering less of
+the lap) is correct console behaviour or a second bug. If the console's attract shows the *whole*
+demo, then the length timer is wrong too, and it lives on the real-time source (`uvClkGetSec` /
+`osGetTime` / the VI counter) -- not on the frame loop and not on the gfx-manager delta.
+
+### The strongest remaining lead
+
+The UV timeline (`uvtseq_rom.c:243`) advances as `step -= rate * func_uvgfxmgr_rom_00401004()`,
+which is genuinely delta-timed and measured correct. A temporary scale factor on that delta
+(`BAR_TIME_SCALE`) **visibly changes the attract cinematics** — two captures at the same input
+frame differ between scale 1.0 and 0.4 — but **does not change the boot logo screens at all**
+(frame 1700 was byte-identical at both scales), and the user reported no perceptible change.
+
+That splits the boot sequence in two:
+
+- **Attract cinematics** — timeline-driven, delta-timed, responds to the scale knob.
+- **Legal / logo screens** — *not* driven by this time base. Whatever paces them is elsewhere.
+
+So if the "too fast" part is the logo/legal screens, every measurement above is consistent and the
+cause has simply not been located yet. This also lines up with the pre-existing note that the
+legal screens are driven by un-decompiled boot assembly whose per-frame handler was never pinned
+down (see the legal-screen-skip item inherited from upstream).
+
+### Next steps
+
+1. Determine precisely *which* part is fast — logo/legal screens or attract — by timing each
+   segment against the reference emulator with a stopwatch, rather than judging the whole boot.
+2. If it is the logo screens, find their pacing source. They are likely on a `uvClkGetSec` timer
+   in boot assembly; instrument that rather than the gfx-manager time base.
+3. Only then decide on a fix. Do **not** reach for `speed_multiplier` or the VI clock — the
+   simulation rate is measured correct and changing it would break lap times.
+
+### Temporary scaffolding to remove
+
+- `bar_timebase()` / `bar_dbg_timebase()` in `src/main/bar_config.cpp` (`BAR_TIME_SCALE`,
+  `BAR_DBG_TIME`).
+- Probe calls patched into `RecompiledFuncs/funcs_38.c` at both return sites of
+  `func_uvgfxmgr_rom_00401004`. These live in **generated** code and disappear on the next
+  `N64Recomp` run — re-apply manually if the investigation resumes.
+- `BAR_DBG_DIV` frame-divider logging in `src/main/os_unimpl_stubs.cpp`.
+
+`BAR_DBG_PAK` in the same file is worth keeping — it is what diagnosed the Controller Pak.

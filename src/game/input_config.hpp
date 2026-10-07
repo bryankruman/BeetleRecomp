@@ -90,7 +90,10 @@ enum class PakType : int { None, ControllerPak, RumblePak };
 struct PortConfig {
     bool        connected = false;   // is a controller plugged into this N64 port
     DeviceRef   device;              // which host device drives it
-    PakType     pak = PakType::None;
+    // BAR saves ONLY to a Controller Pak (osPfs*; no EEPROM/SRAM/Flash), so a port with no pak makes
+    // the game open with "No Controller Pak present. … Start Game Without Saving" and never save.
+    // The 32 KiB mempak store below is fully emulated and persisted per port, so default it inserted.
+    PakType     pak = PakType::ControllerPak;
     Bindings    bindings;
     std::string profile_name;        // last-applied named profile ("" = custom / unsaved edits)
 };

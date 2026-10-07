@@ -6,9 +6,8 @@
 #
 # Run with:  ./N64Recomp patches.toml   (after building patches/patches.elf)
 #
-# This is a LATER-phase step: the minimal first-boot path needs only
-# BeetleRecomp.toml. Patches require symbol TOMLs generated from the decomp
-# (see syms/ and the README).
+# Viewport patches are required for the integrated release's widescreen behavior.
+# Generate the reference symbol TOMLs from the exact ELF used for the main recomp.
 
 [input]
 elf_path = "patches/patches.elf"
@@ -17,11 +16,14 @@ single_file_output = true
 use_absolute_symbols = true
 
 # Decomp symbol metadata so the recompiler can resolve relocations.
-# Generate these from the decomp's symbol_addrs (see scripts / README).
+# Generated from the decomp's recomp ELF by tools/gen_reference_syms.py:
+#   python3 tools/gen_reference_syms.py elf/recomp.elf \
+#       syms/beetleadventurerac.us.syms.toml syms/beetleadventurerac.us.datasyms.toml
 func_reference_syms_file = "syms/beetleadventurerac.us.syms.toml"
 data_reference_syms_files = [
     "syms/beetleadventurerac.us.datasyms.toml",
-    "patches/custom_syms.toml",
+    # "patches/custom_syms.toml",  # re-add once it actually declares a [[section]] — the parser
+    #                               # rejects a file with no sections, see that file's header.
 ]
 
 # Let the recompiler emit the patched binary (so it can fix MIPS32 relocs itself).

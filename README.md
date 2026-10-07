@@ -4,7 +4,12 @@ A work-in-progress **native PC port of _Beetle Adventure Racing!_ (N64, USA)** b
 **static recompilation** with the [N64Recomp][N64Recomp] toolchain — the same approach
 behind [Zelda 64: Recompiled](https://github.com/Zelda64Recomp/Zelda64Recomp).
 
-> **Status (2026-07-01): playable.** Boots through the intros and menus into races and renders at
+> **Integration status (2026-10-06): Linux build passes; Windows/game verification remains.** Daniel Gomes Vieira's
+> frontend, saves/rumble, multiplayer and renderer improvements are integrated with corrections.
+> Read the [fork review](docs/FORK_REVIEW.md) for verification evidence and the two remaining
+> fidelity/enhancement decisions. The historical baseline status below is not a test of this change.
+
+> **Historical baseline (2026-07-01): playable.** Boots through the intros and menus into races and renders at
 > 60 fps, with keyboard + gamepad input and audio working. Ships an in-app launcher / settings /
 > cheats / pause menu (RmlUi over RT64), internal-resolution scaling (defaults to display-native),
 > MSAA + a VI "divot" seam filter, and high-FPS interpolation (phase 1). A handful of polish items

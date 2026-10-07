@@ -1,0 +1,3284 @@
+--- a/librecomp/CMakeLists.txt
++++ b/librecomp/CMakeLists.txt
+@@ -9,6 +9,8 @@
+ add_library(librecomp STATIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/ai.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/cont.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/config_option.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/config.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/dp.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/eep.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/euc-jp.cpp"
+--- /dev/null
++++ b/librecomp/include/librecomp/config.hpp
+@@ -0,0 +1,373 @@
++#ifndef __RECOMP_CONFIG_HPP__
++#define __RECOMP_CONFIG_HPP__
++
++#include <filesystem>
++#include <string>
++#include <vector>
++#include <unordered_set>
++#include <unordered_map>
++#include <variant>
++#include <functional>
++
++#include <json/json.hpp>
++
++#include "recomp.h"
++
++// Remove X11 define
++#undef Bool
++
++namespace recomp {
++    namespace config {
++
++        bool check_config_option_bool_string(const std::string& str);
++
++        enum class ConfigOptionType {
++            None,
++            Enum,
++            Number,
++            String,
++            Bool
++        };
++
++        struct ConfigOptionEnumOption {
++            uint32_t value;
++            std::string key;
++            std::string name;
++
++            template <typename ENUM_TYPE = uint32_t>
++            ConfigOptionEnumOption(ENUM_TYPE value, std::string key, std::string name)
++                : value(static_cast<uint32_t>(value)), key(key), name(name) {}
++
++            template <typename ENUM_TYPE = uint32_t>
++            ConfigOptionEnumOption(ENUM_TYPE value, std::string key)
++                : value(static_cast<uint32_t>(value)), key(key), name(key) {}
++        };
++
++        struct ConfigOptionEnum {
++            std::vector<ConfigOptionEnumOption> options;
++            uint32_t default_value = 0;
++
++            // Case insensitive search for an option based on a key string. (Matches against options[n].key)
++            std::vector<ConfigOptionEnumOption>::const_iterator find_option_from_string(const std::string& option_key) const;
++            // Search for an option that has a specific value. (Matches against options[n].value)
++            std::vector<ConfigOptionEnumOption>::const_iterator find_option_from_value(uint32_t value) const;
++            // Verify an option has a unique key and a unique value
++            bool can_add_option(const std::string& option_key, uint32_t option_value) const;
++
++            ConfigOptionEnum() = default;
++            ConfigOptionEnum(const std::vector<ConfigOptionEnumOption>& options, uint32_t default_value = 0)
++                : options(options), default_value(default_value) {}
++            template <typename ENUM_TYPE = uint32_t>
++            ConfigOptionEnum(const std::vector<ConfigOptionEnumOption>& options, ENUM_TYPE default_value = 0)
++                : options(options), default_value(static_cast<uint32_t>(default_value)) {}
++        };
++
++        struct ConfigOptionNumber {
++            double min = 0.0;
++            double max = 0.0;
++            double step = 0.0;
++            int precision = 0;
++            bool percent = false;
++            double default_value = 0.0;
++
++            static ConfigOptionNumber create_percent_option(double default_value = 0.0) {
++                return ConfigOptionNumber{
++                    .min = 0.0,
++                    .max = 100.0,
++                    .step = 1.0,
++                    .precision = 0,
++                    .percent = true,
++                    .default_value = default_value
++                };
++            }
++        };
++
++        struct ConfigOptionString {
++            std::string default_value;
++        };
++
++        struct ConfigOptionBool {
++            bool default_value;
++        };
++
++        typedef std::variant<ConfigOptionEnum, ConfigOptionNumber, ConfigOptionString, ConfigOptionBool> ConfigOptionVariant;
++
++        struct ConfigOption {
++            std::string id;
++            std::string name;
++            std::string description;
++            bool hidden = false;
++            ConfigOptionType type;
++            ConfigOptionVariant variant;
++        };
++
++        typedef std::variant<std::monostate, uint32_t, double, std::string, bool> ConfigValueVariant;
++
++        // Manages value dependencies between config options (e.g. option is hidden or disabled from other option being a certain value) .
++        class ConfigOptionDependency {
++        private:
++            // Maps options to the options that are affected by their values
++            std::unordered_map<size_t, std::unordered_set<size_t>> option_to_dependencies = {};
++            // Maps dependent options to the values that the source option can be
++            std::unordered_map<size_t, std::vector<ConfigValueVariant>> dependency_to_values = {};
++        public:
++            ConfigOptionDependency() = default;
++
++            // Add dependency. When <source_option> is one of the <values>, <dependent_option> is affected.
++            void add_option_dependency(size_t dependent_option_index, size_t source_option_index, std::vector<ConfigValueVariant> &values);
++
++            // Check which dependent options are affected by the value of the source option.
++            // Returns a map of dependent options and if they are a match
++            std::unordered_map<size_t, bool> check_option_dependencies(size_t source_option_index, ConfigValueVariant value);
++        };
++
++        struct ConfigSchema {
++            std::vector<ConfigOption> options;
++            std::unordered_map<std::string, size_t> options_by_id;
++            ConfigOptionDependency disable_dependencies;
++            ConfigOptionDependency hidden_dependencies;
++        };
++
++        struct ConfigStorage {
++            std::unordered_map<std::string, ConfigValueVariant> value_map;
++        };
++
++        enum class ConfigOptionUpdateType {
++            Disabled,
++            Hidden,
++            EnumDetails,
++            EnumDisabled,
++            Value,
++            Description
++        };
++
++        struct ConfigOptionUpdateContext {
++            size_t option_index;
++            std::vector<ConfigOptionUpdateType> updates = {};
++        };
++
++        enum class OptionChangeContext {
++            Load,
++            Temporary,
++            Permanent
++        };
++
++        using on_option_change_callback = std::function<void(
++            ConfigValueVariant cur_value,
++            ConfigValueVariant prev_value,
++            OptionChangeContext change_context
++        )>;
++
++        using parse_option_func = std::function<ConfigValueVariant(const nlohmann::json&)>;
++        using serialize_option_func = std::function<nlohmann::json(const ConfigValueVariant&)>;
++
++        class Config {
++        public:
++            std::string name;
++            // id is used for the file name (e.g. general.json) and storing keys
++            std::string id;
++            // If true, any configuration changes are temporarily stored until Apply is pressed.
++            // Changing the tab will prompt the user to either apply or cancel changes.
++            bool requires_confirmation = false;
++
++            std::unordered_set<size_t> modified_options = {};
++
++            // For base game configs
++            Config(std::string name, std::string id, bool requires_confirmation = false);
++            // For mod configs
++            Config();
++
++            void set_id(const std::string &id);
++            void set_mod_version(const std::string &mod_version);
++
++            void add_option(const ConfigOption& option);
++
++            void add_enum_option(
++                const std::string &id,
++                const std::string &name,
++                const std::string &description,
++                const std::vector<ConfigOptionEnumOption> &options,
++                uint32_t default_value,
++                bool hidden = false
++            );
++
++            // Allows you to add an enum option using an enum type instead of uint32_t.
++            template <typename ENUM_TYPE>
++            void add_enum_option(
++                const std::string &id,
++                const std::string &name,
++                const std::string &description,
++                const std::vector<ConfigOptionEnumOption> &options,
++                ENUM_TYPE default_value,
++                bool hidden = false
++            ) {
++                add_enum_option(id, name, description, options, static_cast<uint32_t>(default_value), hidden);
++            };
++
++            void add_number_option(
++                const std::string &id,
++                const std::string &name,
++                const std::string &description,
++                double min = 0,
++                double max = 0,
++                double step = 1,
++                int precision = 0,
++                bool percent = false,
++                double default_value = 0,
++                bool hidden = false
++            );
++
++            // Convenience function for adding a percent number option
++            void add_percent_number_option(
++                const std::string &id,
++                const std::string &name,
++                const std::string &description,
++                double default_value,
++                bool hidden = false
++            );
++
++            void add_string_option(
++                const std::string &id,
++                const std::string &name,
++                const std::string &description,
++                const std::string &default_value,
++                bool hidden = false
++            );
++
++            void add_bool_option(
++                const std::string &id,
++                const std::string &name,
++                const std::string &description,
++                bool default_value = false,
++                bool hidden = false
++            );
++
++            const ConfigOption &get_option(size_t option_index) const;
++            const ConfigOption &get_option(const std::string& option_id) const;
++            template <typename T = ConfigOptionVariant>
++            const T &get_option_config(size_t option_index) const {
++                return std::get<T>(get_option(option_index).variant);
++            };
++
++            bool has_option(const std::string& option_id) const;
++            const ConfigValueVariant get_option_value(const std::string& option_id) const;
++            const ConfigValueVariant get_temp_option_value(const std::string& option_id) const;
++            // This should only be used internally to recompui. Other changes to values should be done through update_option_value
++            // so rendering can be updated with your new set value.
++            void set_option_value(const std::string& option_id, ConfigValueVariant value);
++            bool get_enum_option_disabled(size_t option_index, uint32_t enum_index) const;
++            void add_option_change_callback(const std::string& option_id, on_option_change_callback callback);
++            void set_load_callback(std::function<void()> callback) {
++                load_callback = callback;
++            }
++            void set_save_callback(std::function<void()> callback) {
++                save_callback = callback;
++            }
++
++            void report_config_option_update(size_t option_index, ConfigOptionUpdateType update_type);
++            void update_option_disabled(size_t option_index, bool disabled);
++            void update_option_disabled(const std::string& option_id, bool disabled);
++            void update_option_hidden(size_t option_index, bool hidden);
++            void update_option_hidden(const std::string& option_id, bool hidden);
++            void update_option_enum_details(const std::string& option_id, const std::string& enum_details);
++            void update_option_value(const std::string& option_id, ConfigValueVariant value);
++            void update_option_description(const std::string& option_id, const std::string& new_description);
++            void update_enum_option_disabled(const std::string& option_id, uint32_t enum_index, bool disabled);
++
++            // Makes the dependent option disabled when the source option is set to any of the specified values.
++            void add_option_disable_dependency(const std::string& dependent_option_id, const std::string& source_option_id, std::vector<ConfigValueVariant> &values);
++            template <typename... ENUM_TYPE>
++            void add_option_disable_dependency(const std::string& dependent_option_id, const std::string& source_option_id, ENUM_TYPE... enum_values) {
++                std::vector<ConfigValueVariant> values;
++                for (const auto& value : {enum_values...}) {
++                    values.push_back(static_cast<uint32_t>(value));
++                }
++                add_option_disable_dependency(dependent_option_id, source_option_id, values);
++            };
++            // Makes the dependent option hidden when the source option is set to any of the specified values.
++            // Does not override the option's inherent hidden property if set.
++            void add_option_hidden_dependency(const std::string& dependent_option_id, const std::string& source_option_id, std::vector<ConfigValueVariant> &values);
++            template <typename... ENUM_TYPE>
++            void add_option_hidden_dependency(const std::string& dependent_option_id, const std::string& source_option_id, ENUM_TYPE... enum_values) {
++                std::vector<ConfigValueVariant> values;
++                for (const auto& value : {enum_values...}) {
++                    values.push_back(static_cast<uint32_t>(value));
++                }
++                add_option_hidden_dependency(dependent_option_id, source_option_id, values);
++            };
++            void add_option_hidden_dependency(const std::string& dependent_option_id, const std::string& source_option_id, bool bool_val) {
++                std::vector<ConfigValueVariant> values = { bool_val };
++                add_option_hidden_dependency(dependent_option_id, source_option_id, values);
++            };
++
++            // Apply any temporary values to the option.
++            void apply_option_value(const ConfigOption &option);
++            void apply_option_value(const std::string &option_id);
++
++            bool load_config(std::function<bool(nlohmann::json &)> validate_callback = nullptr);
++            bool save_config();
++            bool save_config_json(nlohmann::json config_json) const;
++            std::filesystem::path get_file_path() const;
++            nlohmann::json get_json_config() const;
++
++            void revert_temp_config();
++
++            bool is_dirty() const;
++
++            std::vector<ConfigOptionUpdateContext> get_config_option_updates() { return config_option_updates; }
++            bool is_config_option_disabled(size_t option_index) const { return disabled_options.contains(option_index); }
++            bool is_config_option_hidden(size_t option_index) const;
++            void clear_config_option_updates() {
++                config_option_updates.clear();
++            }
++            std::string get_enum_option_details(size_t option_index) const;
++            void on_json_parse_option(const std::string& option_id, parse_option_func callback) {
++                json_parse_option_map[option_id] = callback;
++            }
++            void on_json_serialize_option(const std::string& option_id, serialize_option_func callback) {
++                json_serialize_option_map[option_id] = callback;
++            }
++
++            const ConfigStorage& get_config_storage() const;
++            const ConfigSchema& get_config_schema() const;
++
++        private:
++            bool loaded_config = false;
++            bool is_mod_config = false;
++
++            std::string config_file_name;
++            std::string mod_version; // only used if mod
++
++            ConfigSchema schema;
++            ConfigStorage storage;
++            ConfigStorage temp_storage;
++
++            std::unordered_map<size_t, on_option_change_callback> option_change_callbacks = {};
++            std::function<void()> load_callback = nullptr;
++            std::function<void()> save_callback = nullptr;
++            std::vector<ConfigOptionUpdateContext> config_option_updates = {};
++            std::unordered_set<size_t> disabled_options = {};
++            std::unordered_set<size_t> hidden_options = {};
++            std::unordered_map<size_t, std::string> enum_option_details = {};
++            std::unordered_map<size_t, std::unordered_set<size_t>> enum_options_disabled = {};
++
++            std::unordered_map<std::string, parse_option_func> json_parse_option_map = {};
++            std::unordered_map<std::string, serialize_option_func> json_serialize_option_map = {};
++
++            const ConfigValueVariant get_option_value_from_storage(const std::string& option_id, const ConfigStorage& src) const;
++
++            void derive_all_config_option_dependencies();
++            void derive_option_dependencies(size_t option_index);
++            void try_call_option_change_callback(const std::string& option_id, ConfigValueVariant value, ConfigValueVariant prev_value, OptionChangeContext change_context);
++            const ConfigValueVariant get_option_default_value(const std::string& option_id) const;
++            void determine_changed_option(const std::string& option_id);
++            ConfigValueVariant parse_config_option_json_value(const nlohmann::json& json_value, const ConfigOption &option);
++
++            // Return pointer to the root of where the config values should be stored in the json.
++            nlohmann::json *get_config_storage_root(nlohmann::json* json);
++            nlohmann::json get_storage_json() const;
++        };
++    }
++}
++
++#endif // __RECOMP_CONFIG_HPP__
+--- a/librecomp/include/librecomp/game.hpp
++++ b/librecomp/include/librecomp/game.hpp
+@@ -21,9 +21,11 @@
+     struct GameEntry {
+         uint64_t rom_hash;
+         std::string internal_name;
++        std::string display_name;
+         std::u8string game_id;
+         std::string mod_game_id;
+         SaveType save_type = SaveType::None;
++        std::span<const char> thumbnail_bytes;
+         bool is_enabled;
+         // Only needed for mod function hooking support, not needed if `has_compressed_code` is false.
+         std::vector<uint8_t> (*decompression_routine)(std::span<const uint8_t> compressed_rom) = nullptr;
+@@ -44,6 +46,14 @@
+         int patch = -1;
+         std::string suffix;
+ 
++        Version() = default;
++        Version(int major, int minor, int patch, std::string suffix = std::string()) {
++            this->major = major;
++            this->minor = minor;
++            this->patch = patch;
++            this->suffix = suffix;
++        }
++
+         std::string to_string() const {
+             return std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch) + suffix;
+         }
+@@ -58,7 +68,11 @@
+                 return minor <=> rhs.minor;
+             }
+             return patch <=> rhs.patch;
+-        } 
++        }
++
++        bool is_null() const {
++            return (major == -1) && (minor == -1) && (patch == -1) && suffix.empty();
++        }
+     };
+     enum class RomValidationError {
+         Good,
+@@ -70,11 +84,12 @@
+         OtherError
+     };
+     void register_config_path(std::filesystem::path path);
++    std::filesystem::path get_config_path();
+     bool register_game(const recomp::GameEntry& entry);
+     void check_all_stored_roms();
+-    bool load_stored_rom(std::u8string& game_id);
+-    RomValidationError select_rom(const std::filesystem::path& rom_path, std::u8string& game_id);
+-    bool is_rom_valid(std::u8string& game_id);
++    bool load_stored_rom(const std::u8string& game_id);
++    RomValidationError select_rom(const std::filesystem::path& rom_path, const std::u8string& game_id);
++    bool is_rom_valid(const std::u8string& game_id);
+     bool is_rom_loaded();
+     void set_rom_contents(std::vector<uint8_t>&& new_rom);
+     std::span<const uint8_t> get_rom();
+@@ -89,6 +104,8 @@
+     /// - `renderer_callbacks`
+     /// 
+     struct Configuration {
++        int argc = 0;
++        char **argv = nullptr;
+         Version project_version;
+         ultramodern::renderer::WindowHandle window_handle;
+         recomp::rsp::callbacks_t rsp_callbacks;
+@@ -114,7 +131,7 @@
+     bool sram_allowed();
+     bool flashram_allowed();
+ 
+-    void start_game(const std::u8string& game_id);
++    void start_game(const std::u8string& game_id, const std::string& game_mode_id);
+     std::u8string current_game_id();
+     std::string current_mod_game_id();
+ }
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -27,6 +27,7 @@
+ #include "librecomp/game.hpp"
+ #include "librecomp/sections.h"
+ #include "librecomp/overlays.hpp"
++#include "librecomp/config.hpp"
+ 
+ namespace N64Recomp {
+     class Context;
+@@ -81,7 +82,10 @@
+             InvalidDependencyString,
+             MissingManifestField,
+             DuplicateMod,
+-            WrongGame
++            WrongGame,
++            InvalidDisableOptionDependency,
++            InvalidHiddenOptionDependency,
++            DuplicateEnumStrings,
+         };
+ 
+         std::string error_to_string(ModOpenError);
+@@ -149,6 +153,25 @@
+             WrongVersion = 3
+         };
+ 
++        enum class DeprecationStatus {
++            // Status is unknown.
++            Unknown,
++
++            // The mod was integrated as part of the project.
++            Integrated,
++
++            // The mod is known to have a game breaking issue, but can be fixed by updating it.
++            BrokenVersion,
++
++            // The mod is known to have a game breaking issue that is not fixable.
++            BrokenPermanent
++        };
++
++        struct DeprecatedMod {
++            DeprecationStatus status;
++            Version maximum_version;
++        };
++
+         struct ModFileHandle {
+             virtual ~ModFileHandle() = default;
+             virtual std::vector<char> read_file(const std::string& filepath, bool& exists) const = 0;
+@@ -188,45 +211,6 @@
+             std::string mod_id;
+             Version version;
+             bool optional;
+-        };
+-
+-        struct ConfigOptionEnum {
+-            std::vector<std::string> options;
+-            uint32_t default_value = 0;
+-        };
+-
+-        struct ConfigOptionNumber {
+-            double min = 0.0;
+-            double max = 0.0;
+-            double step = 0.0;
+-            int precision = 0;
+-            bool percent = false;
+-            double default_value = 0.0;
+-        };
+-
+-        struct ConfigOptionString {
+-            std::string default_value;
+-        };
+-
+-        typedef std::variant<ConfigOptionEnum, ConfigOptionNumber, ConfigOptionString> ConfigOptionVariant;
+-
+-        struct ConfigOption {
+-            std::string id;
+-            std::string name;
+-            std::string description;
+-            ConfigOptionType type;
+-            ConfigOptionVariant variant;
+-        };
+-
+-        struct ConfigSchema {
+-            std::vector<ConfigOption> options;
+-            std::unordered_map<std::string, size_t> options_by_id;
+-        };
+-
+-        typedef std::variant<std::monostate, uint32_t, double, std::string> ConfigValueVariant;
+-
+-        struct ConfigStorage {
+-            std::unordered_map<std::string, ConfigValueVariant> value_map;
+         };
+ 
+         struct ModDetails {
+@@ -239,6 +223,7 @@
+             std::vector<Dependency> dependencies;
+             bool runtime_toggleable;
+             bool enabled_by_default;
++            bool custom_gamemode;
+         };
+ 
+         struct ModManifest {
+@@ -252,11 +237,11 @@
+             std::vector<std::string> authors;
+             std::vector<Dependency> dependencies;
+             std::unordered_map<std::string, size_t> dependencies_by_id;
+-            ConfigSchema config_schema;
+             Version minimum_recomp_version;
+             Version version;
+             bool runtime_toggleable;
+             bool enabled_by_default;
++            bool custom_gamemode;
+ 
+             std::vector<NativeLibraryManifest> native_libraries;
+             std::unique_ptr<ModFileHandle> file_handle;
+@@ -341,7 +326,11 @@
+             uint32_t pad;
+         };
+ 
+-        typedef std::variant<ModConfigQueueSaveMod, ModConfigQueueSave, ModConfigQueueEnd> ModConfigQueueVariant;
++        struct ModConfigSetLatestGamemode {
++            uint32_t pad;
++        };
++
++        typedef std::variant<ModConfigQueueSaveMod, ModConfigQueueSave, ModConfigQueueEnd, ModConfigSetLatestGamemode> ModConfigQueueVariant;
+ 
+         class LiveRecompilerCodeHandle;
+         class ModContext {
+@@ -351,14 +340,18 @@
+ 
+             void register_game(const std::string& mod_game_id);
+             void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes);
++            void register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version& maximum_version);
+             std::vector<ModOpenErrorDetails> scan_mod_folder(const std::filesystem::path& mod_folder);
+             void close_mods();
+             void load_mods_config();
+             void enable_mod(const std::string& mod_id, bool enabled, bool trigger_save);
+-            bool is_mod_enabled(const std::string& mod_id);
+-            bool is_mod_auto_enabled(const std::string& mod_id);
++            bool is_mod_enabled(const std::string& mod_id) const;
++            bool is_mod_auto_enabled(const std::string& mod_id) const;
++            bool is_mod_deprecated(const std::string& mod_id, const Version& mod_version) const;
++            DeprecationStatus get_mod_deprecation_status(const std::string& mod_id) const;
++            Version get_mod_deprecation_version(const std::string& mod_id) const;
+             size_t num_opened_mods();
+-            std::vector<ModLoadErrorDetails> load_mods(const GameEntry& game_entry, uint8_t* rdram, int32_t load_address, uint32_t& ram_used);
++            std::vector<ModLoadErrorDetails> load_mods(const GameEntry& game_entry, const std::string& game_mode_id, uint8_t* rdram, int32_t load_address, uint32_t& ram_used);
+             void unload_mods();
+             std::string get_mod_id_from_filename(const std::filesystem::path& mod_filename) const;
+             std::filesystem::path get_mod_filename(const std::string& mod_id) const;
+@@ -366,17 +359,21 @@
+             size_t get_mod_order_index(size_t mod_index) const;
+             std::optional<ModDetails> get_details_for_mod(const std::string& mod_id) const;
+             std::vector<ModDetails> get_all_mod_details(const std::string& mod_game_id);
++            size_t game_mode_count(const std::string& mod_game_id, bool include_disabled) const;
+             recomp::Version get_mod_version(size_t mod_index);
+             std::string get_mod_id(size_t mod_index);
+             void set_mod_index(const std::string &mod_game_id, const std::string &mod_id, size_t index);
+-            const ConfigSchema &get_mod_config_schema(const std::string &mod_id) const;
++            const config::ConfigSchema &get_mod_config_schema(const std::string &mod_id) const;
++            config::Config *get_mod_config(const std::string &mod_id);
+             const std::vector<char> &get_mod_thumbnail(const std::string &mod_id) const;
+-            void set_mod_config_value(size_t mod_index, const std::string &option_id, const ConfigValueVariant &value);
+-            void set_mod_config_value(const std::string &mod_id, const std::string &option_id, const ConfigValueVariant &value);
+-            ConfigValueVariant get_mod_config_value(size_t mod_index, const std::string &option_id) const;
+-            ConfigValueVariant get_mod_config_value(const std::string &mod_id, const std::string &option_id) const;
++            void set_mod_config_value(size_t mod_index, const std::string &option_id, const config::ConfigValueVariant &value);
++            void set_mod_config_value(const std::string &mod_id, const std::string &option_id, const config::ConfigValueVariant &value);
++            config::ConfigValueVariant get_mod_config_value(size_t mod_index, const std::string &option_id) const;
++            config::ConfigValueVariant get_mod_config_value(const std::string &mod_id, const std::string &option_id) const;
+             void set_mods_config_path(const std::filesystem::path &path);
+             void set_mod_config_directory(const std::filesystem::path &path);
++            std::string get_latest_game_mode_id() const;
++            void set_latest_game_mode_id(const std::string& game_mode_id);
+             ModContentTypeId register_content_type(const ModContentType& type);
+             bool register_container_type(const std::string& extension, const std::vector<ModContentTypeId>& content_types, bool requires_manifest);
+             ModContentTypeId get_code_content_type() const { return code_content_type_id; }
+@@ -394,7 +391,7 @@
+             CodeModLoadError init_mod_code(uint8_t* rdram, const std::unordered_map<uint32_t, uint16_t>& section_vrom_map, ModHandle& mod, int32_t load_address, bool hooks_available, uint32_t& ram_used, std::string& error_param);
+             CodeModLoadError load_mod_code(uint8_t* rdram, ModHandle& mod, uint32_t base_event_index, std::string& error_param);
+             CodeModLoadError resolve_code_dependencies(ModHandle& mod, size_t mod_index, const std::unordered_map<recomp_func_t*, recomp::overlays::BasePatchedFunction>& base_patched_funcs, std::string& error_param);
+-            void add_opened_mod(ModManifest&& manifest, ConfigStorage&& config_storage, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& detected_content_types, std::vector<char>&& thumbnail);
++            void add_opened_mod(ModManifest&& manifest, config::Config&& config, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& detected_content_types, std::vector<char>&& thumbnail);
+             std::vector<ModLoadErrorDetails> regenerate_with_hooks(
+                 const std::vector<std::pair<HookDefinition, size_t>>& sorted_unprocessed_hooks,
+                 const std::unordered_map<uint32_t, uint16_t>& section_vrom_map,
+@@ -419,6 +416,7 @@
+             std::unordered_set<std::string> mod_ids;
+             std::unordered_set<std::string> enabled_mods;
+             std::unordered_set<std::string> auto_enabled_mods;
++            std::unordered_map<std::string, DeprecatedMod> deprecated_mods;
+             std::unordered_map<recomp_func_t*, PatchData> patched_funcs;
+             std::unordered_map<std::string, size_t> loaded_mods_by_id;
+             std::unique_ptr<std::thread> mod_configuration_thread;
+@@ -438,12 +436,14 @@
+             std::vector<bool> processed_hook_slots;
+             // Generated shim functions to use for implementing shim exports.
+             std::vector<std::unique_ptr<N64Recomp::ShimFunction>> shim_functions;
+-            ConfigSchema empty_schema;
++            config::ConfigSchema empty_schema;
+             std::vector<char> empty_bytes;
+             size_t num_events = 0;
+             ModContentTypeId code_content_type_id;
+             ModContentTypeId rom_patch_content_type_id;
+             size_t active_game = (size_t)-1;
++            std::string latest_game_mode;
++            mutable std::mutex latest_game_mode_mutex;
+         };
+ 
+         class ModCodeHandle {
+@@ -463,7 +463,7 @@
+         public:
+             // TODO make these private and expose methods for the functionality they're currently used in.
+             ModManifest manifest;
+-            ConfigStorage config_storage;
++            config::Config config;
+             std::unique_ptr<ModCodeHandle> code_handle;
+             std::unique_ptr<N64Recomp::Context> recompiler_context;
+             std::vector<uint32_t> section_load_addresses;
+@@ -471,7 +471,7 @@
+             std::vector<ModContentTypeId> content_types;
+             std::vector<char> thumbnail;
+ 
+-            ModHandle(const ModContext& context, ModManifest&& manifest, ConfigStorage&& config_storage, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& content_types, std::vector<char>&& thumbnail);
++            ModHandle(const ModContext& context, ModManifest&& manifest, config::Config&& config, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& content_types, std::vector<char>&& thumbnail);
+             ModHandle(const ModHandle& rhs) = delete;
+             ModHandle& operator=(const ModHandle& rhs) = delete;
+             ModHandle(ModHandle&& rhs);
+@@ -510,7 +510,8 @@
+                     .authors = manifest.authors,
+                     .dependencies = manifest.dependencies,
+                     .runtime_toggleable = is_runtime_toggleable(),
+-                    .enabled_by_default = manifest.enabled_by_default
++                    .enabled_by_default = manifest.enabled_by_default,
++                    .custom_gamemode = manifest.custom_gamemode
+                 };
+             }
+         private:
+@@ -617,27 +618,36 @@
+         void register_hook_exports();
+         void run_hook(uint8_t* rdram, recomp_context* ctx, size_t hook_slot_index);
+ 
+-        ModOpenError parse_manifest(ModManifest &ret, const std::vector<char> &manifest_data, std::string &error_param);
++        ModOpenError parse_manifest(ModManifest &ret, const std::vector<char> &manifest_data, std::string &error_param, recomp::config::Config *config = nullptr);
+         CodeModLoadError validate_api_version(uint32_t api_version, std::string& error_param);
+ 
+         void initialize_mods();
+-        void register_embedded_mod(const std::string &mod_id, std::span<const uint8_t> mod_bytes);
++        void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes);
++        void register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version &maximum_version);
+         void scan_mods();
+         void close_mods();
+         std::filesystem::path get_mods_directory();
+         std::optional<ModDetails> get_details_for_mod(const std::string& mod_id);
+         std::vector<ModDetails> get_all_mod_details(const std::string& mod_game_id);
++        size_t game_mode_count(const std::string& mod_game_id, bool include_disabled);
+         recomp::Version get_mod_version(size_t mod_index);
+         std::string get_mod_id(size_t mod_index);
+         void enable_mod(const std::string& mod_id, bool enabled);
+         bool is_mod_enabled(const std::string& mod_id);
+         bool is_mod_auto_enabled(const std::string& mod_id);
+-        const ConfigSchema &get_mod_config_schema(const std::string &mod_id);
++        bool is_mod_deprecated(const std::string& mod_id, const Version& mod_version);
++        DeprecationStatus get_mod_deprecation_status(const std::string& mod_id);
++        Version get_mod_deprecation_version(const std::string& mod_id);
++        std::string deprecation_status_to_message(DeprecationStatus deprecation_status);
++        const config::ConfigSchema &get_mod_config_schema(const std::string &mod_id);
++        config::Config *get_mod_config(const std::string &mod_id);
+         const std::vector<char> &get_mod_thumbnail(const std::string &mod_id);
+-        void set_mod_config_value(size_t mod_index, const std::string &option_id, const ConfigValueVariant &value);
+-        void set_mod_config_value(const std::string &mod_id, const std::string &option_id, const ConfigValueVariant &value);
+-        ConfigValueVariant get_mod_config_value(size_t mod_index, const std::string &option_id);
+-        ConfigValueVariant get_mod_config_value(const std::string &mod_id, const std::string &option_id);
++        void set_mod_config_value(size_t mod_index, const std::string &option_id, const config::ConfigValueVariant &value);
++        void set_mod_config_value(const std::string &mod_id, const std::string &option_id, const config::ConfigValueVariant &value);
++        config::ConfigValueVariant get_mod_config_value(size_t mod_index, const std::string &option_id);
++        config::ConfigValueVariant get_mod_config_value(const std::string &mod_id, const std::string &option_id);
++        std::string get_latest_game_mode_id();
++        void set_latest_game_mode_id(const std::string& game_mode_id);
+         std::string get_mod_id_from_filename(const std::filesystem::path& mod_filename);
+         std::filesystem::path get_mod_filename(const std::string& mod_id);
+         size_t get_mod_order_index(const std::string& mod_id);
+--- /dev/null
++++ b/librecomp/src/config.cpp
+@@ -0,0 +1,712 @@
++#include <fstream>
++#include <cmath>
++#include "librecomp/files.hpp"
++#include "librecomp/config.hpp"
++#include "librecomp/game.hpp"
++#include "librecomp/mods.hpp"
++
++static bool read_json(std::ifstream input_file, nlohmann::json& json_out) {
++    if (!input_file.good()) {
++        return false;
++    }
++
++    try {
++        input_file >> json_out;
++    }
++    catch (nlohmann::json::exception&) {
++        return false;
++    }
++    return true;
++}
++
++static bool read_json_with_backups(const std::filesystem::path& path, nlohmann::json& json_out) {
++    // Try reading and parsing the base file.
++    if (read_json(std::ifstream{path}, json_out)) {
++        return true;
++    }
++
++    // Try reading and parsing the backup file.
++    if (read_json(recomp::open_input_backup_file(path), json_out)) {
++        return true;
++    }
++
++    // Both reads failed.
++    return false;
++}
++
++static bool save_json_with_backups(const std::filesystem::path& path, const nlohmann::json& json_data) {
++    {
++        std::ofstream output_file = recomp::open_output_file_with_backup(path);
++        if (!output_file.good()) {
++            return false;
++        }
++
++        output_file << std::setw(4) << json_data;
++        output_file.flush();
++        if (!output_file.good()) return false;
++        output_file.close();
++        if (output_file.fail()) return false;
++    }
++    return recomp::finalize_output_file_with_backup(path);
++}
++
++static std::filesystem::path get_path_to_config(bool is_mod_config) {
++    if (is_mod_config) {
++        return recomp::get_config_path() / recomp::mods::mod_config_directory;
++    }
++    return recomp::get_config_path();
++}
++
++namespace recomp::config {
++Config::Config(std::string name, std::string id, bool requires_confirmation) {
++    this->name = name;
++    this->id = id;
++    this->requires_confirmation = requires_confirmation;
++    schema.options.clear();
++    schema.options_by_id.clear();
++    storage.value_map.clear();
++    temp_storage.value_map.clear();
++
++    config_file_name = this->id + ".json";
++}
++
++Config::Config() {
++    is_mod_config = true;
++    requires_confirmation = false;
++    name = "Mod Config";
++
++    schema.options.clear();
++    schema.options_by_id.clear();
++    storage.value_map.clear();
++    temp_storage.value_map.clear();
++}
++
++void Config::set_id(const std::string &id) {
++    this->id = id;
++    config_file_name = this->id + ".json";
++}
++void Config::set_mod_version(const std::string &mod_version) {
++    this->mod_version = mod_version;
++}
++
++const ConfigStorage& Config::get_config_storage() const {
++    return storage;
++}
++
++const ConfigSchema& Config::get_config_schema() const {
++    return schema;
++}
++
++nlohmann::json *Config::get_config_storage_root(nlohmann::json* json) {
++    if (is_mod_config) {
++        return &(*json)["storage"];
++    }
++    return json;
++}
++
++void Config::add_option(const ConfigOption& option) {
++    if (loaded_config) {
++        assert(false && "Cannot add options after config has been loaded.");
++    }
++    schema.options.push_back(option);
++    schema.options_by_id[option.id] = schema.options.size() - 1;
++
++    ConfigValueVariant default_value = std::monostate();
++    switch (option.type) {
++        case ConfigOptionType::None:
++            assert(false && "Cannot add option with type None.");
++            break;
++        case ConfigOptionType::Enum:
++            default_value = std::get<ConfigOptionEnum>(option.variant).default_value;
++            break;
++        case ConfigOptionType::Number:
++            default_value = std::get<ConfigOptionNumber>(option.variant).default_value;
++            break;
++        case ConfigOptionType::String:
++            default_value = std::get<ConfigOptionString>(option.variant).default_value;
++            break;
++        case ConfigOptionType::Bool:
++            default_value = std::get<ConfigOptionBool>(option.variant).default_value;
++            break;
++    }
++
++    storage.value_map[option.id] = default_value;
++    if (requires_confirmation) {
++        temp_storage.value_map[option.id] = default_value;
++    }
++}
++
++void Config::add_enum_option(
++    const std::string &id,
++    const std::string &name,
++    const std::string &description,
++    const std::vector<ConfigOptionEnumOption> &options,
++    uint32_t default_value,
++    bool hidden
++) {
++    ConfigOption option;
++    option.id = id;
++    option.name = name;
++    option.description = description;
++    option.type = ConfigOptionType::Enum;
++    option.hidden = hidden;
++
++    ConfigOptionEnum option_enum = {{}, default_value};
++
++    for (const auto &option : options) {
++        assert(option_enum.can_add_option(option.key, option.value) && "Duplicate enum option key or value.");
++        option_enum.options.push_back(option);
++    }
++
++    if (option_enum.find_option_from_value(default_value) == option_enum.options.end()) {
++        assert(false && "Default value must match to an option.");
++    }
++
++    option.variant = option_enum;
++
++    add_option(option);
++}
++
++void Config::add_number_option(
++    const std::string &id,
++    const std::string &name,
++    const std::string &description,
++    double min,
++    double max,
++    double step,
++    int precision,
++    bool percent,
++    double default_value,
++    bool hidden
++) {
++    ConfigOption option;
++    option.id = id;
++    option.name = name;
++    option.description = description;
++    option.type = ConfigOptionType::Number;
++    option.variant = ConfigOptionNumber{min, max, step, precision, percent, default_value};
++    option.hidden = hidden;
++
++    add_option(option);
++}
++
++void Config::add_percent_number_option(
++    const std::string &id,
++    const std::string &name,
++    const std::string &description,
++    double default_value,
++    bool hidden
++) {
++    add_option(ConfigOption{
++        .id = id,
++        .name = name,
++        .description = description,
++        .hidden = hidden,
++        .type = ConfigOptionType::Number,
++        .variant = ConfigOptionNumber::create_percent_option(default_value)
++    });
++}
++
++void Config::add_string_option(
++    const std::string &id,
++    const std::string &name,
++    const std::string &description,
++    const std::string &default_value,
++    bool hidden
++) {
++    ConfigOption option;
++    option.id = id;
++    option.name = name;
++    option.description = description;
++    option.type = ConfigOptionType::String;
++    option.variant = ConfigOptionString{default_value};
++    option.hidden = hidden;
++
++    add_option(option);
++}
++
++void Config::add_bool_option(
++    const std::string &id,
++    const std::string &name,
++    const std::string &description,
++    bool default_value,
++    bool hidden
++) {
++    ConfigOption option;
++    option.id = id;
++    option.name = name;
++    option.description = description;
++    option.type = ConfigOptionType::Bool;
++    option.variant = ConfigOptionBool{default_value};
++    option.hidden = hidden;
++
++    add_option(option);
++}
++
++const ConfigValueVariant Config::get_option_default_value(const std::string& option_id) const {
++    auto option_by_id_it = schema.options_by_id.find(option_id);
++    if (option_by_id_it == schema.options_by_id.end()) {
++        assert(false && "Option not found.");
++        return std::monostate();
++    }
++
++    const ConfigOption &option = schema.options[option_by_id_it->second];
++    switch (option.type) {
++    case ConfigOptionType::Enum:
++        return std::get<ConfigOptionEnum>(option.variant).default_value;
++    case ConfigOptionType::Number:
++        return std::get<ConfigOptionNumber>(option.variant).default_value;
++    case ConfigOptionType::String:
++        return std::get<ConfigOptionString>(option.variant).default_value;
++    case ConfigOptionType::Bool:
++        return std::get<ConfigOptionBool>(option.variant).default_value;
++    default:
++        assert(false && "Unknown config option type.");
++        return std::monostate();
++    }
++}
++
++const ConfigOption &Config::get_option(size_t option_index) const {
++    if (option_index >= schema.options.size()) {
++        throw std::out_of_range("Option index out of range: " + std::to_string(option_index));
++    }
++    return schema.options[option_index];
++}
++
++const ConfigOption &Config::get_option(const std::string& option_id) const {
++    auto option_by_id_it = schema.options_by_id.find(option_id);
++    if (option_by_id_it == schema.options_by_id.end()) {
++        throw std::out_of_range("Option ID not found: " + option_id);
++    }
++    return schema.options[option_by_id_it->second];
++}
++
++bool Config::has_option(const std::string& option_id) const {
++    return schema.options_by_id.contains(option_id);
++}
++
++const ConfigValueVariant Config::get_option_value_from_storage(const std::string& option_id, const ConfigStorage& src) const {
++    auto it = src.value_map.find(option_id);
++    if (it != src.value_map.end()) {
++        return it->second;
++    }
++    return get_option_default_value(option_id);
++}
++
++const ConfigValueVariant Config::get_option_value(const std::string& option_id) const {
++    return get_option_value_from_storage(option_id, storage);
++}
++
++const ConfigValueVariant Config::get_temp_option_value(const std::string& option_id) const {
++    return get_option_value_from_storage(option_id, temp_storage);
++}
++
++void Config::determine_changed_option(const std::string& option_id) {
++    if (get_option_value(option_id) != get_temp_option_value(option_id)) {
++        modified_options.insert(schema.options_by_id[option_id]);
++    } else {
++        modified_options.erase(schema.options_by_id[option_id]);
++    }
++}
++
++void Config::try_call_option_change_callback(const std::string& option_id, ConfigValueVariant value, ConfigValueVariant prev_value, OptionChangeContext change_context) {
++    size_t option_index = schema.options_by_id[option_id];
++    auto callback_it = option_change_callbacks.find(option_index);
++    bool is_load = (change_context == OptionChangeContext::Load);
++    bool value_changed = (value != prev_value);
++    if (callback_it != option_change_callbacks.end() && (is_load || value_changed)) {
++        callback_it->second(value, prev_value, change_context);
++    }
++}
++
++void Config::set_option_value(const std::string& option_id, ConfigValueVariant value) {
++    ConfigStorage &conf_storage = requires_confirmation ? temp_storage : storage;
++
++    auto it = conf_storage.value_map.find(option_id);
++    if (it != conf_storage.value_map.end()) {
++        ConfigValueVariant prev_value = it->second;
++        it->second = value;
++
++        if (requires_confirmation) {
++            determine_changed_option(option_id);
++            try_call_option_change_callback(option_id, value, prev_value, OptionChangeContext::Temporary);
++        } else {
++            try_call_option_change_callback(option_id, value, prev_value, OptionChangeContext::Permanent);
++        }
++
++        derive_option_dependencies(schema.options_by_id[option_id]);
++    }
++}
++
++bool Config::get_enum_option_disabled(size_t option_index, uint32_t enum_index) const {
++    auto enum_it = enum_options_disabled.find(option_index);
++    if (enum_it != enum_options_disabled.end()) {
++        return enum_it->second.contains(enum_index);
++    }
++    return false;
++}
++
++nlohmann::json Config::get_json_config() const {
++    if (is_mod_config) {
++        nlohmann::json config_json;
++        if (id.empty()) {
++            assert(false && "Mod ID does not exist for this config.");
++        }
++        if (mod_version.empty()) {
++            assert(false && "Mod version does not exist for this config.");
++        }
++        config_json["mod_id"] = id;
++        config_json["mod_version"] = mod_version;
++        config_json["recomp_version"] = recomp::get_project_version().to_string();
++        config_json["storage"] = get_storage_json();
++        return config_json;
++    }
++    return get_storage_json();
++}
++
++nlohmann::json Config::get_storage_json() const {
++    nlohmann::json json;
++    for (const auto& option : schema.options) {
++        const ConfigValueVariant value = get_option_value(option.id);
++
++        if (json_serialize_option_map.contains(option.id)) {
++            auto cb = json_serialize_option_map.at(option.id);
++            json[option.id] = cb(value);
++            continue;
++        }
++
++        switch (option.type) {
++        case ConfigOptionType::None: {
++            break;
++        }
++        case ConfigOptionType::Enum: {
++            auto &option_enum = std::get<ConfigOptionEnum>(option.variant);
++            auto found_opt = option_enum.find_option_from_value(std::get<uint32_t>(value));
++            if (found_opt != option_enum.options.end()) {
++                json[option.id] = found_opt->key;
++            }
++            break;
++        }
++        case ConfigOptionType::Number: {
++            auto &option_number = std::get<ConfigOptionNumber>(option.variant);
++            if (option_number.precision == 0) {
++                json[option.id] = static_cast<int>(std::get<double>(value));
++            } else {
++                json[option.id] = std::get<double>(value);
++            }
++            break;
++        }
++        case ConfigOptionType::String:
++            json[option.id] = std::get<std::string>(value);
++            break;
++        case ConfigOptionType::Bool:
++            json[option.id] = std::get<bool>(value);
++            break;
++        }
++    }
++    return json;
++}
++
++std::filesystem::path Config::get_file_path() const {
++    return get_path_to_config(is_mod_config) / config_file_name;
++}
++
++bool Config::save_config_json(nlohmann::json config_json) const {
++    std::filesystem::path file_path = get_file_path();
++
++    bool result = save_json_with_backups(file_path, config_json);
++    if (save_callback) {
++        save_callback();
++    }
++
++    return result;
++}
++
++void Config::apply_option_value(const ConfigOption &option) {
++    ConfigValueVariant prev_value = get_option_value(option.id);
++    ConfigValueVariant cur_value = get_temp_option_value(option.id);
++    storage.value_map[option.id] = cur_value;
++    try_call_option_change_callback(option.id, cur_value, prev_value, OptionChangeContext::Permanent);
++}
++
++void Config::apply_option_value(const std::string &option_id) {
++    auto option_by_id_it = schema.options_by_id.find(option_id);
++    if (option_by_id_it != schema.options_by_id.end()) {
++        apply_option_value(schema.options[option_by_id_it->second]);
++        modified_options.erase(option_by_id_it->second);
++    }
++}
++
++bool Config::save_config() {
++    if (requires_confirmation) {
++        for (const auto& option : schema.options) {
++            apply_option_value(option);
++        }
++
++        modified_options.clear();
++    }
++
++    return save_config_json(get_json_config());
++}
++
++void Config::derive_option_dependencies(size_t option_index) {
++    auto &option_id = schema.options[option_index].id;
++    auto value = requires_confirmation ? get_temp_option_value(option_id) :  get_option_value(option_id);
++
++    auto disable_result = schema.disable_dependencies.check_option_dependencies(option_index, value);
++    for (auto &option_res : disable_result) {
++        update_option_disabled(option_res.first, option_res.second);
++    }
++
++    auto hidden_result = schema.hidden_dependencies.check_option_dependencies(option_index, value);
++    for (auto &option_res : hidden_result) {
++        update_option_hidden(option_res.first, option_res.second);
++    }
++}
++
++void Config::derive_all_config_option_dependencies() {
++    for (size_t option_index = 0; option_index < schema.options.size(); option_index++) {
++        derive_option_dependencies(option_index);
++    }
++}
++
++ConfigValueVariant Config::parse_config_option_json_value(const nlohmann::json& json_value, const ConfigOption &option) {
++    if (json_parse_option_map.contains(option.id)) {
++        return json_parse_option_map[option.id](json_value);
++    }
++
++    bool is_null = json_value.is_null();
++
++    switch (option.type) {
++        case ConfigOptionType::None:
++        default: {
++            return {};
++        }
++        case ConfigOptionType::Enum: {
++            if (is_null || !json_value.is_string()) {
++                return std::get<ConfigOptionEnum>(option.variant).default_value;
++            }
++            std::string enum_string_value = json_value.get<std::string>();
++            auto option_variant = std::get<ConfigOptionEnum>(option.variant);
++            auto found_opt = option_variant.find_option_from_string(enum_string_value);
++            if (found_opt != option_variant.options.end()) {
++                return found_opt->value;
++            } else {
++                return std::get<ConfigOptionEnum>(option.variant).default_value;
++            }
++        }
++        case ConfigOptionType::Number: {
++            if (is_null || !json_value.is_number()) {
++                return std::get<ConfigOptionNumber>(option.variant).default_value;
++            }
++            const auto &number = std::get<ConfigOptionNumber>(option.variant);
++            const double value = json_value.get<double>();
++            return std::isfinite(value) ? std::clamp(value, number.min, number.max) : number.default_value;
++        }
++        case ConfigOptionType::String:
++            if (is_null || !json_value.is_string()) {
++                return std::get<ConfigOptionString>(option.variant).default_value;
++            }
++            return json_value.get<std::string>();
++        case ConfigOptionType::Bool:
++            if (is_null || (!json_value.is_boolean() && !json_value.is_string())) {
++                return std::get<ConfigOptionBool>(option.variant).default_value;
++            }
++            if (json_value.is_string()) {
++                std::string str_val = json_value.get<std::string>();
++                return check_config_option_bool_string(str_val);
++            }
++            return json_value.get<bool>();
++    }
++}
++
++bool Config::load_config(std::function<bool(nlohmann::json &)> validate_callback) {
++    std::filesystem::path file_path = get_path_to_config(is_mod_config) / config_file_name;
++    nlohmann::json config_json{};
++
++    if (!read_json_with_backups(file_path, config_json)) {
++        if (requires_confirmation) {
++            revert_temp_config();
++        }
++        if (!is_mod_config) {
++            // Only save default config for non-mod configs
++            save_config();
++        }
++        derive_all_config_option_dependencies();
++        clear_config_option_updates();
++        loaded_config = true;
++        return true;
++    }
++
++    if (!config_json.is_object() || (validate_callback != nullptr && !validate_callback(config_json))) {
++        return false;
++    }
++
++    nlohmann::json *json_config_root = get_config_storage_root(&config_json);
++    if (!json_config_root->is_object()) return false;
++
++    for (const auto& option : schema.options) {
++        auto json_value = (*json_config_root)[option.id];
++
++        auto value = parse_config_option_json_value(json_value, option);
++        storage.value_map[option.id] = value;
++
++        if (requires_confirmation) {
++            temp_storage.value_map[option.id] = value;
++        }
++        try_call_option_change_callback(option.id, value, value, OptionChangeContext::Load);
++    }
++
++    derive_all_config_option_dependencies();
++    clear_config_option_updates();
++
++    loaded_config = true;
++    if (load_callback != nullptr) {
++        load_callback();
++    }
++    return true;
++}
++
++void Config::revert_temp_config() {
++    if (!requires_confirmation) {
++        return;
++    }
++
++    modified_options.clear();
++
++    for (const auto& option : schema.options) {
++        auto temp_value = get_temp_option_value(option.id);
++        auto original_value = get_option_value(option.id);
++        temp_storage.value_map[option.id] = original_value;
++        try_call_option_change_callback(option.id, original_value, temp_value, OptionChangeContext::Temporary);
++    }
++
++    for (size_t option_index = 0; option_index < schema.options.size(); option_index++) {
++        report_config_option_update(option_index, ConfigOptionUpdateType::Value);
++    }
++
++    derive_all_config_option_dependencies();
++}
++
++bool Config::is_dirty() const {
++    return !modified_options.empty();
++}
++
++void Config::add_option_change_callback(const std::string& option_id, on_option_change_callback callback) {
++    size_t option_index = schema.options_by_id[option_id];
++    option_change_callbacks[option_index] = callback;
++}
++
++void Config::report_config_option_update(size_t option_index, ConfigOptionUpdateType update_type) {
++    ConfigOptionUpdateContext *update_context = nullptr;
++    for (auto &context : config_option_updates) {
++        if (context.option_index == option_index) {
++            update_context = &context;
++            break;
++        }
++    }
++
++    if (update_context == nullptr) {
++        config_option_updates.push_back({option_index, {}});
++        update_context = &config_option_updates.back();
++    }
++
++    update_context->updates.push_back(update_type);
++}
++
++void Config::update_option_disabled(size_t option_index, bool disabled) {
++    bool was_disabled = is_config_option_disabled(option_index);
++    if (was_disabled == disabled) return;
++
++    if (disabled) {
++        disabled_options.insert(option_index);
++    } else {
++        disabled_options.erase(option_index);
++    }
++    report_config_option_update(option_index, ConfigOptionUpdateType::Disabled);
++};
++
++void Config::update_option_disabled(const std::string& option_id, bool disabled) {
++    size_t option_index = schema.options_by_id[option_id];
++    update_option_disabled(option_index, disabled);
++};
++
++void Config::update_option_hidden(size_t option_index, bool hidden) {
++    if (schema.options[option_index].hidden) {
++        // unchangeable - always hidden
++        return;
++    }
++    bool was_hidden = is_config_option_hidden(option_index);
++    if (was_hidden == hidden) {
++        return;
++    }
++    if (hidden) {
++        hidden_options.insert(option_index);
++    } else {
++        hidden_options.erase(option_index);
++    }
++    report_config_option_update(option_index, ConfigOptionUpdateType::Hidden);
++};
++
++void Config::update_option_hidden(const std::string& option_id, bool hidden) {
++    size_t option_index = schema.options_by_id[option_id];
++    update_option_hidden(option_index, hidden);
++};
++
++void Config::update_option_enum_details(const std::string& option_id, const std::string& enum_details) {
++    size_t option_index = schema.options_by_id[option_id];
++    enum_option_details[option_index] = enum_details;
++    report_config_option_update(option_index, ConfigOptionUpdateType::EnumDetails);
++};
++
++void Config::update_option_value(const std::string& option_id, ConfigValueVariant value) {
++    size_t option_index = schema.options_by_id[option_id];
++    // This could potentially cause an update loop due to set_option_value calling change callbacks, which could call this function.
++    // It seems more important to call change callbacks AND respect requires_confirmation
++    set_option_value(option_id, value);
++    report_config_option_update(option_index, ConfigOptionUpdateType::Value);
++};
++
++void Config::update_option_description(const std::string& option_id, const std::string& new_description) {
++    size_t option_index = schema.options_by_id[option_id];
++    schema.options[option_index].description = new_description;
++    report_config_option_update(option_index, ConfigOptionUpdateType::Description);
++}
++
++void Config::update_enum_option_disabled(const std::string& option_id, uint32_t enum_index, bool disabled) {
++    size_t option_index = schema.options_by_id[option_id];
++    if (!enum_options_disabled.contains(option_index)) {
++        enum_options_disabled[option_index] = {};
++    }
++    if (disabled) {
++        enum_options_disabled[option_index].insert(enum_index);
++    } else {
++        enum_options_disabled[option_index].erase(enum_index);
++    }
++    report_config_option_update(option_index, ConfigOptionUpdateType::EnumDisabled);
++}
++
++void Config::add_option_disable_dependency(const std::string& dependent_option_id, const std::string& source_option_id, std::vector<ConfigValueVariant> &values) {
++    size_t dependent_index = schema.options_by_id[dependent_option_id];
++    size_t source_index = schema.options_by_id[source_option_id];
++    schema.disable_dependencies.add_option_dependency(dependent_index, source_index, values);
++}
++
++void Config::add_option_hidden_dependency(const std::string& dependent_option_id, const std::string& source_option_id, std::vector<ConfigValueVariant> &values) {
++    size_t dependent_index = schema.options_by_id[dependent_option_id];
++    size_t source_index = schema.options_by_id[source_option_id];
++    schema.hidden_dependencies.add_option_dependency(dependent_index, source_index, values);
++}
++
++std::string Config::get_enum_option_details(size_t option_index) const {
++    if (!enum_option_details.contains(option_index)) {
++        return std::string();
++    }
++    return enum_option_details.at(option_index);
++}
++
++bool Config::is_config_option_hidden(size_t option_index) const {
++    return schema.options[option_index].hidden || hidden_options.contains(option_index);
++}
++
++}
+--- /dev/null
++++ b/librecomp/src/config_option.cpp
+@@ -0,0 +1,99 @@
++#include "librecomp/config.hpp"
++
++static char make_char_upper(char c) {
++    if (c >= 'a' && c <= 'z')  {
++        c -= 'a' - 'A';
++    }
++    return c;
++}
++
++static bool case_insensitive_compare(const std::string& a, const std::string& b) {
++    if (a.size() != b.size()) {
++        return false;
++    }
++    for (size_t i = 0; i < a.size(); i++) {
++        if (make_char_upper(a[i]) != make_char_upper(b[i])) {
++            return false;
++        }
++    }
++    return true;
++}
++
++namespace recomp::config {
++    bool check_config_option_bool_string(const std::string& str) {
++        static const std::string false_strings[] = {
++            "false",
++            "off",
++            "no",
++        };
++        static const std::string true_strings[] = {
++            "true",
++            "on",
++            "yes",
++        };
++
++        for (const auto& false_str : false_strings) {
++            if (case_insensitive_compare(str, false_str)) {
++                return false;
++            }
++        }
++
++        for (const auto& true_str : true_strings) {
++            if (case_insensitive_compare(str, true_str)) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
++    // ConfigOptionEnum
++    std::vector<ConfigOptionEnumOption>::const_iterator ConfigOptionEnum::find_option_from_string(const std::string& option_key) const {
++        return std::find_if(options.begin(), options.end(), [option_key](const ConfigOptionEnumOption& opt) {
++            return case_insensitive_compare(opt.key, option_key);
++        });
++    };
++
++    std::vector<ConfigOptionEnumOption>::const_iterator ConfigOptionEnum::find_option_from_value(uint32_t value) const {
++        return std::find_if(options.begin(), options.end(), [value](const ConfigOptionEnumOption& opt) {
++            return opt.value == value;
++        });
++    }
++
++    bool ConfigOptionEnum::can_add_option(const std::string& option_key, uint32_t option_value) const {
++        return options.size() == 0 || (
++            find_option_from_string(option_key) == options.end() &&
++            find_option_from_value(option_value) == options.end());
++    }
++
++    // ConfigOptionDependency
++    void ConfigOptionDependency::add_option_dependency(size_t dependent_option_index, size_t source_option_index, std::vector<ConfigValueVariant> &values) {
++        if (!option_to_dependencies.contains(source_option_index)) {
++            option_to_dependencies[source_option_index] = {};
++        }
++        option_to_dependencies[source_option_index].insert(dependent_option_index);
++        dependency_to_values[dependent_option_index] = values;
++    }
++
++    std::unordered_map<size_t, bool> ConfigOptionDependency::check_option_dependencies(size_t source_option_index, ConfigValueVariant value) {
++        std::unordered_map<size_t, bool> result{};
++        if (!option_to_dependencies.contains(source_option_index)) {
++            return result;
++        }
++
++        std::unordered_set<size_t> &dependencies = option_to_dependencies[source_option_index];
++        for (auto &dep : dependencies) {
++            bool is_match = false;
++            for (auto &check_value : dependency_to_values[dep]) {
++                if (value == check_value) {
++                    is_match = true;
++                    break;
++                }
++            }
++
++            result[dep] = is_match;
++        }
++
++        return result;
++    }
++}
+--- a/librecomp/src/mod_config_api.cpp
++++ b/librecomp/src/mod_config_api.cpp
+@@ -3,12 +3,15 @@
+ #include "librecomp/addresses.hpp"
+ 
+ void recomp_get_config_u32(uint8_t* rdram, recomp_context* ctx, size_t mod_index) {
+-    recomp::mods::ConfigValueVariant val = recomp::mods::get_mod_config_value(mod_index, _arg_string<0>(rdram, ctx));
++    recomp::config::ConfigValueVariant val = recomp::mods::get_mod_config_value(mod_index, _arg_string<0>(rdram, ctx));
+     if (uint32_t* as_u32 = std::get_if<uint32_t>(&val)) {
+         _return(ctx, *as_u32);
+     }
+     else if (double* as_double = std::get_if<double>(&val)) {
+         _return(ctx, uint32_t(int32_t(*as_double)));
++    }
++    else if (bool* as_bool = std::get_if<bool>(&val)) {
++        _return(ctx, uint32_t(*as_bool));
+     }
+     else {
+         _return(ctx, uint32_t{0});
+@@ -16,12 +19,15 @@
+ }
+ 
+ void recomp_get_config_double(uint8_t* rdram, recomp_context* ctx, size_t mod_index) {
+-    recomp::mods::ConfigValueVariant val = recomp::mods::get_mod_config_value(mod_index, _arg_string<0>(rdram, ctx));
++    recomp::config::ConfigValueVariant val = recomp::mods::get_mod_config_value(mod_index, _arg_string<0>(rdram, ctx));
+     if (uint32_t* as_u32 = std::get_if<uint32_t>(&val)) {
+         ctx->f0.d = double(*as_u32);
+     }
+     else if (double* as_double = std::get_if<double>(&val)) {
+         ctx->f0.d = *as_double;
++    }
++    else if (bool* as_bool = std::get_if<bool>(&val)) {
++        ctx->f0.d = double(*as_bool);
+     }
+     else {
+         ctx->f0.d = 0.0;
+@@ -46,7 +52,7 @@
+ }
+ 
+ void recomp_get_config_string(uint8_t* rdram, recomp_context* ctx, size_t mod_index) {
+-    recomp::mods::ConfigValueVariant val = recomp::mods::get_mod_config_value(mod_index, _arg_string<0>(rdram, ctx));
++    recomp::config::ConfigValueVariant val = recomp::mods::get_mod_config_value(mod_index, _arg_string<0>(rdram, ctx));
+     if (std::string* as_string = std::get_if<std::string>(&val)) {
+         return_string(rdram, ctx, *as_string);
+     }
+--- a/librecomp/src/mod_manifest.cpp
++++ b/librecomp/src/mod_manifest.cpp
+@@ -1,39 +1,11 @@
+ #include <unordered_map>
++#include <cmath>
+ 
+ #include "json/json.hpp"
+ 
+ #include "recompiler/context.h"
+ #include "librecomp/files.hpp"
+ #include "librecomp/mods.hpp"
+-
+-static bool read_json(std::ifstream input_file, nlohmann::json &json_out) {
+-    if (!input_file.good()) {
+-        return false;
+-    }
+-
+-    try {
+-        input_file >> json_out;
+-    }
+-    catch (nlohmann::json::parse_error &) {
+-        return false;
+-    }
+-    return true;
+-}
+-
+-static bool read_json_with_backups(const std::filesystem::path &path, nlohmann::json &json_out) {
+-    // Try reading and parsing the base file.
+-    if (read_json(std::ifstream{ path }, json_out)) {
+-        return true;
+-    }
+-
+-    // Try reading and parsing the backup file.
+-    if (read_json(recomp::open_input_backup_file(path), json_out)) {
+-        return true;
+-    }
+-
+-    // Both reads failed.
+-    return false;
+-}
+ 
+ recomp::mods::ZipModFileHandle::~ZipModFileHandle() {
+     if (file_handle) {
+@@ -180,6 +152,7 @@
+ const std::string authors_key = "authors";
+ const std::string minimum_recomp_version_key = "minimum_recomp_version";
+ const std::string enabled_by_default_key = "enabled_by_default";
++const std::string custom_gamemode_key = "custom_gamemode";
+ const std::string dependencies_key = "dependencies";
+ const std::string optional_dependencies_key = "optional_dependencies";
+ const std::string native_libraries_key = "native_libraries";
+@@ -332,16 +305,20 @@
+ constexpr std::string_view config_schema_percent_key = "percent";
+ constexpr std::string_view config_schema_options_key = "options";
+ constexpr std::string_view config_schema_default_key = "default";
+-
+-std::unordered_map<std::string, recomp::mods::ConfigOptionType> config_option_map{
+-    { "Enum",   recomp::mods::ConfigOptionType::Enum},
+-    { "Number", recomp::mods::ConfigOptionType::Number},
+-    { "String", recomp::mods::ConfigOptionType::String},
++constexpr std::string_view config_schema_matches_key = "matches";
++constexpr std::string_view config_schema_hidden_from_key = "hidden_from";
++constexpr std::string_view config_schema_disabled_from_key = "disabled_from";
++
++std::unordered_map<std::string, recomp::config::ConfigOptionType> config_option_map{
++    { "Enum",   recomp::config::ConfigOptionType::Enum},
++    { "Number", recomp::config::ConfigOptionType::Number},
++    { "String", recomp::config::ConfigOptionType::String},
++    { "Bool",   recomp::config::ConfigOptionType::Bool},
+ };
+ 
+-recomp::mods::ModOpenError parse_manifest_config_schema_option(const nlohmann::json &config_schema_json, recomp::mods::ModManifest &ret, std::string &error_param) {
++recomp::mods::ModOpenError parse_manifest_config_schema_option(const nlohmann::json &config_schema_json, recomp::config::Config *ret, std::string &error_param) {
+     using json = nlohmann::json;
+-    recomp::mods::ConfigOption option;
++    recomp::config::ConfigOption option;
+     auto id = config_schema_json.find(config_schema_id_key);
+     if (id != config_schema_json.end()) {
+         if (!get_to<json::string_t>(*id, option.id)) {
+@@ -398,15 +375,24 @@
+     }
+ 
+     switch (option.type) {
+-    case recomp::mods::ConfigOptionType::Enum:
++    case recomp::config::ConfigOptionType::Enum:
+         {
+-            recomp::mods::ConfigOptionEnum option_enum;
++            recomp::config::ConfigOptionEnum option_enum;
+ 
+             auto options = config_schema_json.find(config_schema_options_key);
+             if (options != config_schema_json.end()) {
+-                if (!get_to_vec<std::string>(*options, option_enum.options)) {
++                std::vector<std::string> option_key_list;
++                if (!get_to_vec<std::string>(*options, option_key_list)) {
+                     error_param = config_schema_options_key;
+                     return recomp::mods::ModOpenError::IncorrectConfigSchemaType;
++                }
++
++                for (uint32_t i = 0; i < static_cast<uint32_t>(option_key_list.size()); i++) {
++                    if (!option_enum.can_add_option(option_key_list[i], i)) {
++                        error_param = config_schema_options_key;
++                        return recomp::mods::ModOpenError::DuplicateEnumStrings;
++                    }
++                    option_enum.options.push_back({i, option_key_list[i]});
+                 }
+             }
+ 
+@@ -414,9 +400,9 @@
+             if (default_value != config_schema_json.end()) {
+                 std::string default_value_string;
+                 if (get_to<json::string_t>(*default_value, default_value_string)) {
+-                    auto it = std::find(option_enum.options.begin(), option_enum.options.end(), default_value_string);
++                    auto it = option_enum.find_option_from_string(default_value_string);
+                     if (it != option_enum.options.end()) {
+-                        option_enum.default_value = uint32_t(it - option_enum.options.begin());
++                        option_enum.default_value = it->value;
+                     }
+                     else {
+                         error_param = config_schema_default_key;
+@@ -433,9 +419,9 @@
+ 
+         }
+         break;
+-    case recomp::mods::ConfigOptionType::Number:
++    case recomp::config::ConfigOptionType::Number:
+         {
+-            recomp::mods::ConfigOptionNumber option_number;
++            recomp::config::ConfigOptionNumber option_number;
+ 
+             auto min = config_schema_json.find(config_schema_min_key);
+             if (min != config_schema_json.end()) {
+@@ -491,12 +477,27 @@
+                 option_number.default_value = default_value->template get<double>();
+             }
+ 
++            if (!std::isfinite(option_number.min) || !std::isfinite(option_number.max) ||
++                option_number.max < option_number.min) {
++                error_param = config_schema_max_key;
++                return recomp::mods::ModOpenError::IncorrectConfigSchemaType;
++            }
++            if (!std::isfinite(option_number.step) || option_number.step < 0.0) {
++                error_param = config_schema_step_key;
++                return recomp::mods::ModOpenError::IncorrectConfigSchemaType;
++            }
++            if (!std::isfinite(option_number.default_value)) {
++                error_param = config_schema_default_key;
++                return recomp::mods::ModOpenError::IncorrectConfigSchemaType;
++            }
++            option_number.default_value = std::clamp(option_number.default_value, option_number.min, option_number.max);
++
+             option.variant = option_number;
+         }
+         break;
+-    case recomp::mods::ConfigOptionType::String:
++    case recomp::config::ConfigOptionType::String:
+         {
+-            recomp::mods::ConfigOptionString option_string;
++            recomp::config::ConfigOptionString option_string;
+ 
+             auto default_value = config_schema_json.find(config_schema_default_key);
+             if (default_value != config_schema_json.end()) {
+@@ -509,17 +510,154 @@
+             option.variant = option_string;
+         }
+         break;
++    case recomp::config::ConfigOptionType::Bool:
++        {
++            recomp::config::ConfigOptionBool option_bool;
++
++            auto default_value = config_schema_json.find(config_schema_default_key);
++            if (default_value != config_schema_json.end()) {
++                if (!get_to<json::boolean_t>(*default_value, option_bool.default_value)) {
++                    error_param = config_schema_default_key;
++                    return recomp::mods::ModOpenError::IncorrectConfigSchemaType;
++                }
++            }
++
++            option.variant = option_bool;
++        }
++        break;
+     default:
+         break;
+     }
+ 
+-    ret.config_schema.options_by_id.emplace(option.id, ret.config_schema.options.size());
+-    ret.config_schema.options.emplace_back(option);
++    if (ret != nullptr) {
++        ret->add_option(option);
++    }
+ 
+     return recomp::mods::ModOpenError::Good;
+ }
+ 
+-recomp::mods::ModOpenError recomp::mods::parse_manifest(ModManifest& ret, const std::vector<char>& manifest_data, std::string& error_param) {
++std::vector<recomp::config::ConfigValueVariant> parse_config_option_dependency_matches(const nlohmann::json &matches_object, const recomp::config::ConfigOption &source_option) {
++    std::vector<recomp::config::ConfigValueVariant> matches = {};
++
++    switch (source_option.type) {
++        case recomp::config::ConfigOptionType::None:
++        default:
++            //! ERROR: Source option type is invalid
++            return matches;
++        case recomp::config::ConfigOptionType::Enum: {
++            std::vector<std::string> enum_values = {};
++            if (!get_to_vec<std::string>(matches_object, enum_values)) {
++                //! ERROR: failed to get array of strings in matches
++                return matches;
++            }
++
++            auto &option_enum = get<recomp::config::ConfigOptionEnum>(source_option.variant);
++            for (auto &value_str : enum_values) {
++                auto it = option_enum.find_option_from_string(value_str);
++                if (it == option_enum.options.end()) {
++                    //! ERROR: one of the matches specified doesn't exist in the source enum
++                    return {};
++                }
++                matches.push_back(it->value);
++            }
++            break;
++        }
++        case recomp::config::ConfigOptionType::String:
++            //! ERROR: string dependencies are unsupported
++            return matches;
++        case recomp::config::ConfigOptionType::Number:
++            //! ERROR: numerical dependencies are unsupported
++            return matches;
++        case recomp::config::ConfigOptionType::Bool: {
++            bool bool_condition;
++            if (!get_to<nlohmann::json::boolean_t>(matches_object, bool_condition)) {
++                //! ERROR: Failed to get boolean from dependency matches
++                return matches;
++            }
++            matches.push_back(bool_condition);
++            break;
++        }
++    }
++    return matches;
++}
++
++recomp::mods::ModOpenError parse_config_option_dependencies(const nlohmann::json &config_schema_json, recomp::config::Config &config) {
++    using json = nlohmann::json;
++
++    auto id = config_schema_json.find(config_schema_id_key);
++    std::string option_id;
++    if (id != config_schema_json.end()) {
++        if (!get_to<json::string_t>(*id, option_id)) {
++            return recomp::mods::ModOpenError::Good;
++        }
++    }
++
++    const auto& schema = config.get_config_schema();
++    if (!schema.options_by_id.contains(option_id)) {
++        return recomp::mods::ModOpenError::IncorrectConfigSchemaType;
++    }
++
++    auto conditional_add_dependency = [&config_schema_json, &schema, &config, &option_id](const std::string_view &dep_key, bool hidden) -> bool {
++        auto find_it = config_schema_json.find(dep_key);
++        if (find_it == config_schema_json.end()) {
++            return true;
++        }
++
++        auto& dependency_json = *find_it;
++        if (!dependency_json.is_object()) {
++            //! ERROR: Dependency malformed
++            return false;
++        }
++
++        std::string source_dependency_id;
++        auto find_dep_id = dependency_json.find(config_schema_id_key);
++        if (find_dep_id == dependency_json.end()) {
++            //! ERROR: Could not find source dependency id
++            return false;
++        }
++
++        if (!get_to<json::string_t>(*find_dep_id, source_dependency_id)) {
++            //! ERROR: Failed to get source dependency id
++            return false;
++        }
++        if (schema.options_by_id.contains(source_dependency_id) == false) {
++            //! ERROR: Failed to find specified source dependency in schema
++            return false;
++        }
++
++        size_t source_dependency_index = schema.options_by_id.at(source_dependency_id);
++        auto &source_option = schema.options.at(source_dependency_index);
++
++        auto find_matches = dependency_json.find(config_schema_matches_key);
++        if (find_matches == dependency_json.end()) {
++            //! ERROR: Failed to find matches
++            return false;
++        }
++        auto matches = parse_config_option_dependency_matches(*find_matches, source_option);
++        if (matches.empty()) {
++            //! ERROR: Could not find valid data in matches
++            return false;
++        }
++
++        // Mutate the configuration's schema, not a temporary schema copy that is
++        // discarded when manifest parsing returns.
++        if (hidden) {
++            config.add_option_hidden_dependency(option_id, source_dependency_id, matches);
++        } else {
++            config.add_option_disable_dependency(option_id, source_dependency_id, matches);
++        }
++        return true;
++    };
++
++    bool disable_success = conditional_add_dependency(config_schema_disabled_from_key, false);
++    if (!disable_success) return recomp::mods::ModOpenError::InvalidDisableOptionDependency;
++    bool hidden_success = conditional_add_dependency(config_schema_hidden_from_key, true);
++    if (!hidden_success) return recomp::mods::ModOpenError::InvalidHiddenOptionDependency;
++
++    return recomp::mods::ModOpenError::Good;
++}
++
++recomp::mods::ModOpenError recomp::mods::parse_manifest(ModManifest& ret, const std::vector<char>& manifest_data, std::string& error_param, recomp::config::Config *config) {
+     using json = nlohmann::json;
+     json manifest_json = json::parse(manifest_data.begin(), manifest_data.end(), nullptr, false);
+ 
+@@ -585,6 +723,12 @@
+ 
+     // Enabled by default (optional, true if not present)
+     current_error = try_get<json::boolean_t>(ret.enabled_by_default, manifest_json, enabled_by_default_key, false, error_param, true);
++    if (current_error != ModOpenError::Good) {
++        return current_error;
++    }
++
++    // Custom gamemode (optional, false if not present)
++    current_error = try_get<json::boolean_t>(ret.custom_gamemode, manifest_json, custom_gamemode_key, false, error_param, false);
+     if (current_error != ModOpenError::Good) {
+         return current_error;
+     }
+@@ -663,9 +807,21 @@
+             }
+ 
+             for (const json &option : *options) {
+-                ModOpenError open_error = parse_manifest_config_schema_option(option, ret, error_param);
++                ModOpenError open_error = parse_manifest_config_schema_option(option, config, error_param);
+                 if (open_error != ModOpenError::Good) {
+                     return open_error;
++                }
++            }
++
++            // Parse option dependencies after all options have been added
++            // Requires config to not be null
++            if (config != nullptr) {
++                for (const json &option : *options) {
++                    ModOpenError dep_error = parse_config_option_dependencies(option, *config);
++                    if (dep_error != ModOpenError::Good) {
++                        error_param = dep_error == ModOpenError::InvalidDisableOptionDependency ? config_schema_disabled_from_key : config_schema_hidden_from_key;
++                        return dep_error;
++                    }
+                 }
+             }
+         }
+@@ -678,86 +834,44 @@
+     return ModOpenError::Good;
+ }
+ 
+-bool parse_mod_config_storage(const std::filesystem::path &path, const std::string &expected_mod_id, recomp::mods::ConfigStorage &config_storage, const recomp::mods::ConfigSchema &config_schema) {
+-    using json = nlohmann::json;
+-    json config_json;
+-    if (!read_json_with_backups(path, config_json)) {
+-        return false;
+-    }
+-
+-    auto mod_id = config_json.find("mod_id");
+-    if (mod_id != config_json.end()) {
+-        std::string mod_id_str;
+-        if (get_to<json::string_t>(*mod_id, mod_id_str)) {
+-            if (*mod_id != expected_mod_id) {
+-                // The mod's ID doesn't match.
++bool parse_mod_config_storage(const std::string &expected_mod_id, recomp::config::Config &config) {
++    return config.load_config([expected_mod_id](nlohmann::json &config_json) {
++        auto mod_id = config_json.find("mod_id");
++        if (mod_id != config_json.end()) {
++            std::string mod_id_str;
++            if (get_to<nlohmann::json::string_t>(*mod_id, mod_id_str)) {
++                if (*mod_id != expected_mod_id) {
++                    // The mod's ID doesn't match.
++                    return false;
++                }
++            }
++            else {
++                // The mod ID is not a string.
+                 return false;
+             }
+         }
+         else {
+-            // The mod ID is not a string.
++            // The configuration file doesn't have a mod ID.
+             return false;
+         }
+-    }
+-    else {
+-        // The configuration file doesn't have a mod ID.
+-        return false;
+-    }
+-
+-    auto storage_json = config_json.find("storage");
+-    if (storage_json == config_json.end()) {
+-        // The configuration file doesn't have a storage object.
+-        return false;
+-    }
+-
+-    if (!storage_json->is_object()) {
+-        // The storage key does not correspond to an object.
+-        return false;
+-    }
+-
+-    // Only parse the object for known option types based on the schema.
+-    std::string value_str;
+-    for (const recomp::mods::ConfigOption &option : config_schema.options) {
+-        auto option_json = storage_json->find(option.id);
+-        if (option_json == storage_json->end()) {
+-            // Option doesn't exist in storage.
+-            continue;
+-        }
+-
+-        switch (option.type) {
+-        case recomp::mods::ConfigOptionType::Enum:
+-            if (get_to<json::string_t>(*option_json, value_str)) {
+-                const recomp::mods::ConfigOptionEnum &option_enum = std::get<recomp::mods::ConfigOptionEnum>(option.variant);
+-                auto option_it = std::find(option_enum.options.begin(), option_enum.options.end(), value_str);
+-                if (option_it != option_enum.options.end()) {
+-                    config_storage.value_map[option.id] = uint32_t(option_it - option_enum.options.begin());
+-                }
+-            }
+-
+-            break;
+-        case recomp::mods::ConfigOptionType::Number:
+-            if (option_json->is_number()) {
+-                config_storage.value_map[option.id] = option_json->template get<double>();
+-            }
+-
+-            break;
+-        case recomp::mods::ConfigOptionType::String: {
+-            if (get_to<json::string_t>(*option_json, value_str)) {
+-                config_storage.value_map[option.id] = value_str;
+-            }
+-
+-            break;
+-        }
+-        default:
+-            assert(false && "Unknown option type.");
+-            break;
+-        }
+-    }
+-
+-    return true;
++
++        auto storage_json = config_json.find("storage");
++        if (storage_json == config_json.end()) {
++            // The configuration file doesn't have a storage object.
++            return false;
++        }
++
++        if (!storage_json->is_object()) {
++            // The storage key does not correspond to an object.
++            return false;
++        }
++
++        return true;
++    });
+ }
+ 
+ recomp::mods::ModOpenError recomp::mods::ModContext::open_mod_from_manifest(ModManifest& manifest, std::string& error_param, const std::vector<ModContentTypeId>& supported_content_types, bool requires_manifest) {
++    recomp::config::Config mod_config;
+     {
+         bool exists;
+         std::vector<char> manifest_data = manifest.file_handle->read_file("mod.json", exists);
+@@ -795,7 +909,7 @@
+             }
+         }
+         else {
+-            ModOpenError parse_error = parse_manifest(manifest, manifest_data, error_param);
++            ModOpenError parse_error = parse_manifest(manifest, manifest_data, error_param, &mod_config);
+             if (parse_error != ModOpenError::Good) {
+                 return parse_error;
+             }
+@@ -843,10 +957,10 @@
+         }
+     }
+ 
++    mod_config.set_id(manifest.mod_id);
++    mod_config.set_mod_version(manifest.version.to_string());
+     // Read the mod config if it exists.
+-    ConfigStorage config_storage;
+-    std::filesystem::path config_path = mod_config_directory / (manifest.mod_id + ".json");
+-    parse_mod_config_storage(config_path, manifest.mod_id, config_storage, manifest.config_schema);
++    parse_mod_config_storage(manifest.mod_id, mod_config);
+ 
+     // Read the mod thumbnail if it exists.
+     static const std::string thumbnail_dds_name = "thumb.dds";
+@@ -858,7 +972,7 @@
+     }
+ 
+     // Store the loaded mod manifest in a new mod handle.
+-    add_opened_mod(std::move(manifest), std::move(config_storage), std::move(game_indices), std::move(detected_content_types), std::move(thumbnail_data));
++    add_opened_mod(std::move(manifest), std::move(mod_config), std::move(game_indices), std::move(detected_content_types), std::move(thumbnail_data));
+ 
+     return ModOpenError::Good;
+ }
+@@ -953,6 +1067,12 @@
+             return "Duplicate mod found";
+         case ModOpenError::WrongGame:
+             return "Mod is for a different game";
++        case ModOpenError::InvalidDisableOptionDependency:
++            return "Invalid disable option dependency in mod.json";
++        case ModOpenError::InvalidHiddenOptionDependency:
++            return "Invalid hidden option dependency in mod.json";
++        case ModOpenError::DuplicateEnumStrings:
++            return "Duplicate enum strings found in mod.json (enum strings are case insensitive)";
+     }
+     return "Unknown mod opening error: " + std::to_string((int)error);
+ }
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -268,9 +268,9 @@
+     }
+ }
+ 
+-recomp::mods::ModHandle::ModHandle(const ModContext& context, ModManifest&& manifest, ConfigStorage&& config_storage, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& content_types, std::vector<char>&& thumbnail) :
++recomp::mods::ModHandle::ModHandle(const ModContext& context, ModManifest&& manifest, recomp::config::Config&& config, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& content_types, std::vector<char>&& thumbnail) :
+     manifest(std::move(manifest)),
+-    config_storage(std::move(config_storage)),
++    config(std::move(config)),
+     code_handle(),
+     recompiler_context{std::make_unique<N64Recomp::Context>()},
+     content_types{std::move(content_types)},
+@@ -599,12 +599,12 @@
+     protect(target_func, old_flags);
+ }
+ 
+-void recomp::mods::ModContext::add_opened_mod(ModManifest&& manifest, ConfigStorage&& config_storage, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& detected_content_types, std::vector<char>&& thumbnail) {
++void recomp::mods::ModContext::add_opened_mod(ModManifest&& manifest, config::Config&& config, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& detected_content_types, std::vector<char>&& thumbnail) {
+     std::unique_lock lock(opened_mods_mutex);
+     size_t mod_index = opened_mods.size();
+     opened_mods_by_id.emplace(manifest.mod_id, mod_index);
+     opened_mods_by_filename.emplace(manifest.mod_root_path.filename().native(), mod_index);
+-    opened_mods.emplace_back(*this, std::move(manifest), std::move(config_storage), std::move(game_indices), std::move(detected_content_types), std::move(thumbnail));
++    opened_mods.emplace_back(*this, std::move(manifest), std::move(config), std::move(game_indices), std::move(detected_content_types), std::move(thumbnail));
+     opened_mods_order.emplace_back(mod_index);
+ }
+ 
+@@ -634,6 +634,11 @@
+ 
+ void recomp::mods::ModContext::register_embedded_mod(const std::string &mod_id, std::span<const uint8_t> mod_bytes) {
+     embedded_mod_bytes.emplace(mod_id, mod_bytes);
++}
++
++void recomp::mods::ModContext::register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version &maximum_version) {
++    deprecated_mods[mod_id].status = deprecation_status;
++    deprecated_mods[mod_id].maximum_version = maximum_version;
+ }
+ 
+ void recomp::mods::ModContext::close_mods() {
+@@ -648,49 +653,18 @@
+     auto_enabled_mods.clear();
+ }
+ 
+-bool save_mod_config_storage(const std::filesystem::path &path, const std::string &mod_id, const recomp::Version &mod_version, const recomp::mods::ConfigStorage &config_storage, const recomp::mods::ConfigSchema &config_schema) {
+-    using json = nlohmann::json;
+-    json config_json;
+-    config_json["mod_id"] = mod_id;
+-    config_json["mod_version"] = mod_version.to_string();
+-    config_json["recomp_version"] = recomp::get_project_version().to_string();
+-
+-    json &storage_json = config_json["storage"];
+-    for (auto it : config_storage.value_map) {
+-        auto id_it = config_schema.options_by_id.find(it.first);
+-        if (id_it == config_schema.options_by_id.end()) {
+-            continue;
+-        }
+-
+-        const recomp::mods::ConfigOption &config_option = config_schema.options[id_it->second];
+-        switch (config_option.type) {
+-        case recomp::mods::ConfigOptionType::Enum:
+-            storage_json[it.first] = std::get<recomp::mods::ConfigOptionEnum>(config_option.variant).options[std::get<uint32_t>(it.second)];
+-            break;
+-        case recomp::mods::ConfigOptionType::Number:
+-            storage_json[it.first] = std::get<double>(it.second);
+-            break;
+-        case recomp::mods::ConfigOptionType::String:
+-            storage_json[it.first] = std::get<std::string>(it.second);
+-            break;
+-        default:
+-            assert(false && "Unknown config type.");
+-            break;
+-        }
+-    }
+-
+-    std::ofstream output_file = recomp::open_output_file_with_backup(path);
+-    if (!output_file.good()) {
+-        return false;
+-    }
+-
++bool save_mod_config_storage(const std::filesystem::path &path, const nlohmann::json &config_json) {
++    auto output_file = recomp::open_output_file_with_backup(path);
++    if (!output_file.good()) return false;
+     output_file << std::setw(4) << config_json;
++    output_file.flush();
++    if (!output_file.good()) return false;
+     output_file.close();
+-
++    if (output_file.fail()) return false;
+     return recomp::finalize_output_file_with_backup(path);
+ }
+ 
+-bool parse_mods_config(const std::filesystem::path &path, std::unordered_set<std::string> &enabled_mods, std::vector<std::string> &mod_order) {
++bool parse_mods_config(const std::filesystem::path &path, std::string& latest_game_mode, std::unordered_set<std::string> &enabled_mods, std::vector<std::string> &mod_order) {
+     using json = nlohmann::json;
+     json config_json;
+     if (!read_json_with_backups(path, config_json)) {
+@@ -712,13 +686,25 @@
+         get_to_vec<std::string>(*mod_order_json, mod_order);
+     }
+ 
++    auto latest_game_mode_json = config_json.find("latest_game_mode");
++    if (latest_game_mode_json != config_json.end()) {
++        const std::string* temp_ptr = latest_game_mode_json->get_ptr<const std::string*>();
++        if (temp_ptr == nullptr) {
++            latest_game_mode = {};
++        }
++        else {
++            latest_game_mode = *temp_ptr;
++        }
++    }
++
+     return true;
+ }
+ 
+-bool save_mods_config(const std::filesystem::path &path, const std::unordered_set<std::string> &enabled_mods, const std::vector<std::string> &mod_order) {
++bool save_mods_config(const std::filesystem::path &path, const std::string& latest_game_mode, const std::unordered_set<std::string> &enabled_mods, const std::vector<std::string> &mod_order) {
+     nlohmann::json config_json;
+     config_json["enabled_mods"] = enabled_mods;
+     config_json["mod_order"] = mod_order;
++    config_json["latest_game_mode"] = latest_game_mode;
+ 
+     std::ofstream output_file = recomp::open_output_file_with_backup(path);
+     if (!output_file.good()) {
+@@ -733,12 +719,14 @@
+ 
+ void recomp::mods::ModContext::dirty_mod_configuration_thread_process() {
+     using namespace std::chrono_literals;
++    using json = nlohmann::json;
++
+     ModConfigQueueVariant variant;
+     ModConfigQueueSaveMod save_mod;
+     std::unordered_set<std::string> pending_mods;
+-    std::unordered_map<std::string, ConfigStorage> pending_mod_storage;
+-    std::unordered_map<std::string, ConfigSchema> pending_mod_schema;
+-    std::unordered_map<std::string, Version> pending_mod_version;
++    // Own the path and JSON snapshot. Mod rescans may destroy or move ModHandles
++    // while this thread writes; no borrowed Config pointer can survive that.
++    std::unordered_map<std::string, std::pair<std::filesystem::path, json>> pending_mod_configs;
+     std::unordered_set<std::string> config_enabled_mods;
+     std::vector<std::string> config_mod_order;
+     bool pending_config_save = false;
+@@ -754,6 +742,9 @@
+         else if (const ModConfigQueueSaveMod* queue_save_mod = std::get_if<ModConfigQueueSaveMod>(&variant)) {
+             pending_mods.emplace(queue_save_mod->mod_id);
+         }
++        else if (std::get_if<ModConfigSetLatestGamemode>(&variant) != nullptr) {
++            pending_config_save = true;
++        }
+     };
+ 
+     while (active) {
+@@ -768,6 +759,7 @@
+         }
+ 
+         if (active && !pending_mods.empty()) {
++            pending_mod_configs.clear();
+             {
+                 std::unique_lock opened_mods_lock(opened_mods_mutex);
+                 for (const std::string &id : pending_mods) {
+@@ -775,16 +767,13 @@
+                     if (it != opened_mods_by_id.end()) {
+                         const ModHandle &mod = opened_mods[it->second];
+                         std::unique_lock config_storage_lock(mod_config_storage_mutex);
+-                        pending_mod_storage[id] = mod.config_storage;
+-                        pending_mod_schema[id] = mod.manifest.config_schema;
+-                        pending_mod_version[id] = mod.manifest.version;
++                        pending_mod_configs[id] = {mod.config.get_file_path(), mod.config.get_json_config()};
+                     }
+                 }
+             }
+ 
+-            for (const std::string &id : pending_mods) {
+-                config_path = mod_config_directory / std::string(id + ".json");
+-                save_mod_config_storage(config_path, id, pending_mod_version[id], pending_mod_storage[id], pending_mod_schema[id]);
++            for (const auto &[id, snapshot] : pending_mod_configs) {
++                save_mod_config_storage(snapshot.first, snapshot.second);
+             }
+ 
+             pending_mods.clear();
+@@ -801,7 +790,7 @@
+                 }
+             }
+ 
+-            save_mods_config(mods_config_path, config_enabled_mods, config_mod_order);
++            save_mods_config(mods_config_path, get_latest_game_mode_id(), config_enabled_mods, config_mod_order);
+             pending_config_save = false;
+         }
+     }
+@@ -861,7 +850,10 @@
+     std::unordered_set<std::string> config_enabled_mods;
+     std::vector<std::string> config_mod_order;
+     std::vector<bool> opened_mod_is_known;
+-    parse_mods_config(mods_config_path, config_enabled_mods, config_mod_order);
++    {
++        std::lock_guard lock(latest_game_mode_mutex);
++        parse_mods_config(mods_config_path, latest_game_mode, config_enabled_mods, config_mod_order);
++    }
+ 
+     // Fill a vector with the relative order of the mods. Existing mods will get ordered below new mods.
+     std::vector<size_t> sort_order;
+@@ -1055,6 +1047,11 @@
+         return;
+     }
+ 
++    // Do nothing if this mod was deprecated.
++    if (is_mod_deprecated(mod.manifest.mod_id, mod.manifest.version)) {
++        return;
++    }
++
+     if (enabled) {
+         bool was_enabled = enabled_mods.emplace(mod_id).second;
+ 
+@@ -1079,7 +1076,7 @@
+                 if (mod_from_stack_it != opened_mods_by_id.end()) {
+                     const ModHandle &mod_from_stack_handle = opened_mods[mod_from_stack_it->second];
+                     for (const Dependency &dependency : mod_from_stack_handle.manifest.dependencies) {
+-                        if (!dependency.optional && !auto_enabled_mods.contains(dependency.mod_id)) {
++                        if (!dependency.optional && !auto_enabled_mods.contains(dependency.mod_id) && !is_mod_deprecated(dependency.mod_id, dependency.version)) {
+                             auto_enabled_mods.emplace(dependency.mod_id);
+                             mod_stack.emplace_back(dependency.mod_id);
+ 
+@@ -1124,7 +1121,7 @@
+                     if (mod_from_stack_it != opened_mods_by_id.end()) {
+                         const ModHandle &mod_from_stack_handle = opened_mods[mod_from_stack_it->second];
+                         for (const Dependency &dependency : mod_from_stack_handle.manifest.dependencies) {
+-                            if (!dependency.optional && !new_auto_enabled_mods.contains(dependency.mod_id)) {
++                            if (!dependency.optional && !new_auto_enabled_mods.contains(dependency.mod_id) && !is_mod_deprecated(dependency.mod_id, dependency.version)) {
+                                 new_auto_enabled_mods.emplace(dependency.mod_id);
+                                 mod_stack.emplace_back(dependency.mod_id);
+                             }
+@@ -1160,12 +1157,42 @@
+     }
+ }
+ 
+-bool recomp::mods::ModContext::is_mod_enabled(const std::string& mod_id) {
++bool recomp::mods::ModContext::is_mod_enabled(const std::string& mod_id) const {
+     return enabled_mods.contains(mod_id);
+ }
+ 
+-bool recomp::mods::ModContext::is_mod_auto_enabled(const std::string& mod_id) {
++bool recomp::mods::ModContext::is_mod_auto_enabled(const std::string& mod_id) const {
+     return auto_enabled_mods.contains(mod_id);
++}
++
++bool recomp::mods::ModContext::is_mod_deprecated(const std::string& mod_id, const Version& mod_version) const {
++    auto it = deprecated_mods.find(mod_id);
++    if (it != deprecated_mods.end()) {
++        return (it->second.status != recomp::mods::DeprecationStatus::Unknown) && (it->second.maximum_version.is_null() || (mod_version <= it->second.maximum_version));
++    }
++    else {
++        return false;
++    }
++}
++
++recomp::mods::DeprecationStatus recomp::mods::ModContext::get_mod_deprecation_status(const std::string& mod_id) const {
++    auto it = deprecated_mods.find(mod_id);
++    if (it != deprecated_mods.end()) {
++        return it->second.status;
++    }
++    else {
++        return recomp::mods::DeprecationStatus::Unknown;
++    }
++}
++
++recomp::Version recomp::mods::ModContext::get_mod_deprecation_version(const std::string& mod_id) const {
++    auto it = deprecated_mods.find(mod_id);
++    if (it != deprecated_mods.end()) {
++        return it->second.maximum_version;
++    }
++    else {
++        return Version();
++    }
+ }
+ 
+ size_t recomp::mods::ModContext::num_opened_mods() {
+@@ -1237,6 +1264,29 @@
+             std::vector<Dependency> cur_dependencies{};
+ 
+             ret.emplace_back(mod.get_details());
++        }
++    }
++
++    return ret;
++}
++
++size_t recomp::mods::ModContext::game_mode_count(const std::string& mod_game_id, bool include_disabled) const {
++    size_t ret = 0;
++    bool all_games = mod_game_id.empty();
++    size_t game_index = (size_t)-1;
++
++    auto find_game_it = mod_game_ids.find(mod_game_id);
++    if (find_game_it != mod_game_ids.end()) {
++        game_index = find_game_it->second;
++    }
++
++    for (const ModHandle &mod : opened_mods) {
++        if (all_games || mod.is_for_game(game_index)) {
++            if (include_disabled || is_mod_enabled(mod.manifest.mod_id) || is_mod_auto_enabled(mod.manifest.mod_id)) {
++                if (mod.manifest.custom_gamemode) {
++                    ret++;
++                }
++            }
+         }
+     }
+ 
+@@ -1431,7 +1481,7 @@
+     mod_configuration_thread_queue.enqueue(ModConfigQueueSave());
+ }
+ 
+-const recomp::mods::ConfigSchema &recomp::mods::ModContext::get_mod_config_schema(const std::string &mod_id) const {
++const recomp::config::ConfigSchema &recomp::mods::ModContext::get_mod_config_schema(const std::string &mod_id) const {
+     // Check that the mod exists.
+     auto find_it = opened_mods_by_id.find(mod_id);
+     if (find_it == opened_mods_by_id.end()) {
+@@ -1439,7 +1489,18 @@
+     }
+ 
+     const ModHandle &mod = opened_mods[find_it->second];
+-    return mod.manifest.config_schema;
++    return mod.config.get_config_schema();
++}
++
++recomp::config::Config *recomp::mods::ModContext::get_mod_config(const std::string &mod_id) {
++    // Check that the mod exists.
++    auto find_it = opened_mods_by_id.find(mod_id);
++    if (find_it == opened_mods_by_id.end()) {
++        return nullptr;
++    }
++
++    ModHandle &mod = opened_mods[find_it->second];
++    return &mod.config;
+ }
+ 
+ const std::vector<char> &recomp::mods::ModContext::get_mod_thumbnail(const std::string &mod_id) const {
+@@ -1453,7 +1514,7 @@
+     return mod.thumbnail;
+ }
+ 
+-void recomp::mods::ModContext::set_mod_config_value(size_t mod_index, const std::string &option_id, const ConfigValueVariant &value) {
++void recomp::mods::ModContext::set_mod_config_value(size_t mod_index, const std::string &option_id, const recomp::config::ConfigValueVariant &value) {
+     // Check that the mod exists.
+     if (mod_index >= opened_mods.size()) {
+         return;
+@@ -1461,42 +1522,13 @@
+ 
+     ModHandle &mod = opened_mods[mod_index];
+     std::unique_lock lock(mod_config_storage_mutex);
+-    auto option_by_id_it = mod.manifest.config_schema.options_by_id.find(option_id);
+-    if (option_by_id_it != mod.manifest.config_schema.options_by_id.end()) {
+-        // Only accept setting values if the value exists and the variant is the right type.
+-        const ConfigOption &option = mod.manifest.config_schema.options[option_by_id_it->second];
+-        switch (option.type) {
+-        case ConfigOptionType::Enum:
+-            if (std::holds_alternative<uint32_t>(value)) {
+-                if (std::get<uint32_t>(value) < std::get<ConfigOptionEnum>(option.variant).options.size()) {
+-                    mod.config_storage.value_map[option_id] = value;
+-                }
+-            }
+-
+-            break;
+-        case ConfigOptionType::Number:
+-            if (std::holds_alternative<double>(value)) {
+-                mod.config_storage.value_map[option_id] = value;
+-            }
+-
+-            break;
+-        case ConfigOptionType::String:
+-            if (std::holds_alternative<std::string>(value)) {
+-                mod.config_storage.value_map[option_id] = value;
+-            }
+-
+-            break;
+-        default:
+-            assert(false && "Unknown config option type.");
+-            return;
+-        }
+-    }
++    mod.config.set_option_value(option_id, value);
+ 
+     // Notify the asynchronous thread it should save the configuration for this mod.
+     mod_configuration_thread_queue.enqueue(ModConfigQueueSaveMod{ mod.manifest.mod_id });
+ }
+ 
+-void recomp::mods::ModContext::set_mod_config_value(const std::string &mod_id, const std::string &option_id, const ConfigValueVariant &value) {
++void recomp::mods::ModContext::set_mod_config_value(const std::string &mod_id, const std::string &option_id, const recomp::config::ConfigValueVariant &value) {
+     // Check that the mod exists.
+     auto find_it = opened_mods_by_id.find(mod_id);
+     if (find_it == opened_mods_by_id.end()) {
+@@ -1506,7 +1538,7 @@
+     set_mod_config_value(find_it->second, option_id, value);
+ }
+ 
+-recomp::mods::ConfigValueVariant recomp::mods::ModContext::get_mod_config_value(size_t mod_index, const std::string &option_id) const {
++recomp::config::ConfigValueVariant recomp::mods::ModContext::get_mod_config_value(size_t mod_index, const std::string &option_id) const {
+     // Check that the mod exists.
+     if (mod_index >= opened_mods.size()) {
+         return std::monostate();
+@@ -1514,33 +1546,10 @@
+ 
+     const ModHandle &mod = opened_mods[mod_index];
+     std::unique_lock lock(mod_config_storage_mutex);
+-    auto it = mod.config_storage.value_map.find(option_id);
+-    if (it != mod.config_storage.value_map.end()) {
+-        return it->second;
+-    }
+-    else {
+-        // Attempt to see if we can find a default value from the schema.
+-        auto option_by_id_it = mod.manifest.config_schema.options_by_id.find(option_id);
+-        if (option_by_id_it == mod.manifest.config_schema.options_by_id.end()) {
+-            return std::monostate();
+-        }
+-
+-        const ConfigOption &option = mod.manifest.config_schema.options[option_by_id_it->second];
+-        switch (option.type) {
+-        case ConfigOptionType::Enum:
+-            return std::get<ConfigOptionEnum>(option.variant).default_value;
+-        case ConfigOptionType::Number:
+-            return std::get<ConfigOptionNumber>(option.variant).default_value;
+-        case ConfigOptionType::String:
+-            return std::get<ConfigOptionString>(option.variant).default_value;
+-        default:
+-            assert(false && "Unknown config option type.");
+-            return std::monostate();
+-        }
+-    }
+-}
+-
+-recomp::mods::ConfigValueVariant recomp::mods::ModContext::get_mod_config_value(const std::string &mod_id, const std::string &option_id) const {
++    return mod.config.get_option_value(option_id);
++}
++
++recomp::config::ConfigValueVariant recomp::mods::ModContext::get_mod_config_value(const std::string &mod_id, const std::string &option_id) const {
+     // Check that the mod exists.
+     auto find_it = opened_mods_by_id.find(mod_id);
+     if (find_it == opened_mods_by_id.end()) {
+@@ -1558,7 +1567,20 @@
+     mod_config_directory = path;
+ }
+ 
+-std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mods(const GameEntry& game_entry, uint8_t* rdram, int32_t load_address, uint32_t& ram_used) {
++std::string recomp::mods::ModContext::get_latest_game_mode_id() const {
++    std::lock_guard lock(latest_game_mode_mutex);
++    return latest_game_mode;
++}
++
++void recomp::mods::ModContext::set_latest_game_mode_id(const std::string& game_mode_id) {
++    {
++        std::lock_guard lock(latest_game_mode_mutex);
++        latest_game_mode = game_mode_id;
++    }
++    mod_configuration_thread_queue.enqueue(ModConfigSetLatestGamemode());
++}
++
++std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mods(const GameEntry& game_entry, const std::string& game_mode_id, uint8_t* rdram, int32_t load_address, uint32_t& ram_used) {
+     std::vector<recomp::mods::ModLoadErrorDetails> ret{};
+     ram_used = 0;
+     num_events = recomp::overlays::num_base_events();
+@@ -1603,15 +1625,18 @@
+     for (size_t mod_index = 0; mod_index < opened_mods.size(); mod_index++) {
+         auto& mod = opened_mods[mod_index];
+         if (mod.is_for_game(mod_game_index) && (enabled_mods.contains(mod.manifest.mod_id) || auto_enabled_mods.contains(mod.manifest.mod_id))) {
+-            active_mods.push_back(mod_index);
+-            loaded_mods_by_id.emplace(mod.manifest.mod_id, mod_index);
+-
+-            printf("Loading mod %s\n", mod.manifest.mod_id.c_str());
+-            std::string load_error_param;
+-            ModLoadError load_error = load_mod(mod, load_error_param);
+-
+-            if (load_error != ModLoadError::Good) {
+-                ret.emplace_back(mod.manifest.mod_id, load_error, load_error_param);
++            // Only load gamemode mods if the current gamemode matches the mod id.
++            if (!mod.manifest.custom_gamemode || game_mode_id == mod.manifest.mod_id) {
++                active_mods.push_back(mod_index);
++                loaded_mods_by_id.emplace(mod.manifest.mod_id, mod_index);
++
++                printf("Loading mod %s\n", mod.manifest.mod_id.c_str());
++                std::string load_error_param;
++                ModLoadError load_error = load_mod(mod, load_error_param);
++
++                if (load_error != ModLoadError::Good) {
++                    ret.emplace_back(mod.manifest.mod_id, load_error, load_error_param);
++                }
+             }
+         }
+     }
+--- a/librecomp/src/patcher.cpp
++++ b/librecomp/src/patcher.cpp
+@@ -40,11 +40,16 @@
+         return false;
+     }
+ 
++    uint8_t byte0 = patch_data[offset++];
++    uint8_t byte1 = patch_data[offset++];
++    uint8_t byte2 = patch_data[offset++];
++    uint8_t byte3 = patch_data[offset++];
++
+     number_out =
+-        (uint32_t(patch_data[offset++]) <<  0) |
+-        (uint32_t(patch_data[offset++]) <<  8) |
+-        (uint32_t(patch_data[offset++]) << 16) |
+-        (uint32_t(patch_data[offset++]) << 24);
++        (uint32_t(byte0) <<  0) |
++        (uint32_t(byte1) <<  8) |
++        (uint32_t(byte2) << 16) |
++        (uint32_t(byte3) << 24);
+     return true;
+ }
+ 
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -68,7 +68,15 @@
+     config_path = path;
+ }
+ 
++std::filesystem::path recomp::get_config_path() {
++    return config_path;
++}
++
+ bool recomp::register_game(const recomp::GameEntry& entry) {
++    if (entry.display_name.empty()) {
++        ultramodern::error_handling::message_box("Game display name was not set.");
++        ULTRAMODERN_QUICK_EXIT();
++    }
+     // TODO verify that there's no game with this ID already.
+     {
+         std::lock_guard<std::mutex> lock(game_roms_mutex);
+@@ -78,7 +86,6 @@
+         std::lock_guard<std::mutex> lock(mod_context_mutex);
+         mod_context->register_game(entry.mod_game_id);
+     }
+-
+     return true;
+ }
+ 
+@@ -95,6 +102,11 @@
+     mod_context->register_embedded_mod(mod_id, mod_bytes);
+ }
+ 
++void recomp::mods::register_deprecated_mod(const std::string& mod_id, recomp::mods::DeprecationStatus deprecation_status, const Version& maximum_version) {
++    std::lock_guard<std::mutex> lock(mod_context_mutex);
++    mod_context->register_deprecated_mod(mod_id, deprecation_status, maximum_version);
++}
++
+ void recomp::mods::scan_mods() {
+     std::vector<recomp::mods::ModOpenErrorDetails> mod_open_errors;
+     {
+@@ -196,7 +208,7 @@
+ 
+ static std::unordered_set<std::u8string> valid_game_roms;
+ 
+-bool recomp::is_rom_valid(std::u8string& game_id) {
++bool recomp::is_rom_valid(const std::u8string& game_id) {
+     return valid_game_roms.contains(game_id);
+ }
+ 
+@@ -208,7 +220,7 @@
+     }
+ }
+ 
+-bool recomp::load_stored_rom(std::u8string& game_id) {
++bool recomp::load_stored_rom(const std::u8string& game_id) {
+     auto find_it = game_roms.find(game_id);
+ 
+     if (find_it == game_roms.end()) {
+@@ -345,7 +357,7 @@
+     }
+ }
+ 
+-recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_path, std::u8string& game_id) {
++recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_path, const std::u8string& game_id) {
+     auto find_it = game_roms.find(game_id);
+ 
+     if (find_it == game_roms.end()) {
+@@ -457,6 +469,7 @@
+     exit(EXIT_FAILURE);
+ }
+ 
++std::string current_game_mode_id;
+ std::optional<std::u8string> current_game = std::nullopt;
+ std::atomic<GameStatus> game_status = GameStatus::None;
+ 
+@@ -522,11 +535,13 @@
+     return game_entry.mod_game_id;
+ }
+ 
+-void recomp::start_game(const std::u8string& game_id) {
++void recomp::start_game(const std::u8string& game_id, const std::string& game_mode_id) {
+     std::lock_guard<std::mutex> lock(current_game_mutex);
++    current_game_mode_id = game_mode_id;
+     current_game = game_id;
+     game_status.store(GameStatus::Running);
+     game_status.notify_all();
++    mods::set_latest_game_mode_id(game_mode_id);
+ }
+ 
+ bool ultramodern::is_game_started() {
+@@ -560,34 +575,77 @@
+     return mod_context->is_mod_auto_enabled(mod_id);
+ }
+ 
+-const recomp::mods::ConfigSchema &recomp::mods::get_mod_config_schema(const std::string &mod_id) {
++bool recomp::mods::is_mod_deprecated(const std::string& mod_id, const recomp::Version& mod_version) {
++    std::lock_guard lock{ mod_context_mutex };
++    return mod_context->is_mod_deprecated(mod_id, mod_version);
++}
++
++recomp::mods::DeprecationStatus recomp::mods::get_mod_deprecation_status(const std::string& mod_id) {
++    std::lock_guard lock{ mod_context_mutex };
++    return mod_context->get_mod_deprecation_status(mod_id);
++}
++
++recomp::Version recomp::mods::get_mod_deprecation_version(const std::string& mod_id) {
++    std::lock_guard lock{ mod_context_mutex };
++    return mod_context->get_mod_deprecation_version(mod_id);
++}
++
++std::string recomp::mods::deprecation_status_to_message(DeprecationStatus deprecation_status) {
++    switch (deprecation_status) {
++    case DeprecationStatus::Integrated:
++        return "This mod has already been integrated into the game";
++    case DeprecationStatus::BrokenVersion:
++        return "This version of the mod is known to cause issues. Please update it";
++    case DeprecationStatus::BrokenPermanent:
++        return "This mod is known to cause issues. Please uninstall it";
++    default:
++        return "Reason is unknown";
++    }
++}
++
++const recomp::config::ConfigSchema &recomp::mods::get_mod_config_schema(const std::string &mod_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_mod_config_schema(mod_id);
+ }
+ 
++recomp::config::Config *recomp::mods::get_mod_config(const std::string &mod_id) {
++    std::lock_guard lock{ mod_context_mutex };
++    return mod_context->get_mod_config(mod_id);
++}
++
+ const std::vector<char> &recomp::mods::get_mod_thumbnail(const std::string &mod_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_mod_thumbnail(mod_id);
+ }
+ 
+-void recomp::mods::set_mod_config_value(size_t mod_index, const std::string &option_id, const ConfigValueVariant &value) {
++void recomp::mods::set_mod_config_value(size_t mod_index, const std::string &option_id, const recomp::config::ConfigValueVariant &value) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->set_mod_config_value(mod_index, option_id, value);
+ }
+ 
+-void recomp::mods::set_mod_config_value(const std::string &mod_id, const std::string &option_id, const ConfigValueVariant &value) {
++void recomp::mods::set_mod_config_value(const std::string &mod_id, const std::string &option_id, const recomp::config::ConfigValueVariant &value) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->set_mod_config_value(mod_id, option_id, value);
+ }
+ 
+-recomp::mods::ConfigValueVariant recomp::mods::get_mod_config_value(size_t mod_index, const std::string &option_id) {
++recomp::config::ConfigValueVariant recomp::mods::get_mod_config_value(size_t mod_index, const std::string &option_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_mod_config_value(mod_index, option_id);
+ }
+ 
+-recomp::mods::ConfigValueVariant recomp::mods::get_mod_config_value(const std::string &mod_id, const std::string &option_id) {
++recomp::config::ConfigValueVariant recomp::mods::get_mod_config_value(const std::string &mod_id, const std::string &option_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_mod_config_value(mod_id, option_id);
++}
++
++std::string recomp::mods::get_latest_game_mode_id() {
++    std::lock_guard lock{ mod_context_mutex };
++    return mod_context->get_latest_game_mode_id();
++}
++
++void recomp::mods::set_latest_game_mode_id(const std::string& game_mode_id) {
++    std::lock_guard lock{ mod_context_mutex };
++    mod_context->set_latest_game_mode_id(game_mode_id);
+ }
+ 
+ std::string recomp::mods::get_mod_id_from_filename(const std::filesystem::path& mod_filename) {
+@@ -618,6 +676,11 @@
+ std::vector<recomp::mods::ModDetails> recomp::mods::get_all_mod_details(const std::string& mod_game_id) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->get_all_mod_details(mod_game_id);
++}
++
++size_t recomp::mods::game_mode_count(const std::string& mod_game_id, bool include_disabled) {
++    std::lock_guard lock { mod_context_mutex };
++    return mod_context->game_mode_count(mod_game_id, include_disabled);
+ }
+ 
+ recomp::Version recomp::mods::get_mod_version(size_t mod_index) {
+@@ -659,7 +722,7 @@
+                     std::vector<recomp::mods::ModLoadErrorDetails> mod_load_errors;
+                     {
+                         std::lock_guard lock { mod_context_mutex };
+-                        mod_load_errors = mod_context->load_mods(game_entry, rdram, recomp::mod_rdram_start, mod_ram_used);
++                        mod_load_errors = mod_context->load_mods(game_entry, current_game_mode_id, rdram, recomp::mod_rdram_start, mod_ram_used);
+                     }
+ 
+                     if (!mod_load_errors.empty()) {
+@@ -729,8 +792,111 @@
+         save_type == SaveType::AllowAll;
+ }
+ 
++void print_cli_game_options() {
++    for (const auto &it : game_roms) {
++        bool rom_valid = recomp::is_rom_valid(it.second.game_id);
++        fprintf(stderr, "\"%s\" (%s)%s\n", it.second.mod_game_id.c_str(), it.second.display_name.c_str(), rom_valid ? "" : " (No ROM)");
++    }
++}
++
++void print_cli_game_mode_options(const std::vector<recomp::mods::ModDetails> &mods) {
++    for (const auto &mod : mods) {
++        if (mod.custom_gamemode) {
++            bool mod_enabled = recomp::mods::is_mod_enabled(mod.mod_id) || recomp::mods::is_mod_auto_enabled(mod.mod_id);
++            fprintf(stderr, "\"%s\" (%s)%s\n", mod.mod_id.c_str(), mod.display_name.c_str(), mod_enabled ? "" : " (Disabled)");
++        }
++    }
++}
++
++void parse_cli(int argc, char **argv) {
++    std::string cli_game_id;
++    std::string cli_game_mode_id;
++    bool game_mode_missing_argument = false;
++    for (int i = 1; i < argc; i++) {
++        if (strcmp(argv[i], "--game") == 0) {
++            if (i + 1 < argc) {
++                cli_game_id = std::string(argv[++i]);
++            }
++            else {
++                fprintf(stderr, "No argument was specified for the game. Possible options are:\n");
++                print_cli_game_options();
++            }
++        }
++        else if (strcmp(argv[i], "--game-mode") == 0) {
++            if (i + 1 < argc) {
++                cli_game_mode_id = std::string(argv[++i]);
++            }
++            else {
++                game_mode_missing_argument = true;
++            }
++        }
++    }
++
++    if (!cli_game_id.empty()) {
++        // We use the mod game ID instead to do the lookup since it's much easier for the user to remember.
++        std::u8string game_id;
++        for (const auto &it : game_roms) {
++            if (it.second.mod_game_id == cli_game_id) {
++                if (recomp::is_rom_valid(it.second.game_id)) {
++                    game_id = it.second.game_id;
++                }
++                else {
++                    fprintf(stderr, "Game \"%s\" does not have a valid ROM. Please select a ROM on the launcher first.\n", cli_game_id.c_str());
++                }
++
++                break;
++            }
++        }
++
++        if (!game_id.empty()) {
++            bool game_mode_error = false;
++            std::string game_mode_id;
++            if (!cli_game_mode_id.empty() || game_mode_missing_argument) {
++                std::vector<recomp::mods::ModDetails> mods = recomp::mods::get_all_mod_details(cli_game_id);
++                if (!cli_game_mode_id.empty()) {
++                    for (const auto &mod : mods) {
++                        if ((mod.mod_id == cli_game_mode_id) && mod.custom_gamemode) {
++                            if (recomp::mods::is_mod_enabled(mod.mod_id) || recomp::mods::is_mod_auto_enabled(mod.mod_id)) {
++                                game_mode_id = mod.mod_id;
++                            }
++                            else {
++                                fprintf(stderr, "Game mode \"%s\" is disabled. Please enable it on the mods menu first.\n", cli_game_mode_id.c_str());
++                            }
++
++                            break;
++                        }
++                    }
++
++                    if (game_mode_id.empty()) {
++                        fprintf(stderr, "Game mode \"%s\" is not available. Possible options are:\n", cli_game_mode_id.c_str());
++                        print_cli_game_mode_options(mods);
++                        game_mode_error = true;
++                    }
++                }
++                else if (game_mode_missing_argument) {
++                    fprintf(stderr, "No argument was specified for the game mode. Possible options are:\n");
++                    print_cli_game_mode_options(mods);
++                    game_mode_error = true;
++                }
++            }
++
++            if (!game_mode_error) {
++                recomp::start_game(game_id, game_mode_id);
++            }
++        }
++        else {
++            fprintf(stderr, "Game \"%s\" is not available. Possible options are:\n", cli_game_id.c_str());
++            print_cli_game_options();
++        }
++    }
++    else if (game_mode_missing_argument) {
++        fprintf(stderr, "No argument was specified for the game mode. The game must be specified first to show the options.\n");
++    }
++}
++
+ void recomp::start(const recomp::Configuration& cfg) {
+     project_version = cfg.project_version;
++
+     recomp::check_all_stored_roms();
+ 
+     recomp::rsp::set_callbacks(cfg.rsp_callbacks);
+@@ -813,6 +979,8 @@
+         // Loop until the game starts.
+         while (!wait_for_game_started(rdram, &context)) {}
+     }, window_handle, rdram};
++
++    parse_cli(cfg.argc, cfg.argv);
+ 
+     while (!exited) {
+         ultramodern::sleep_milliseconds(1);
+--- a/ultramodern/include/ultramodern/config.hpp
++++ b/ultramodern/include/ultramodern/config.hpp
+@@ -69,33 +69,61 @@
+             Off,
+             OptionCount
+         };
+-        // BAR letterbox control: how the 4:3 image is fit to a window of a different aspect ratio.
+-        //   Pillarbox = keep aspect + black bars (default; only visible when the window isn't 4:3).
+-        //   Crop      = keep aspect, fill the window, crop the overflow (removes the left/right pillars).
+-        //   Stretch   = fill the window, distort to its aspect.
++        // BAR letterbox control: how the image is fit to a window of a different aspect ratio.
++        //   Crop      = keep aspect, fill the window, crop the overflow (no bars).
++        //   Stretch   = fill the window, distort to its aspect (no bars).
++        //   Pillarbox = keep aspect and pad with black bars. Currently the default; see below.
+         // Pairs with ar_option=Expand (widen 3D FOV) so Crop/Stretch show more scene instead of just zooming.
++        //
++        // Crop is deliberately FIRST even though it is not currently the default. The end goal for this
++        // project is that the image always fills the window with no black bars, and the first enumerator
++        // is what every fallback path resolves to: nlohmann's enum deserializer returns it for an
++        // unrecognised string, RT64's clampEnum() returns it for an out-of-range value, and a
++        // default-constructed GraphicsConfig that predates this field would zero to it. Putting Pillarbox
++        // first (as this enum used to) meant any one of those paths silently reintroduced the bars.
++        // Do not reorder.
++        //
++        // The DEFAULT is Pillarbox only while plain 4:3 is being established as a correct baseline:
++        // it is the one mode that shows the whole picture at its true proportions, so it is what
++        // "4:3 works" can be judged against. It goes back to Crop once that baseline is signed off.
+         enum class PresentFillMode {
+-            Pillarbox,
+             Crop,
+             Stretch,
+-            OptionCount
+-        };
+-
++            Pillarbox,
++            OptionCount
++        };
++        enum class PresentationMode {
++            Console,
++            SkipBuffering,
++            PresentEarly
++        };
++
++        // Every member has a default initializer, and that is load-bearing rather than tidiness.
++        // RecompFrontend's graphics tab applies settings by default-constructing a GraphicsConfig and
++        // assigning only the options it knows about (ui_config_tab_graphics.cpp, apply_graphics_config).
++        // It cannot know about divot_option or pfm_option, which this project added — so without these
++        // initializers those two fields held indeterminate values every time the player touched the
++        // graphics menu, which for pfm_option meant the letterbox could reappear at random. Any field
++        // added here must carry a default for the same reason.
+         class GraphicsConfig {
+         public:
+-            bool developer_mode;
+-            Resolution res_option;
+-            WindowMode wm_option;
+-            HUDRatioMode hr_option;
+-            GraphicsApi api_option;
+-            AspectRatio ar_option;
+-            Antialiasing msaa_option;
+-            RefreshRate rr_option;
+-            HighPrecisionFramebuffer hpfb_option;
+-            int rr_manual_value;
+-            int ds_option;
+-            DivotFilter divot_option;
+-            PresentFillMode pfm_option;   // BAR: window-fit mode (pillarbox/crop/stretch) for the final present
++            bool developer_mode = false;
++            Resolution res_option = Resolution::Auto;
++            WindowMode wm_option = WindowMode::Windowed;
++            HUDRatioMode hr_option = HUDRatioMode::Original;
++            GraphicsApi api_option = GraphicsApi::Auto;
++            AspectRatio ar_option = AspectRatio::Original;   // BASELINE: get plain 4:3 right first
++            Antialiasing msaa_option = Antialiasing::MSAA4X;
++            RefreshRate rr_option = RefreshRate::Display;
++            HighPrecisionFramebuffer hpfb_option = HighPrecisionFramebuffer::Auto;
++            int rr_manual_value = 60;
++            int ds_option = 1;
++            DivotFilter divot_option = DivotFilter::Auto;
++            // BASELINE: Pillarbox shows the WHOLE picture at its true proportions, which is what
++            // "4:3 working properly" means and what the next step is measured against. Removing the
++            // bars is a separate, later change: Crop fills the window but cuts 25% off the top and
++            // bottom of a 4:3 image, so it cannot be the baseline.
++            PresentFillMode pfm_option = PresentFillMode::Pillarbox;
+ 
+             virtual ~GraphicsConfig() = default;
+ 
+@@ -164,10 +192,12 @@
+             {ultramodern::renderer::DivotFilter::Off, "Off"},
+         });
+ 
++        // Crop first: an unrecognised string resolves to the first entry, and this project must never
++        // fall back to a mode that adds black bars. See the enum's own comment.
+         NLOHMANN_JSON_SERIALIZE_ENUM(ultramodern::renderer::PresentFillMode, {
+-            {ultramodern::renderer::PresentFillMode::Pillarbox, "Pillarbox"},
+             {ultramodern::renderer::PresentFillMode::Crop, "Crop"},
+             {ultramodern::renderer::PresentFillMode::Stretch, "Stretch"},
++            {ultramodern::renderer::PresentFillMode::Pillarbox, "Pillarbox"},
+         });
+     }
+ }
+--- a/ultramodern/include/ultramodern/input.hpp
++++ b/ultramodern/include/ultramodern/input.hpp
+@@ -15,7 +15,12 @@
+         enum class Pak {
+             None,
+             RumblePak,
+-            // ControllerPak,
++            // A Controller Pak (mempak). The runtime does not emulate the pak itself — the port
++            // answers the joybus READ_PAK/WRITE_PAK traffic against its own backing store. What the
++            // value provides is the ability to report an accessory that is NOT a Rumble Pak, so
++            // OSContStatus.status carries CONT_CARD_ON without osMotorInit accepting the port as a
++            // rumble device. Without it, a port emulating a Controller Pak has to claim RumblePak.
++            ControllerPak,
+             // TransferPak
+         };
+ 
+--- a/ultramodern/include/ultramodern/renderer_context.hpp
++++ b/ultramodern/include/ultramodern/renderer_context.hpp
+@@ -84,6 +84,7 @@
+ 
+                 virtual void enable_instant_present() = 0;
+                 virtual void send_dl(const OSTask* task) = 0;
++                virtual void send_dummy_workload(uint32_t fb_address) = 0;
+                 virtual void update_screen() = 0;
+                 virtual void shutdown() = 0;
+                 virtual uint32_t get_display_framerate() const = 0;
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -37,10 +37,14 @@
+ struct UpdateConfigAction {
+ };
+ 
+-using Action = std::variant<SpTaskAction, ScreenUpdateAction, UpdateConfigAction>;
++struct DummyWorkloadAction {
++    int32_t fb_address;
++};
++
++using Action = std::variant<SpTaskAction, ScreenUpdateAction, UpdateConfigAction, DummyWorkloadAction>;
+ 
+ struct ViState {
+-    const OSViMode* mode;
++    const OSViMode* mode = nullptr;
+     PTR(void) framebuffer;
+     PTR(OSMesg) mq;
+     OSMesg msg;
+@@ -70,6 +74,11 @@
+         void update_vi() {
+             ViState* next_state = get_next_state();
+             const OSViMode* next_mode = next_state->mode;
++            if (next_mode == nullptr) {
++                // Skip the update if the next mode hasn't been set yet.
++                return;
++            }
++
+             const OSViCommonRegs* common_regs = &next_mode->comRegs;
+             const OSViFieldRegs* field_regs = &next_mode->fldRegs[field];
+             PTR(void) framebuffer = osVirtualToPhysical(next_state->framebuffer);
+@@ -218,19 +227,23 @@
+         }
+         total_vis = new_total_vis;
+ 
+-        // If the game hasn't started yet, set a dummy VI mode and origin.
+-        if (!ultramodern::is_game_started()) {
+-            static bool odd = false;
+-            set_dummy_vi(odd);
+-            odd = !odd;
+-        }
+-
+-        // Queue a screen update for the graphics thread with the current VI register state.
+-        // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
+-        events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
+-
+-        // Update VI registers and swap VI modes.
+-        events_context.vi.update_vi();
++        {
++            // SDK calls change the pending VI state under this same mutex. Keep the
++            // state swap and copy atomic with respect to those calls so a retrace
++            // cannot lose osViBlack(FALSE), a new mode, or a framebuffer update.
++            std::lock_guard lock{ events_context.message_mutex };
++            if (!ultramodern::is_game_started()) {
++                static bool odd = false;
++                set_dummy_vi(odd);
++                odd = !odd;
++
++                events_context.action_queue.enqueue(DummyWorkloadAction{events_context.vi.get_next_state()->framebuffer});
++            }
++
++            // Scan out the previous frame before applying the pending VI state.
++            events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
++            events_context.vi.update_vi();
++        }
+ 
+         // If the game has started, handle sending VI and AI events. Skipped while paused so the game
+         // blocks waiting for the next VI message (frozen sim); ScreenUpdateAction above still fires.
+@@ -363,11 +376,6 @@
+         if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
+-                // Turn on instant present if the game has been started and it hasn't been turned on yet.
+-                if (ultramodern::is_game_started() && !enabled_instant_present) {
+-                    renderer_context->enable_instant_present();
+-                    enabled_instant_present = true;
+-                }
+                 // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
+                 // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
+                 // is finished as well, so sending this early shouldn't be an issue in most cases.
+@@ -400,6 +408,9 @@
+                 if (renderer_context->update_config(old_config, new_config)) {
+                     old_config = new_config;
+                 }
++            }
++            else if (const auto* dummy_workload_action = std::get_if<DummyWorkloadAction>(&action)) {
++                renderer_context->send_dummy_workload(dummy_workload_action->fb_address);
+             }
+         }
+     }
+@@ -449,15 +460,42 @@
+     return ret;
+ }();
+ 
++// Same dummy mode, but scanning out from a different line offset. See set_dummy_vi below: this is how
++// the pre-game VI origin is made to change without changing the framebuffer address the game reads
++// back through osViGetCurrentFramebuffer().
++static const OSViMode dummy_mode_alt = []() {
++    OSViMode ret = dummy_mode;
++    for (int field = 0; field < 2; field++) {
++        ret.fldRegs[field].origin = dummy_mode.fldRegs[field].origin + 0x25800;
++    }
++    return ret;
++}();
++
+ void set_dummy_vi(bool odd) {
+     ViState* next_state = events_context.vi.get_next_state();
+-    next_state->mode = &dummy_mode;
+-    // BAR boots with osViBlack(TRUE)+osViSwapBuffer(0x100000), then un-blacks ONLY once its gfx manager
+-    // sees osViGetCurrentFramebuffer()==0x100000 (uvgfxmgr_rom.c). That check runs while this dummy VI
+-    // is still the current state, so the dummy framebuffer MUST be 0x100000 (BAR's boot framebuffer) or
+-    // the un-black never fires and the screen stays black forever (RT64 refuses to present a VI whose
+-    // hStart==0, which is what VI_STATE_BLACK forces). Was 0x80700000.
+-    (void)odd;
++    // Two constraints meet here, and they pull in opposite directions.
++    //
++    // (1) BAR boots with osViBlack(TRUE)+osViSwapBuffer(0x100000) and un-blacks ONLY once its gfx
++    //     manager sees osViGetCurrentFramebuffer()==0x100000 (uvgfxmgr_rom.c). That getter returns
++    //     this ViState's framebuffer verbatim, and the check runs while the last dummy state is still
++    //     current -- so if this field is ever anything else when the game starts, BAR never un-blacks
++    //     and the screen stays black forever (RT64 refuses to present a VI whose hStart==0, which is
++    //     what VI_STATE_BLACK forces). Upstream's 0x80700000 is wrong for BAR; do not "restore" it on
++    //     a future merge without re-testing the boot.
++    //
++    // (2) Presentation before a game starts is driven by the VI *origin* changing -- emphatically so
++    //     in Console presentation mode, which presents strictly from that origin. Pinned to one
++    //     address, RT64 sees the same frame forever and stops presenting: recompui's draw_hook never
++    //     runs, and the launcher paints once and then ignores every click and keypress.
++    //
++    // Alternating next_state->framebuffer satisfies (2) but breaks (1) HALF THE TIME -- whether BAR
++    // un-blacks then depends on the parity of the last dummy frame before is_game_started() flips,
++    // which is a coin toss that presents as an intermittent permanent black screen. So instead the
++    // framebuffer stays pinned at 0x100000 for (1), and the alternation moves into the mode's field
++    // origin, which update_vi() adds to the framebuffer when it computes VI_ORIGIN_REG. The scanout
++    // address changes every frame for (2); the address the game reads back never does.
++    next_state->mode = odd ? &dummy_mode_alt : &dummy_mode;
++    next_state->control = next_state->mode->comRegs.ctrl;
+     next_state->framebuffer = 0x100000;
+ }
+ 
+@@ -575,10 +613,12 @@
+ }
+ 
+ extern "C" PTR(void) osViGetNextFramebuffer() {
++    std::lock_guard lock{ events_context.message_mutex };
+     return events_context.vi.get_next_state()->framebuffer;
+ }
+ 
+ extern "C" PTR(void) osViGetCurrentFramebuffer() {
++    std::lock_guard lock{ events_context.message_mutex };
+     return events_context.vi.get_cur_state()->framebuffer;
+ }
+ 
+@@ -603,6 +643,15 @@
+     moodycamel::LightweightSemaphore gfx_thread_ready;
+     moodycamel::LightweightSemaphore task_thread_ready;
+     events_context.rdram = rdram;
++    // The frontend may start a cached game before the first timed VI tick. BAR
++    // checks the current framebuffer once during graphics-module initialization
++    // and only unblanks when it sees 0x100000. Seed both states synchronously;
++    // relying on the VI thread leaves fast starts permanently black.
++    {
++        std::lock_guard lock{ events_context.message_mutex };
++        set_dummy_vi(false);
++        events_context.vi.update_vi();
++    }
+     events_context.sp.gfx_thread = std::thread{ gfx_thread_func, rdram, &gfx_thread_ready, window_handle };
+     events_context.sp.task_thread = std::thread{ task_thread_func, rdram, &task_thread_ready };
+ 
+--- a/ultramodern/src/input.cpp
++++ b/ultramodern/src/input.cpp
+@@ -1,4 +1,5 @@
+ #include <cassert>
++#include <cmath>
+ 
+ #include "ultramodern/input.hpp"
+ #include "ultramodern/ultra64.h"
+@@ -136,6 +137,18 @@
+     u8 pattern;
+ 
+     __osContGetInitData(&pattern, data);
++}
++
++void convert_to_n64_range(float x, float y, int8_t& stick_x, int8_t& stick_y) {
++    // BAR's callback returns the same joybus sample divided by 80. Reconstruct it
++    // exactly: a second circular/octagonal transform makes the OS and SI routes disagree.
++    auto convert = [](float value) -> int8_t {
++        if (!std::isfinite(value)) return 0;
++        value = value < -1.0f ? -1.0f : (value > 1.0f ? 1.0f : value);
++        return static_cast<int8_t>(std::lround(value * 80.0f));
++    };
++    stick_x = convert(x);
++    stick_y = convert(y);
+ }
+ 
+ extern "C" void osContGetReadData(OSContPad *data) {
+@@ -150,9 +163,9 @@
+         }
+ 
+         if (got_response) {
++            convert_to_n64_range(x, y, data[controller].stick_x, data[controller].stick_y);
++
+             data[controller].button = buttons;
+-            data[controller].stick_x = (int8_t)(127 * x);
+-            data[controller].stick_y = (int8_t)(127 * y);
+             data[controller].err_no = 0;
+         } else {
+             data[controller].err_no =  CONT_NO_RESPONSE_ERROR; // CHNL_ERR_NORESP >> 4
+@@ -211,4 +224,3 @@
+ 
+     return 0;
+ }
+-

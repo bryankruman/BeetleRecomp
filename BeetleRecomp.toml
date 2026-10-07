@@ -27,6 +27,19 @@ relocatable_sections_path = "overlays.us.txt"
 # symbols_file_path = "syms/beetleadventurerac.us.syms.toml"
 
 [patches]
+# BAR serves the controller bus itself. Keep the original libultra save/pak code;
+# otherwise recovered SDK names silently select runtime no-pak or ignored stubs.
+original = [
+    "osPfsIsPlug", "__osPfsRequestData", "__osPfsGetInitData",
+    "__osContRamWrite", "__osContRamRead", "__osMotorAccess", "osMotorInit",
+    "osPfsAllocateFile", "osPfsFileState", "__osPfsGetStatus", "osPfsInitPak",
+    "osPfsChecker", "__osPfsRWInode", "osPfsDeleteFile", "osPfsFreeBlocks",
+    "osPfsRepairId", "osPfsReadWriteFile", "osPfsNumFiles", "osPfsFindFile",
+    "__osPfsSelectBank", "__osPfsGetNextPage",
+    "__osCheckId", "__osGetId", "__osCheckPackId", "__osRepairPackId",
+    "corrupted_init", "corrupted",
+]
+
 # Functions to emit as empty stubs (e.g. raw RCP/hardware pokes the runtime handles
 # itself). Populate during bring-up as you discover them.
 stubs = [

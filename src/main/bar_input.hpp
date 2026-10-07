@@ -53,7 +53,7 @@ uint16_t resolve_port(int port, int8_t* sx, int8_t* sy);
 // A port is "present" (advertised to the game) when it's plugged in AND has a device assigned.
 bool port_connected(int port);
 // The pak inserted in a port (None if not present).
-bar::input_config::PakType port_pak(int port);
+bar::input_config::PakType port_pak(int port, bool require_connected = true);
 
 // ---- Rumble ----
 // Request rumble on/off for a port (from the input_set_rumble callback / the SI-stub motor

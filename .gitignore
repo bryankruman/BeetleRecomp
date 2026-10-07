@@ -28,6 +28,7 @@
 /patches/patches.bin
 /patches/patches.map
 /patches/*.o
+/patches/*.d
 
 # --- Generated symbol tables (large; regenerate from the decomp) ---
 /syms/*.toml
@@ -44,3 +45,10 @@ Thumbs.db
 
 # HUD/menu decomp grind staging (transient)
 .grind/
+
+# Local fork-review snapshots and verification artifacts
+.review/
+/build-frontend/
+/dist/
+__pycache__/
+*.pyc

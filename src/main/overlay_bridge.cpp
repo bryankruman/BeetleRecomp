@@ -3,7 +3,7 @@
 // BAR loads each relocatable module into a heap buffer and jumps to its entry point
 // (decomp src/module.c: uvLoadModuleCode -> uvDoModuleRelocs -> entryPointFunction(...)). In a
 // static recomp the module's recompiled functions live in func_map keyed by their recomp-ELF VRAM
-// (0x80800000 + id*0x100000), NOT the heap address — so the entry-point LOOKUP_FUNC failed with
+// (assigned by the decomp's recomp linker), NOT the heap address — so the entry-point LOOKUP_FUNC failed with
 // "Failed to find function at 0x...".
 //
 // Fix: intercept uvDoModuleRelocs (called with a0 = ovlStartPtr, a1 = ModuleCommInfo*, right before

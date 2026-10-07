@@ -204,7 +204,10 @@ InputConfig default_input_config() {
     // Port 0: a plugged-in keyboard controller with the historical map (unchanged default behavior).
     c.ports[0].connected    = true;
     c.ports[0].device.type  = DeviceType::Keyboard;
-    c.ports[0].pak          = PakType::None;
+    // BAR saves only via osPfs* (Controller Pak); with no pak the game opens on
+    // "No Controller Pak present. … Start Game Without Saving" and can never save. The 32 KiB
+    // per-port mempak store in bar_input.cpp is fully emulated and persisted, so ship it inserted.
+    c.ports[0].pak          = PakType::ControllerPak;
     c.ports[0].bindings     = default_keyboard_bindings();
     c.ports[0].profile_name = "Default Keyboard";
     // Ports 1-3: unplugged, no device (as the SI stub reported before Controls).

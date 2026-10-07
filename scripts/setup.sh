@@ -4,29 +4,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-add_sub() { # add_sub <url> <path>
-  if [ -f "$2/CMakeLists.txt" ] || [ -e "$2/.git" ]; then
-    echo ">> $2 already present, skipping"
-  else
-    git submodule add -f "$1" "$2"
-  fi
-}
-
-echo ">> Adding submodules..."
-add_sub https://github.com/N64Recomp/N64ModernRuntime.git lib/N64ModernRuntime
-add_sub https://github.com/rt64/rt64.git                  lib/rt64
-add_sub https://github.com/mikke89/RmlUi.git              lib/RmlUi
-add_sub https://github.com/sammycage/lunasvg.git          lib/lunasvg
-# N64Recomp arrives transitively via N64ModernRuntime, but we also need the
-# standalone recompiler executables, so vendor it directly too:
-add_sub https://github.com/bryankruman/N64Recomp.git        lib/N64Recomp
-
+# The committed .gitmodules and Git index are the source of dependency pins.
+# Do not run `submodule add` on an already registered, uninitialized checkout.
 echo ">> Updating submodules recursively..."
 git submodule update --init --recursive
 
+python3 scripts/apply-dependency-patches.py
+
 echo ">> Building N64Recomp + RSPRecomp (Release)..."
 cmake -S lib/N64Recomp -B lib/N64Recomp/build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build lib/N64Recomp/build --config Release
+cmake --build lib/N64Recomp/build --config Release --parallel "${BEETLE_BUILD_JOBS:-4}"
 
 echo ">> Copying recompiler executables to repo root..."
 find lib/N64Recomp/build -maxdepth 2 -type f \

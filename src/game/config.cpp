@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <exception>
 #include <fstream>
+#include <string>
 
 #include "json/json.hpp"   // nlohmann::json (vendored by ultramodern; same header config.hpp uses)
 
@@ -63,13 +64,47 @@ fs::path compute_app_config_directory() {
     return fs::current_path();
 }
 
+// graphics.json has two writers, and for one field they disagree about the vocabulary.
+//
+// This file is one writer. The other is RecompFrontend's settings menu, which persists through
+// librecomp's own Config (`<tab id>.json` under the same directory, so also `graphics.json`) using
+// the display names in `ui_config_tab_graphics.cpp`. Every enum's names match across the two except
+// HUDRatioMode::Full, which is "Full" to ultramodern's NLOHMANN_JSON_SERIALIZE_ENUM table and
+// "Expand" to the menu -- the menu's label for it, matching the Aspect Ratio option beside it.
+//
+// Neither side throws on a name it does not know; both quietly fall back to a default. So writing
+// "Full" here made the menu reset HUD Placement to its own default (Clamp16x9), and writing "Expand"
+// there made this loader read HUD Ratio as Original -- which silently disables HUD anchoring, since
+// Original collapses every extended-GBI origin back to the frame's centre. Both were observed.
+//
+// So: accept either spelling on the way in, and write the menu's spelling on the way out, because
+// the menu is the writer that wins whenever the frontend build is running.
+static const char *hud_ratio_to_string(ultramodern::renderer::HUDRatioMode mode) {
+    switch (mode) {
+        case ultramodern::renderer::HUDRatioMode::Clamp16x9: return "Clamp16x9";
+        case ultramodern::renderer::HUDRatioMode::Full:      return "Expand";
+        case ultramodern::renderer::HUDRatioMode::Original:
+        default:                                             return "Original";
+    }
+}
+
+static ultramodern::renderer::HUDRatioMode hud_ratio_from_string(const std::string& s,
+                                                                 ultramodern::renderer::HUDRatioMode fallback) {
+    using ultramodern::renderer::HUDRatioMode;
+    if ((s == "Expand") || (s == "Full"))    return HUDRatioMode::Full;
+    if ((s == "Clamp16x9") || (s == "16:9")) return HUDRatioMode::Clamp16x9;
+    if (s == "Original")                     return HUDRatioMode::Original;
+    return fallback;
+}
+
 nlohmann::json graphics_to_json(const GraphicsConfig& c) {
-    // Enum fields serialize as strings via the NLOHMANN_JSON_SERIALIZE_ENUM tables in config.hpp.
+    // Enum fields serialize as strings via the NLOHMANN_JSON_SERIALIZE_ENUM tables in config.hpp,
+    // except hr_option -- see the note above.
     return nlohmann::json{
         {"developer_mode",  c.developer_mode},
         {"res_option",      c.res_option},
         {"wm_option",       c.wm_option},
-        {"hr_option",       c.hr_option},
+        {"hr_option",       hud_ratio_to_string(c.hr_option)},
         {"api_option",      c.api_option},
         {"ar_option",       c.ar_option},
         {"msaa_option",     c.msaa_option},
@@ -89,7 +124,7 @@ GraphicsConfig graphics_from_json(const nlohmann::json& j) {
     c.developer_mode  = j.value("developer_mode",  c.developer_mode);
     c.res_option      = j.value("res_option",      c.res_option);
     c.wm_option       = j.value("wm_option",       c.wm_option);
-    c.hr_option       = j.value("hr_option",       c.hr_option);
+    c.hr_option       = hud_ratio_from_string(j.value("hr_option", std::string{}), c.hr_option);
     c.api_option      = j.value("api_option",      c.api_option);
     c.ar_option       = j.value("ar_option",       c.ar_option);
     c.msaa_option     = j.value("msaa_option",     c.msaa_option);
@@ -127,16 +162,16 @@ GraphicsConfig default_graphics_config() {
     c.developer_mode  = false;
     c.res_option      = Resolution::Auto;                     // display-native: render at the window/monitor resolution (integer scale)
     c.wm_option       = WindowMode::Windowed;
-    c.hr_option       = HUDRatioMode::Original;
+    c.hr_option       = HUDRatioMode::Full;                   // widescreen HUD: anchor the racing HUD to the widened frame's edges
     c.api_option      = GraphicsApi::Auto;                    // RT64 picks D3D12 on Windows / Vulkan on Linux
-    c.ar_option       = AspectRatio::Original;
+    c.ar_option       = AspectRatio::Original;                // BASELINE: plain 4:3 first, widescreen after
     c.msaa_option     = Antialiasing::MSAA4X;                  // seam fix 2A: 4x MSAA adds edge coverage, softening coplanar seams
     c.rr_option       = RefreshRate::Display;                 // HIGH-FPS: interpolate up to the monitor rate
     c.hpfb_option     = HighPrecisionFramebuffer::Auto;
     c.rr_manual_value = 144;                                  // only consulted when rr_option == Manual
     c.ds_option       = 1;
     c.divot_option    = DivotFilter::Auto;                    // seam fix 2B: match the game's VI divot bit (on for BAR)
-    c.pfm_option      = PresentFillMode::Pillarbox;           // letterbox: keep the original pillarbox present by default (no regression)
+    c.pfm_option      = PresentFillMode::Pillarbox;           // BASELINE: whole picture, true proportions
     return c;
 }
 
