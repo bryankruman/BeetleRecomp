@@ -168,6 +168,24 @@ and private generated-input hashes agree locally and on the validated worker. Ev
 `/opt/beetle-recomp-review-20261006/vi-startup-validation` and local
 `.review/vi-startup-validation/{boot-framebuffer-debug,repeated-fast-starts,race-persistence-retry}`.
 
+Additional bounded runtime observations used the same validated Windows executable
+(`fa98c8d5670e181092895a3a3f2abe73d6548b7fa55901e7e3d0fb9473b727a9`).
+A four-minute original-aspect attract run rendered several cinematic scenes, menus
+and a forest/bridge attract scene. Eight captures and an 87.38-second raw stereo
+audio sample are retained privately. Nonzero raw samples establish audio production;
+they do not certify audible playback or pacing. One cinematic capture contains sky
+edge fragments; compare motion and the original game before calling this a regression.
+Evidence: `.review/vi-startup-validation/original-aspect-attract-3070/review-3076.json`.
+
+Two subsequent 140-second startup-viewport runs exercised Original aspect in a
+1280x720 window and expanded rendering in an 860x360 window. All ten captures were
+visually reviewed. Both reached Coventry Cove racing with readable HUD, minimap and
+gauge; Original aspect retained side bars and expanded rendering extended the scene.
+Both preserved the private Pak hash. The harness deliberately terminated its own
+live processes: exit code 1 is neither a crash finding nor a normal-quit check.
+These observations do not test live resize, multiplayer or split screens.
+Evidence: `.review/vi-startup-validation/viewport-matrix-3078/review-3091.json`.
+
 Remaining release gates: actual settings/import behavior;
 single-player and 2/4-player input/saves/rumble; resize/Original/16:9/ultrawide HUD and split
 screens; boot splash, menu roll, pause, Mount Mayhem fog, attract pacing/audio and results
