@@ -215,9 +215,10 @@ require "$(count_in_funcs 'BAR FIX: skip RCP-register')" 1 \
 # for both what is drawn and what the game bothers to submit. src/main/bar_frustum.cpp explains the
 # numbers and the channel guard; here we only hand it the arguments and write back what it changed.
 #
-# Anchored on the FUNCTION NAME rather than an instruction address, so unlike the rules above it
-# cannot rot when the decomp ELF moves. The argument slots are the MIPS o32 layout this function is
-# compiled with: a1..a3 are left, right and top, and bottom, near and far are at 0x10, 0x14 and 0x18
+# Resolve the function at original .uvfmtx_rom+0x1F74 in this exact ELF. The resolver
+# checks its original prologue before returning its symbol, so readable function
+# names and rebased modules retain the hook. The argument slots use the MIPS o32 layout
+# for this function: a1..a3 are left, right and top; bottom, near and far are at 0x10, 0x14 and 0x18
 # of the caller's stack -- read them back from the same places the body is about to load them from.
 #
 # Every line carries its own /* */ comment marker rather than a leading // on the first line. An
@@ -226,10 +227,10 @@ require "$(count_in_funcs 'BAR FIX: skip RCP-register')" 1 \
 # The verification below therefore also asserts the call and the declaration land on separate lines.
 frustum_hook='    { /* BAR: draw distance + the frustum the game culls against (src/main/bar_frustum.cpp) */\n        extern void bar_frustum_adjust(uint8_t*, unsigned, unsigned*, unsigned*, unsigned*, unsigned*, unsigned*, unsigned*);\n        unsigned bar_l = (unsigned)ctx->r5, bar_r = (unsigned)ctx->r6, bar_t = (unsigned)ctx->r7;\n        unsigned bar_b = (unsigned)MEM_W(0X10, ctx->r29), bar_n = (unsigned)MEM_W(0X14, ctx->r29), bar_f = (unsigned)MEM_W(0X18, ctx->r29);\n        bar_frustum_adjust(rdram, (unsigned)ctx->r4, &bar_l, &bar_r, &bar_t, &bar_b, &bar_n, &bar_f);\n        ctx->r5 = (int32_t)bar_l; ctx->r6 = (int32_t)bar_r; ctx->r7 = (int32_t)bar_t;\n        MEM_W(0X10, ctx->r29) = (int32_t)bar_b; MEM_W(0X14, ctx->r29) = (int32_t)bar_n; MEM_W(0X18, ctx->r29) = (int32_t)bar_f;\n    }'
 for f in "$RF"/*.c; do
-    if grep -q 'RECOMP_FUNC void func_uvfmtx_rom_00401F74(' "$f" && ! grep -q 'bar_frustum_adjust' "$f"; then
-        awk -v fix="$frustum_hook" '
+    if grep -Fq "RECOMP_FUNC void ${FRUSTUM_PROJECTION}(" "$f" && ! grep -q 'bar_frustum_adjust' "$f"; then
+        awk -v fix="$frustum_hook" -v projection="$FRUSTUM_PROJECTION" '
             { print }
-            /RECOMP_FUNC void func_uvfmtx_rom_00401F74\(/ { armed = 1; next }
+            $0 ~ ("^RECOMP_FUNC void " projection "\\(") { armed = 1; next }
             armed && /^[[:space:]]*int c1cs = 0;[[:space:]]*$/ { print fix; armed = 0 }
         ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
     fi
@@ -237,7 +238,7 @@ done
 # Two separate lines must mention it: the declaration and the call. One line means the hook collapsed
 # and is sitting inside a comment.
 require "$(count_in_funcs 'bar_frustum_adjust')" 2 \
-    "frustum hook (draw distance + culling width)" "RECOMP_FUNC void func_uvfmtx_rom_00401F74("
+    "frustum hook (draw distance + culling width)" "RECOMP_FUNC void ${FRUSTUM_PROJECTION}("
 require "$(count_in_funcs 'bar_frustum_adjust(rdram, (unsigned)ctx->r4')" 1 \
     "frustum hook call is live (not collapsed into its comment)" "bar_frustum_adjust(rdram, ..."
 

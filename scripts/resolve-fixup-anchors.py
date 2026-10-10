@@ -44,7 +44,12 @@ def resolve(path):
     hardware = functions.get(0x8000E460, set())
     if hardware not in ({'func_8000E460'}, {'osAiGetLength'}):
         raise ValueError(f'Unexpected audio-length function: {hardware}')
+    # Verify the original argument spill and a2-to-f14 move before resolving
+    # the projection symbol; readable decomp names may change independently.
+    instruction('.uvfmtx_rom', 0x1F74, 0xAFA50004)
+    instruction('.uvfmtx_rom', 0x1F78, 0x44867000)
     result = {
+        'FRUSTUM_PROJECTION': function('.uvfmtx_rom', 0x1F74),
         'INTRO_SKIP': instruction('.intro', 0x618, 0x30B81000),
         'MIDI_WAIT_LABEL': 'L_'+instruction('.uvcmidi_rom', 0x984, 0x0C00048C)[2:],
         'CONT_PROBE': instruction('.uvcont_rom', 0x1794, 0x13200025),
