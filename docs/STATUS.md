@@ -1,6 +1,33 @@
 # Project Status & Resume Guide
 
-_Last updated: 2026-07-03_
+_Last updated: 2026-10-11_
+
+## Current paired build validation — October 10, 2026, 11:58 PM ET
+
+The isolated Linux application build passes against the accepted decomp commit
+`f66abae11ee5899e276ce27f8ee22aba676ca75c`, including 140 recovered SDK functions.
+All nine checks passed: anchor regression, main code generation, strict fixups,
+fixup idempotence, symbol generation, MIPS patch build/generation, configuration
+and the complete frontend build. The four-job compile/link step took 190.48 seconds
+on the isolated pve worker. All 14,114 original frontend/private-input files,
+1,156 decomp source files, original ROM and previous builds passed their guards.
+
+This supersedes earlier paired ELF/build hashes for current build compatibility.
+ELF SHA-256: `15b44b2884154a4bb29088aaf0912ae897ab197f23eb35182d68daa65a6f15ef`.
+Linux executable SHA-256: `88a0f89fc8d4a6a33fc67f1d8d4cef85069ffebf46de558b24556196c9261779`.
+Private receipt: `ordinary27-controller140-paired-actual-4952.json`, SHA-256
+`3885e2a40652c434323aa000719cf7e278947439c727e9ff6c3120b4971a4684`.
+The 21 explicit original helper boundaries and authoritative recompiler configuration
+remain unchanged. The new binary has not passed interactive runtime qualification;
+previous Windows/gameplay observations apply to their recorded older executables.
+Settings/import, multiplayer, saves/rumble, live resize/split screens, course fog,
+audible audio quality, pacing, results transitions and repeated normal quitting
+remain release gates. Fork integration is complete; release qualification is partial.
+
+## Historical bring-up notes — July 2026
+
+The measurements and executable paths below are historical. Use the current paired
+build evidence above and [fork review](FORK_REVIEW.md) for present qualification.
 
 ## TL;DR
 - ✅ **Builds + links + runs** → `build-cmake/BeetleRecomp.exe` (native Windows, clang-cl, RT64/D3D12).
