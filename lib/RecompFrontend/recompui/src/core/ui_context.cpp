@@ -235,12 +235,25 @@ void recompui::init_styling(const std::filesystem::path& rcss_file) {
     // Load user rcss.
     std::string style{};
     {
-        std::ifstream style_stream{rcss_file};
-        style_stream.seekg(0, std::ios::end);
-        style.resize(style_stream.tellg());
-        style_stream.seekg(0, std::ios::beg);
+        const auto fail_read = [&rcss_file](const char* operation) {
+            ultramodern::error_handling::message_box(
+                (std::string{"Failed to "} + operation + " required UI stylesheet: " +
+                 rcss_file.string() + "\nRestore the application's assets directory and try again.").c_str());
+            ULTRAMODERN_QUICK_EXIT();
+        };
 
-        style_stream.read(style.data(), style.size());
+        std::ifstream style_stream{rcss_file};
+        if (!style_stream) {
+            fail_read("open");
+        }
+        char chunk[4096];
+        while (style_stream.read(chunk, sizeof(chunk))) {
+            style.append(chunk, sizeof(chunk));
+        }
+        style.append(chunk, static_cast<std::size_t>(style_stream.gcount()));
+        if (style_stream.bad() || !style_stream.eof()) {
+            fail_read("read");
+        }
     }
     std::unique_ptr<Rml::StreamMemory> rml_stream = std::make_unique<Rml::StreamMemory>(reinterpret_cast<Rml::byte*>(style.data()), style.size());
     rml_stream->SetSourceURL(rcss_file.filename().string());

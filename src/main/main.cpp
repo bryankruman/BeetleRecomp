@@ -305,10 +305,44 @@ static ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callba
 // called from, because this is the callback that runs on the thread owning the window.
 static void bar_update_window_focus();
 
+
+// Opt-in runtime qualification: enqueue the same event as closing this application's
+// window, on its owning thread. The normal frontend event pump performs shutdown.
+// This never sends input to another process; an external harness still owns its deadline.
+static void bar_request_timed_test_quit() {
+    static const long limit_ms = [] {
+        const char* value = std::getenv("BAR_TEST_QUIT_AFTER_MS");
+        if (value == nullptr) return 0L;
+        char* end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || parsed < 1000 || parsed > 600000) {
+            std::fprintf(stderr, "[BAR_TEST_QUIT_AFTER_MS] invalid duration; probe disabled\n");
+            return 0L;
+        }
+        return parsed;
+    }();
+    if (limit_ms == 0) return;
+    static const auto started = std::chrono::steady_clock::now();
+    static bool attempted = false;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    if (!attempted && elapsed >= limit_ms) {
+        attempted = true;
+        SDL_Event event{};
+        event.type = SDL_QUIT;
+        if (SDL_PushEvent(&event) == 1) {
+            std::fprintf(stderr, "[BAR_TEST_QUIT_AFTER_MS] queued SDL_QUIT\n");
+        } else {
+            std::fprintf(stderr, "[BAR_TEST_QUIT_AFTER_MS] SDL_QUIT enqueue failed: %s\n", SDL_GetError());
+        }
+    }
+}
+
 static void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t /*data*/) {
     // First statement in the callback, so a stall anywhere below -- including inside the pump itself
     // -- stops the counter and the watchdog times the wedge from the start of the frame that wedged.
     bar::watchdog::heartbeat();
+    bar_request_timed_test_quit();
 #ifdef BEETLE_ENABLE_FRONTEND
     // recompinput owns the SDL queue and must be its ONLY poller -- a second loop would race it and
     // each would swallow events the other needed. It is pumped here rather than from input_poll
@@ -427,9 +461,9 @@ static void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t /*data*/) {
 // we channel-swap to [L,R] (matches Zelda64Recompiled's backend). BAR_AUDIO_XFORM overrides:
 //   0 = as-is, 1 = byteswap only, 2 = channel-swap only [default, correct], 3 = byteswap + channel-swap.
 //
-// SAFETY: the output device is opened (and sound produced) ONLY when BAR_AUDIO_PLAY is set. By default —
-// and while verifying correctness — NO device is opened and NOTHING plays. BAR_AUDIO_CAPTURE=<path> dumps
-// the raw (untransformed) received stream so the correct transform can be checked offline without audio.
+// Audio output is enabled by default; BAR_NO_AUDIO disables the device and audio microcode.
+// BAR_AUDIO_CAPTURE=<path> dumps the raw (untransformed) received stream before the device transform,
+// so a capture alone does not prove sound reached the output device.
 static SDL_AudioDeviceID g_audio_dev = 0;
 static uint32_t g_dev_freq  = 0;        // freq the SDL device is currently open at
 static uint32_t g_game_freq = 0;        // last freq the game requested (for capture/WAV)
@@ -546,7 +580,7 @@ static void queue_samples(int16_t* samples, size_t count) {
         size_t n = std::fwrite(samples, sizeof(int16_t), count, g_audio_capture);
         g_audio_capture_bytes += n * sizeof(int16_t);
     }
-    if (g_audio_dev == 0) return;                    // muted (default) — produce no sound
+    if (g_audio_dev == 0) return;                    // no open output device — produce no sound
     const int xf = bar_audio_xform();
     const bool byteswap = (xf == 1 || xf == 3);
     const bool chanswap = (xf == 2 || xf == 3);
@@ -1073,7 +1107,7 @@ int main(int argc, char** argv) {
     recomp::check_all_stored_roms();                 // populate is_rom_valid() from the config dir
     bool have_rom = recomp::is_rom_valid(game_id);
 
-    // An explicit path (e.g. `BeetleRecomp "C:\path\Beetle.z64"`) wins and is re-validated + cached.
+    // When no valid cached ROM exists, validate and cache an explicit first path argument.
     if (!have_rom && argc > 1 && argv[1][0] != '-') {
         have_rom = bar_select_and_report(std::filesystem::path(argv[1]), game_id);
     }
@@ -1219,5 +1253,8 @@ int main(int argc, char** argv) {
     // Blocks until the game exits.
     recomp::start(config);
     bar_stop_preempt_timer();
+    if (std::getenv("BAR_TEST_QUIT_AFTER_MS") != nullptr) {
+        std::fprintf(stderr, "[BAR_TEST_QUIT_AFTER_MS] runtime returned; shutdown completed\n");
+    }
     return EXIT_SUCCESS;
 }
