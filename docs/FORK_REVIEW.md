@@ -51,7 +51,38 @@ No game ROM, ELF, extracted asset, raw decomp snapshot or credential belongs in 
   * **B:** Hide all multipliers above 1x until the object-drop cause is fixed.
     *Impact:* removes experimental rendering choices, but avoids the known failure entirely in normal settings.
 
-## Current paired build validation — October 10, 2026, 11:58 PM ET
+## Latest runtime qualification — October 11, 2026
+
+The two production fixes are committed locally at
+`8a7370e4c41ea8474c6cfd920926c5e06b20e18a`: stylesheet loading reads bounded chunks
+and reports stream failures; `BAR_TEST_QUIT_AFTER_MS` enables an opt-in, bounded
+shutdown test. Both complete translation units compiled on the isolated worker.
+The stylesheet stream cases also passed the focused Linux regression; Windows
+error-dialog behavior is not established by that regression.
+
+A separate Windows fixture passed the normal confirmed-shutdown path in 45.77
+seconds with exit code zero and no harness termination. It queued `SDL_QUIT`,
+opened the normal confirmation prompt, invoked the existing confirmed-Quit
+callback, and returned through runtime shutdown in that order. All original and
+fixture file guards stayed unchanged. The fixture includes one additional
+opt-in confirmation hook in `ui_state.cpp`; that hook was **not** integrated into
+production. This qualifies the in-process callback path, not a physical click.
+Private receipt: `windows-confirmed-quit-actual-9838.json`, SHA-256
+`665172d2abd3b0c079413f2467dadcefd319580b24b8f7beb22fd2ee368c3608`.
+
+The separately recorded six-minute gameplay run rendered steering responses,
+pause with an unchanged race timer, and resumed timer advancement. Its harness
+ended the run; it is not shutdown or completed-lap evidence. Isolated host tests
+also passed settings/profile persistence and four virtual-controller/Pak paths;
+they do not establish rendered multiplayer or physical rumble.
+
+Release qualification remains partial: rendered multiplayer/split screens,
+live settings/import and resizing, course-specific fog, completed laps/results,
+audible quality and repeated end-to-end transitions still need qualification.
+The source integration is complete; no release has been published. Preserve the
+two fidelity choices recorded as R1 [Wicked Woods door sound] and R2 [Extended draw distance].
+
+## Prior paired build validation — October 10, 2026, 11:58 PM ET
 
 The isolated Linux application build passes against the accepted decomp commit
 `f66abae11ee5899e276ce27f8ee22aba676ca75c`, including 140 recovered SDK functions.
@@ -166,7 +197,8 @@ screenshots and logs are private under `.review/original-controller-sdk-complete
 Closing during gameplay correctly opens the frontend's quit-confirmation dialog, captured
 in `race-persistence-test/quit-confirmation.png`. The test then deliberately terminates the
 process without accepting that dialog. Its exit code 1 is not a demonstrated shutdown hang;
-a clean exit after accepting the prompt is still unverified. The fresh launcher exits cleanly.
+that run did not verify a clean exit after accepting the prompt. The later in-process
+confirmed-Quit check is recorded above. The fresh launcher exits cleanly.
 An eight-second launcher reload also loaded all five saved/imported control profiles,
 preserved `controls.json` byte for byte and exited with code zero.
 
