@@ -119,6 +119,33 @@ namespace recompui {
         }
         #endif
 
+        // DOM navigation parents can remain attached while rebuilding skips a hidden
+        // or disabled branch. Validate every link against this document's fresh tree;
+        // a skipped container may still retain navigation children from an earlier event.
+        static bool is_in_navigation_tree(Element *element, Element *root) {
+            while (element != root) {
+                if (element == nullptr) {
+                    return false;
+                }
+                Element *nav_parent = element->get_nav_parent();
+                if (nav_parent == nullptr) {
+                    return false;
+                }
+                bool found = false;
+                for (Element *child : nav_parent->nav_children) {
+                    if (child == element) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    return false;
+                }
+                element = nav_parent;
+            }
+            return true;
+        }
+
         static int get_element_index(Element *el, std::vector<Element *> elements) {
             for (int i = 0; i < static_cast<int>(elements.size()); i++) {
                 if (el == elements[i]) {
@@ -390,6 +417,20 @@ namespace recompui {
 
             if (nav_context.original_focused_element == nullptr) {
                 return false;
+            }
+
+            // Focus can outlive a branch that the current navigation rebuild excludes.
+            // Recover only through the fresh document tree, never through stale children.
+            if (!RecompNav::is_in_navigation_tree(nav_context.original_focused_element, this)) {
+                event.StopPropagation();
+                if (!nav_children.empty()) {
+                    Element *fallback = nav_context.dive_nav_from_direction(this);
+                    if (fallback != nullptr && fallback != this) {
+                        fallback->focus();
+                        report_focused_element();
+                    }
+                }
+                return true;
             }
 
             #ifdef RECOMPUI_NAV_DEBUG

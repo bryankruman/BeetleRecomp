@@ -46,6 +46,7 @@ constexpr const char*    kDisplayName = "Beetle Adventure Racing!";
 // here.
 constexpr int kMaxPlayers = 4;
 std::array<std::atomic<uint64_t>, kMaxPlayers> g_port_samples{};
+std::array<std::atomic<uint64_t>, kMaxPlayers> g_background_port_samples{};
 std::array<std::atomic<bool>, kMaxPlayers> g_raw_rumble{};
 std::atomic<bool> g_menu_capturing{};
 
@@ -649,6 +650,9 @@ void bar::frontend::pump_events() {
 
     refresh_players();
 
+    // Read mutable configuration only on the existing event/UI owner thread.
+    const bool background_input = recompui::config::general::get_background_input_mode_enabled();
+
     // Profiles and SDL handles belong to the event/UI thread. Publish coherent samples
     // for the game's controller thread instead of reading mutable profiles there.
     for (int port = 0; port < kMaxPlayers; ++port) {
@@ -662,6 +666,22 @@ void bar::frontend::pump_events() {
         const auto sy = static_cast<uint8_t>(static_cast<int8_t>(std::lround(std::clamp(y, -1.0f, 1.0f) * 80.0f)));
         const uint64_t sample = buttons | (uint64_t(sx) << 16) | (uint64_t(sy) << 24) | (uint64_t(assigned) << 32);
         g_port_samples[port].store(sample, std::memory_order_relaxed);
+
+        // Keep a separate controller-only snapshot so losing focus cannot expose
+        // keyboard bits from the last foreground sample. Off and disconnected
+        // ports publish neutral on every pump; the mapper still honors UI capture.
+        uint16_t background_buttons = 0;
+        float background_x = 0.0f, background_y = 0.0f;
+        if (assigned && background_input) {
+            recompinput::profiles::get_n64_input(port, &background_buttons, &background_x, &background_y, false);
+        }
+        if (!std::isfinite(background_x)) background_x = 0.0f;
+        if (!std::isfinite(background_y)) background_y = 0.0f;
+        const auto background_sx = static_cast<uint8_t>(static_cast<int8_t>(std::lround(std::clamp(background_x, -1.0f, 1.0f) * 80.0f)));
+        const auto background_sy = static_cast<uint8_t>(static_cast<int8_t>(std::lround(std::clamp(background_y, -1.0f, 1.0f) * 80.0f)));
+        const uint64_t background_sample = background_buttons | (uint64_t(background_sx) << 16) |
+            (uint64_t(background_sy) << 24) | (uint64_t(assigned) << 32);
+        g_background_port_samples[port].store(background_sample, std::memory_order_relaxed);
     }
     g_menu_capturing.store(recompui::is_context_capturing_input(), std::memory_order_relaxed);
 
@@ -710,14 +730,16 @@ void bar::frontend::set_port_rumble(int port, bool on) {
     g_raw_rumble[port].store(on, std::memory_order_relaxed);
 }
 
-uint16_t bar::frontend::poll_port(int port, int8_t* stick_x, int8_t* stick_y) {
+uint16_t bar::frontend::poll_port(int port, int8_t* stick_x, int8_t* stick_y, bool window_focused) {
     if (stick_x != nullptr) *stick_x = 0;
     if (stick_y != nullptr) *stick_y = 0;
     if (!port_assigned(port)) {
         return 0;
     }
 
-    const uint64_t sample = g_port_samples[port].load(std::memory_order_relaxed);
+    const uint64_t sample = window_focused
+        ? g_port_samples[port].load(std::memory_order_relaxed)
+        : g_background_port_samples[port].load(std::memory_order_relaxed);
     if (stick_x != nullptr) *stick_x = static_cast<int8_t>((sample >> 16) & 0xFF);
     if (stick_y != nullptr) *stick_y = static_cast<int8_t>((sample >> 24) & 0xFF);
     return static_cast<uint16_t>(sample);

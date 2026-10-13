@@ -922,17 +922,21 @@ extern "C" uint16_t bar_poll_keyboard(int port, int8_t* stick_x, int8_t* stick_y
     // as long as its overlay existed, so a normal launch reached the game with a dead keyboard.
     if (bar::frontend::menu_capturing_input()) return 0;
 #endif
-    // Only read the keyboard while our window actually holds input focus, so we don't drive the car
-    // when the user has tabbed away. SDL tracks focus the same way on every platform.
-    if (g_window != nullptr && !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)) return 0;
 #ifdef BEETLE_ENABLE_FRONTEND
     // recompinput's profiles are where the player's own remapping is applied, so the port has to ask
     // for its buttons here rather than reading SDL itself. bar::input::resolve_port does read SDL --
     // and it still works for the keyboard, which is global state -- but it knows about no pad at all
     // in this build, and it applies bar::input_config's bindings rather than the ones the Controls
     // tab writes. Every rebinding a player made was silently ignored.
-    return bar::frontend::poll_port(port, stick_x, stick_y);
+    // The event/UI owner publishes separate foreground and controller-only
+    // background samples. General's setting permits pads, never background keys.
+    const bool window_focused = g_window == nullptr ||
+        (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    return bar::frontend::poll_port(port, stick_x, stick_y, window_focused);
 #else
+    // Only read the keyboard while our window actually holds input focus, so we don't drive the car
+    // when the user has tabbed away. SDL tracks focus the same way on every platform.
+    if (g_window != nullptr && !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)) return 0;
     return bar::input::resolve_port(port, stick_x, stick_y);
 #endif
 }

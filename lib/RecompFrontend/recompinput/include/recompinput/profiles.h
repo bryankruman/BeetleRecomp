@@ -61,7 +61,9 @@ namespace recompinput {
         int get_sp_keyboard_profile_index();
         int get_or_create_mp_keyboard_profile_index(int player_index);
         std::string get_string_from_controller_guid(ControllerGUID guid);
-        bool get_n64_input(int player_index, uint16_t* buttons_out, float* x_out, float* y_out);
+        // Existing callers merge keyboard and controller input. Background sampling opts out
+        // of every keyboard field, including one stored in a controller profile.
+        bool get_n64_input(int player_index, uint16_t* buttons_out, float* x_out, float* y_out, bool include_keyboard = true);
 
         bool load_controls_config(const std::filesystem::path& path);
         bool save_controls_config(const std::filesystem::path& path);
