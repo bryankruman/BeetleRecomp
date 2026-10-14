@@ -31,6 +31,7 @@ relocatable_sections_path = "overlays.us.txt"
 # otherwise recovered SDK names silently select runtime no-pak or ignored stubs.
 original = [
     "osPfsIsPlug", "__osPfsRequestData", "__osPfsGetInitData",
+    "__osContAddressCrc", "__osContDataCrc",
     "__osContRamWrite", "__osContRamRead", "__osMotorAccess", "osMotorInit",
     "osPfsAllocateFile", "osPfsFileState", "__osPfsGetStatus", "osPfsInitPak",
     "osPfsChecker", "__osPfsRWInode", "osPfsDeleteFile", "osPfsFreeBlocks",
