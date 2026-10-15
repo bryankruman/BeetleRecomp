@@ -1,5 +1,24 @@
 # Headless testing: scripted input + internal-render screenshots
 
+## Build scope and bounded qualification
+
+The recipes below describe the legacy auto-start path. A build with
+`BEETLE_ENABLE_FRONTEND` keeps ROM import and game start separate: a ROM path
+argument validates and caches the ROM, while the launcher's **Start Game** action
+starts gameplay. `BAR_AUTOPLAY` supplies game input after input polling begins;
+it cannot activate the frontend launcher. `BAR_SKIP_LAUNCHER` hides the legacy
+`bar_ui` overlay, rather than bypassing the RecompFrontend start action.
+
+Use `BAR_TEST_QUIT_AFTER_MS` for bounded runtime probes. Values from 1000 through
+600000 milliseconds enqueue `SDL_QUIT` on the owning event thread; an external
+harness must still enforce its own deadline and own only the process it starts.
+A successful import or launcher shutdown does not qualify race rendering,
+physical controllers, rumble, audible audio, or a completed race/results screen.
+
+Historical recipes and screenshots below remain reference evidence until
+reproduced with the exact executable being qualified.
+
+
 Everything below is **env-var driven and headless** — no window focus, no window-manager capture, no
 manual clicking. Compose the vars on one launch. All are zero-cost when unset.
 
