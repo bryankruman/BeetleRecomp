@@ -9,6 +9,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <memory>
+#include <stdexcept>
+#include <string>
 
 #if defined(_WIN32)
 #include <Shlobj.h>
@@ -115,7 +118,16 @@ namespace recompui {
     }
 
     std::filesystem::path file::get_program_path() {
-#if defined(__APPLE__)
+#if defined(_WIN32)
+        // Resolve packaged assets beside the executable, independently of the launch directory.
+        // SDL returns UTF-8 and transfers ownership to its caller.
+        std::unique_ptr<char, decltype(&SDL_free)> base_path(SDL_GetBasePath(), SDL_free);
+        if (!base_path || base_path.get()[0] == '\0') {
+            throw std::runtime_error(std::string("Cannot locate executable assets: ") + SDL_GetError());
+        }
+        const std::string utf8_path(base_path.get());
+        return std::filesystem::path(std::u8string(utf8_path.begin(), utf8_path.end()));
+#elif defined(__APPLE__)
         return file::apple::get_bundle_resource_directory();
 #elif defined(__linux__) && defined(RECOMP_FLATPAK)
         return "/app/bin";
