@@ -250,3 +250,58 @@ The hang watchdog is opt-in (`BAR_WATCHDOG=1`): its precautions cannot guarantee
 DbgHelp avoids allocations while another thread is suspended. This is a diagnostic tool,
 not a verified hang repair. The fork's unresolved results-transition issue still needs the
 runtime gate above; no new diagnosis has been claimed here.
+
+### Current Windows shader-bank build and qualification
+
+The current Windows production executable is SHA-256
+`1132776a4e859e1ccdf939ec5175a79f475a57ca495b961150c0dbc8fe7d8f8b`.
+The full four-job Windows cross-build and its provenance checks passed. This build
+retains the reviewed SDK251 private generated inputs; it does not claim
+regeneration from the current decomp checkout. The eight
+tracked build-route changes are committed locally at
+`326d167a916877abec7e1eb7123152a0f2df2754`; the existing dependency modifications
+remain preserved. The tracked packaging procedure produced a private ZIP, SHA-256
+`890e0cc9baf88b159e4896e9b75fb34cde3febd28b90e6295d09930e2b8f0083`.
+Neither the commit nor the package constitutes publication or runtime approval.
+
+The earlier explanation about differing Linux and Windows compiler version strings
+was incomplete. The failing build embedded shader libraries produced by Linux DXC
+1.8 while the packaged Windows compiler libraries were DXC 1.7. That incompatible
+shader/compiler lineage caused the runtime shader-compilation failure. The corrected
+bank contains the three libraries rebuilt with the existing native Windows DXC 1.7,
+with source/include, tool and DLL hashes recorded. The optional cross-build route
+uses `BEETLE_WINDOWS_DXIL_BANK` and `BEETLE_HOST_FILE_TO_C`; it validates the bank and
+rebuilds the consumer that depends on the library sizes. Ordinary native Windows
+builds retain their existing route. No compiler download is required.
+
+The new production executable rendered the Controller Pak game menu in a bounded
+test and exited naturally with code zero after the frontend's Quit confirmation.
+Its runtime-file, source, history, backup and ROM checks passed. The earlier Coventry
+Cove race and viewport observations for executable `fa98c8d5…` remain historical
+evidence for that older build; they do not qualify gameplay on the current executable.
+
+A separate private diagnostic executable, SHA-256
+`886beff7d0c6dacc94ecc6b698226125260cbaadef07ac9d8caf62ce1f0c9a77`,
+recorded 219 keyboard-diagnostic rows, below the 384-row cap, and also exited naturally
+with code zero. Down-key press and release events reached the render queue within
+one polling interval, while the sampled game keyboard state remained neutral.
+The test did not establish delivery of the attempted X and Escape inputs. These
+observations do not establish a production input defect or successful game control.
+The diagnostic instrumentation is detached from the production source and package.
+
+Current release qualification remains incomplete. The new production build still
+needs verified sustained driving, physical player input, saves/reload, multiplayer
+and rumble, audible playback, live viewport/aspect changes and repeated pause/results
+transitions. Actual boot and clean quit are verified separately from these gates.
+
+The following private local receipts preserve the exact build and observation lineage;
+they contain no claim of public release or completed gameplay qualification.
+
+| Receipt | SHA-256 |
+| --- | --- |
+| `recomp-native-bank-53202-commit.json` | `e1bc3883972217a93d318cda3637ad6c8f0ac18f823c472c4cc3bd5e5f2535dd` |
+| `native-bank-cmake-build-actual-52718.json` | `18ff5433f6646f4ba2214bcc9399a719db2197290df27df7fa8cdd29ad450885` |
+| `native-bank-private-package-actual-53128.json` | `cc1bab3465aba5471ce3f1c2622368f3579b8040dd2bef3098fd009c952dc640` |
+| `SDK251-native-bank-production-runtime-53518.json` | `e00c7524302f03aa8d07bad88285b0c4dfc39ac7064484c1a49f9ea804801fd3` |
+| `SDK251-native-bank-key-runtime-53718.json` | `c35bcd8878df1fb31a80088d34f34fda6603faf7529cd32c14480b50015b630d` |
+| `SDK251-native-bank-key-runtime-53718.key-diagnostic.json` | `c7570bfa2798f761bad2bd803404608d1d3fc57783273588a59618d0ec07d181` |
