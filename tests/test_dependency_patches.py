@@ -6,7 +6,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 (ROOT / '.review').mkdir(exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='patch-check-', dir=ROOT / '.review') as scratch:
-    for name in ('N64ModernRuntime', 'rt64', 'N64Recomp'):
+    for name, dependency in (('N64ModernRuntime', 'N64ModernRuntime'), ('rt64', 'rt64'), ('N64Recomp', 'N64Recomp'), ('rt64-windows-dxil', 'rt64')):
         patch = ROOT / 'scripts/dependency-patches' / (name + '.patch')
         fixture = Path(scratch) / name
         fixture.mkdir()
@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix='patch-check-', dir=ROOT / '.review') as
             if not line.startswith('--- a/'):
                 continue
             path = line[6:]
-            original = subprocess.check_output(['git', '-C', str(ROOT / 'lib' / name), 'show', 'HEAD:' + path])
+            original = subprocess.check_output(['git', '-C', str(ROOT / 'lib' / dependency), 'show', 'HEAD:' + path])
             target = fixture / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(original)

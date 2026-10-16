@@ -1,0 +1,46 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -36,7 +36,13 @@
+ endfunction()
+ 
+ if (WIN32)
+-    set (DXC "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
++    if (CMAKE_HOST_WIN32)
++        set (DXC "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
++    else()
++        # Runtime-linked libraries use the authenticated native bank below.
++        # Linux DXC remains suitable for standalone shaders and SPIR-V.
++        set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-linux")
++    endif()
+     add_compile_definitions(NOMINMAX)
+ 
+     # Dependencies that must be next to the DLL.
+@@ -248,7 +254,11 @@
+ endfunction()
+ 
+ function(build_library_shader TARGETOBJ SHADERNAME)
+-    build_shader_dxil(${TARGETOBJ} ${SHADERNAME} "${DXC_LB_OPTS}" ${ARGN})
++    if (COMMAND beetle_build_windows_library)
++        beetle_build_windows_library(${TARGETOBJ} ${SHADERNAME} ${ARGN})
++    else()
++        build_shader_dxil(${TARGETOBJ} ${SHADERNAME} "${DXC_LB_OPTS}" ${ARGN})
++    endif()
+ endfunction()
+ 
+ function(build_pixel_shader TARGETOBJ SHADERNAME)
+--- a/src/tools/file_to_c/CMakeLists.txt
++++ b/src/tools/file_to_c/CMakeLists.txt
+@@ -2,7 +2,12 @@
+ project(file_to_c)
+ set(CMAKE_CXX_STANDARD 17)
+ 
+-add_executable(file_to_c "file_to_c.cpp")
++if (CMAKE_CROSSCOMPILING AND BEETLE_HOST_FILE_TO_C)
++    add_executable(file_to_c IMPORTED GLOBAL)
++    set_target_properties(file_to_c PROPERTIES IMPORTED_LOCATION "${BEETLE_HOST_FILE_TO_C}")
++else()
++    add_executable(file_to_c "file_to_c.cpp")
++endif()
+ 
+ if (APPLE)
+     set_target_properties(file_to_c PROPERTIES

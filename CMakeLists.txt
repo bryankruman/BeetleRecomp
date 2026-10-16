@@ -59,6 +59,9 @@ if (UNIX AND NOT APPLE)
     add_compile_definitions(PLUME_SDL_VULKAN_ENABLED RT64_SDL_WINDOW_VULKAN)
 endif()
 add_compile_definitions(HLSL_CPU)
+if (WIN32)
+    include(cmake/WindowsShaderLibraries.cmake)
+endif()
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/rt64 ${CMAKE_BINARY_DIR}/rt64)
 # RT64 vendors SDL2 2.26.3, whose SDL_endian.h manually defines _m_prefetch (an old Clang-11
 # workaround). clang 17+ provides it as a builtin -> "definition of builtin function" error.
@@ -105,8 +108,10 @@ if (BEETLE_ENABLE_FRONTEND)
     set(DXC_SPV_OPTS "-spirv" "-fspv-target-env=vulkan1.0" "-fvk-use-dx-layout")
     set(DXC_PS_OPTS "${DXC_COMMON_OPTS}" "-E" "PSMain" "-T" "ps_6_0")
     set(DXC_VS_OPTS "${DXC_COMMON_OPTS}" "-E" "VSMain" "-T" "vs_6_0" "-fvk-invert-y")
-    if (WIN32)
+    if (WIN32 AND CMAKE_HOST_WIN32)
         set(DXC "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc.exe")
+    elseif (WIN32)
+        set(DXC "LD_LIBRARY_PATH=${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/x64" "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc-linux")
     elseif (CMAKE_SYSTEM_NAME MATCHES "Linux")
         set(DXC "LD_LIBRARY_PATH=${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/x64" "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc-linux")
     endif()
@@ -243,7 +248,12 @@ if (WIN32)
             "${sdl2_SOURCE_DIR}/lib/x64/SDL2.dll"
             "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxil.dll"
             "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxcompiler.dll"
-            $<TARGET_FILE_DIR:BeetleRecomp>)
+            $<TARGET_FILE_DIR:BeetleRecomp>
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/scripts/windows-shader-bank.py" package
+            --source "${CMAKE_SOURCE_DIR}/lib/rt64/src" --bank "${BEETLE_WINDOWS_DXIL_BANK}"
+            --executable "$<TARGET_FILE:BeetleRecomp>" --dll-dir "$<TARGET_FILE_DIR:BeetleRecomp>"
+            --shader-dir "${CMAKE_BINARY_DIR}/src/shaders"
+        VERBATIM)
     set_target_properties(BeetleRecomp PROPERTIES
         LINK_FLAGS_DEBUG          "/SUBSYSTEM:CONSOLE"
         LINK_FLAGS_RELEASE        "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")

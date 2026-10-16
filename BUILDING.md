@@ -29,6 +29,38 @@ and apply `scripts/dependency-patches/`, then build N64Recomp/RSPRecomp. The pat
 never resets local edits. N64Recomp, N64ModernRuntime and RT64 remain Git submodules; RecompFrontend
 is vendored with its nested notices/licenses. `BEETLE_BUILD_JOBS` defaults to 4.
 
+## Windows shader libraries and cross-builds
+
+RT64 links three embedded DXIL libraries again at runtime. The pinned DXC dependency
+contains different compiler releases for Linux and Windows; a shared Git revision does
+not make those binaries interchangeable. Keep the bundled Windows `dxc.exe`,
+`dxcompiler.dll` and `dxil.dll` together.
+
+Native Windows builds export the three libraries automatically into the build directory's
+`windows-dxil-bank`, then validate/import that bank. Only three small shader compilations
+run on Windows; the C/C++ build may still run on the isolated server. For a Linux-hosted
+Windows build, first export a bank on Windows from the exact same shader/header sources:
+
+```powershell
+python scripts/windows-shader-bank.py export --source lib/rt64/src --bank C:/build/beetle-windows-dxil-bank
+```
+
+Copy that four-file bank into the server's approved build workspace. Configure the
+existing Windows cross-toolchain with `-DBEETLE_WINDOWS_DXIL_BANK=/path/to/bank` and
+`-DBEETLE_HOST_FILE_TO_C=/path/to/existing/native/file_to_c`. This does not install a
+cross-toolchain or fetch dependencies. The existing native `file_to_c` must be built
+for the Linux host; the compiler/SDK toolchain remains an explicit prerequisite.
+Do not edit DXC assignments in the generated source snapshot. The tracked RT64 addon
+selects Linux DXC for standalone shaders/SPIR-V and imports the three runtime-linked
+libraries from the authenticated native bank.
+
+The bank records every shader/shared file, transitive quoted header, exact compile
+arguments, native compiler/DLL hashes and output hashes. Changing any source/header,
+compiler/runtime binary or library invalidates it. Regenerate and transfer the bank
+rather than disabling validation. The build and release packager verify each native
+library appears exactly once in the executable and the packaged DLL pair matches.
+No ROM, ELF, save or generated game code belongs in a shader bank.
+
 ## Generate private inputs and code
 
 Supply your own USA ROM (`e5ab4d226c08d22f68a2edcc48870203e67454b8`) to the decomp build.

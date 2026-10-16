@@ -16,8 +16,12 @@ def git(directory, *args):
 
 def main():
     pending = []
-    for name in ("N64ModernRuntime", "rt64", "N64Recomp"):
-        directory = ROOT / "lib" / name
+    # Keep the original RT64 patch immutable. A separate addon can apply to
+    # an already reviewed/dirty dependency without resetting or replaying it.
+    for name, dependency in (("N64ModernRuntime", "N64ModernRuntime"),
+                             ("rt64", "rt64"), ("N64Recomp", "N64Recomp"),
+                             ("rt64-windows-dxil", "rt64")):
+        directory = ROOT / "lib" / dependency
         patch = ROOT / "scripts" / "dependency-patches" / (name + ".patch")
         if git(directory, "apply", "--reverse", "--check", str(patch)).returncode == 0:
             print(f"{name}: reviewed patch already applied")

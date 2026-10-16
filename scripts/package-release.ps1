@@ -12,7 +12,8 @@
 param(
     [string]$BuildDir = "build-frontend",
     [Parameter(Mandatory = $true)][string]$Version,   # e.g. 0.3.0-alpha
-    [string]$OutDir = "dist"
+    [string]$OutDir = "dist",
+    [string]$ShaderBank = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +25,20 @@ $exe = Join-Path $BuildDir "$exeName.exe"
 if (-not (Test-Path $exe)) {
     throw "no executable at $exe -- build first (see BUILDING.md)"
 }
+
+# Validate before staging: no package may silently combine Linux-produced
+# linked shader libraries with the bundled Windows runtime DLLs.
+if (-not $ShaderBank) {
+    $cache = Join-Path $BuildDir "CMakeCache.txt"
+    if (-not (Test-Path -LiteralPath $cache)) { throw "ShaderBank is required without CMakeCache.txt" }
+    $bankRows = @(Get-Content -LiteralPath $cache | Where-Object { $_ -match '^BEETLE_WINDOWS_DXIL_BANK:PATH=' })
+    if ($bankRows.Count -ne 1) { throw "Expected exactly one native Windows shader bank in CMakeCache.txt" }
+    $ShaderBank = $bankRows[0].Substring($bankRows[0].IndexOf('=') + 1)
+}
+$shaderSource = Join-Path $root "lib/rt64/src"
+$shaderDir = Join-Path $BuildDir "src/shaders"
+python scripts/windows-shader-bank.py package --source $shaderSource --bank $ShaderBank --executable $exe --dll-dir $BuildDir --shader-dir $shaderDir
+if ($LASTEXITCODE -ne 0) { throw "Windows shader/runtime provenance check failed" }
 
 # Release asset naming as in earlier releases: BeetleRecomp-v0.2.0-alpha-windows-x64.zip
 $name = "$exeName-v$Version-windows-x64"
@@ -50,6 +65,9 @@ foreach ($f in $files) {
     Copy-Item $f $stage
 }
 Copy-Item -Recurse "$BuildDir\assets" (Join-Path $stage "assets")
+python scripts/windows-shader-bank.py package --source $shaderSource --bank $ShaderBank --executable (Join-Path $stage "$exeName.exe") --dll-dir $stage --shader-dir $shaderDir
+if ($LASTEXITCODE -ne 0) { throw "Staged Windows shader/runtime provenance check failed" }
+Copy-Item (Join-Path $ShaderBank "manifest.json") (Join-Path $stage "shader-provenance.json")
 
 # License texts of the vendored libraries the executable contains. A missing source stops packaging
 # rather than shipping without it.
