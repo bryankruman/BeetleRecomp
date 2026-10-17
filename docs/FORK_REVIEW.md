@@ -307,7 +307,7 @@ they contain no claim of public release or completed gameplay qualification.
 | `SDK251-native-bank-key-runtime-53718.key-diagnostic.json` | `c7570bfa2798f761bad2bd803404608d1d3fc57783273588a59618d0ec07d181` |
 
 
-## Mod dependency fixes and production compile — October 17, 2026
+## Mod dependency fixes and production build — October 17, 2026
 
 Two additional runtime dependency defects are fixed in local commit
 `536e0183e80b349f964aaf9db229d223927c6cba`. Auto-enablement now checks the
@@ -341,8 +341,23 @@ replaced. Private receipts are `recomp-both-mod-regressions-actual-68550.json`,
 `recomp-portable-mod-runner-actual-68570.json` and
 `recomp-mods-production-TU-actual-68582.json`.
 
-These checks qualify the two dependency fixes and the production translation
-unit. Full application startup and the remaining gameplay gates above remain
-open. The public fork's main revision was rechecked on October 17 and remains
+The corrected object subsequently passed the whole Windows application link in
+an isolated directory. The new `librecomp.lib` preserves all 29 archive members
+in their original member order: 28 payloads are unchanged and the sole replacement
+is the qualified `mods.cpp` object containing commit `536e0183`'s fixes. One archive
+command and one application link passed; both owned process groups were absent
+afterward. All historical source/build files, SDK inputs, tools and referenced
+inputs passed independent final guards. No historical output was replaced.
+
+The resulting AMD64 Windows executable is 19,928,064 bytes, SHA-256
+`9c2a4d5e6e74998c03aaa233187d0e9757b8a313ee595e06c17765a015a28c71`.
+Private receipt: `recomp-mod-fix-whole-app-link-actual-68678.json`, SHA-256
+`4349c6f20172d022e78bf959ef17ef1d3afb877f7bed16cb4cd9ffb6fe83f5d3`.
+The link retains the qualified native Windows DXC 1.7 shader library and the
+original SDK251 generated game code. It does not regenerate or qualify the latest
+decomp checkout. This executable has not been launched; startup, runtime and the
+remaining gameplay gates above remain open for this build.
+
+The public fork's main revision was rechecked on October 17 and remains
 `6497e67257809401468cd47850393775952b31bb`; there is no newer fork source revision
 to integrate at that observation.
