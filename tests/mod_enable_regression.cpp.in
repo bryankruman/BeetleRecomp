@@ -1,0 +1,163 @@
+// Generated detached test. Production method bodies below are literal.
+// State-only scaffolding replaces archive/thread/filesystem machinery. This tests
+// enable/recompute behavior, not ModContext ABI, scanning, callbacks or runtime.
+#include <algorithm>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <mutex>
+#include <compare>
+#include <stdexcept>
+#include <iostream>
+#include <utility>
+namespace recomp {
+@@VERSION@@
+namespace mods {
+struct Dependency { std::string mod_id; Version version; bool optional = false; };
+struct ModManifest { std::string mod_id; Version version; std::vector<Dependency> dependencies; };
+struct ModContentTypeId { size_t value; };
+struct ModHandle {
+    ModManifest manifest;
+    std::vector<ModContentTypeId> content_types;
+    bool is_runtime_toggleable() const { return true; }
+    bool is_for_game(size_t) const { return true; }
+};
+class ModContext;
+using content_enabled_callback = void(ModContext&, const ModHandle&);
+using content_disabled_callback = void(ModContext&, const ModHandle&);
+struct ModContentType {
+    content_enabled_callback* on_enabled = nullptr;
+    content_disabled_callback* on_disabled = nullptr;
+};
+enum class DeprecationStatus { Unknown, Integrated, BrokenVersion, BrokenPermanent };
+struct DeprecatedMod { DeprecationStatus status; Version maximum_version; };
+struct ModConfigQueueSave {};
+struct Queue { void enqueue(ModConfigQueueSave) { throw std::runtime_error("unexpected save"); } };
+class ModContext {
+public:
+    void enable_mod(const std::string&, bool, bool);
+    bool is_mod_enabled(const std::string&) const;
+    bool is_mod_auto_enabled(const std::string&) const;
+    bool is_mod_deprecated(const std::string&, const Version&) const;
+    std::vector<ModHandle> opened_mods;
+    std::unordered_map<std::string, size_t> opened_mods_by_id;
+    std::unordered_set<std::string> enabled_mods, auto_enabled_mods;
+    std::unordered_map<std::string, DeprecatedMod> deprecated_mods;
+    std::mutex opened_mods_mutex;
+    size_t active_game = size_t(-1);
+    std::vector<ModContentType> content_types;
+    std::vector<std::string> events;
+    Queue mod_configuration_thread_queue;
+};
+}}
+@@METHODS@@
+using namespace recomp;
+using namespace recomp::mods;
+static void require(bool ok, const char* message) {
+    if (!ok) throw std::runtime_error(message);
+}
+static void add(ModContext& c, std::string id, Version v, std::vector<Dependency> deps = {}) {
+    c.opened_mods_by_id[id] = c.opened_mods.size();
+    c.opened_mods.push_back({{std::move(id), v, std::move(deps)}, {}});
+}
+static void parent_on(ModContext& c, const ModHandle& m) { c.events.push_back("P+" + m.manifest.mod_id); }
+static void parent_off(ModContext& c, const ModHandle& m) { c.events.push_back("P-" + m.manifest.mod_id); }
+static void dependency_on(ModContext& c, const ModHandle& m) { c.events.push_back("D+" + m.manifest.mod_id); }
+static void dependency_off(ModContext& c, const ModHandle& m) { c.events.push_back("D-" + m.manifest.mod_id); }
+static void leaf_on(ModContext& c, const ModHandle& m) { c.events.push_back("L+" + m.manifest.mod_id); }
+static void leaf_off(ModContext& c, const ModHandle& m) { c.events.push_back("L-" + m.manifest.mod_id); }
+int main() {
+    try {
+        // Primary failure: minimum1.0 is deprecated, installed2.0 is not.
+        ModContext c;
+        add(c, "parent", {1,0,0}, {{"library", {1,0,0}, false}});
+        add(c, "library", {2,0,0});
+        add(c, "other", {1,0,0});
+        c.deprecated_mods["library"] = {DeprecationStatus::BrokenVersion, {1,0,0}};
+        c.enable_mod("parent", true, false);
+        require(c.is_mod_auto_enabled("library"), "minimum1.0/installed2.0 incorrectly skipped");
+        // Exercise the separate recomputation branch while parent stays enabled.
+        c.enable_mod("other", true, false);
+        c.enable_mod("other", false, false);
+        require(c.is_mod_auto_enabled("library"), "recomputation lost valid installed2.0");
+        c.enable_mod("parent", false, false);
+        require(!c.is_mod_auto_enabled("library"), "orphan dependency remained auto-enabled");
+        // A truly deprecated installed version must remain excluded.
+        ModContext d;
+        add(d, "parent", {1,0,0}, {{"library", {1,0,0}, false}});
+        add(d, "library", {1,0,0});
+        d.deprecated_mods["library"] = {DeprecationStatus::BrokenVersion, {1,0,0}};
+        d.enable_mod("parent", true, false);
+        require(!d.is_mod_auto_enabled("library"), "deprecated installed1.0 was auto-enabled");
+        d.enable_mod("library", true, false);
+        require(!d.is_mod_enabled("library"), "direct deprecated enable changed");
+        // Optional dependencies remain optional; recursive required ones still work.
+        ModContext e;
+        add(e, "parent", {1,0,0}, {{"middle", {1,0,0}, false}, {"optional", {1,0,0}, true}});
+        add(e, "middle", {2,0,0}, {{"leaf", {1,0,0}, false}});
+        add(e, "leaf", {2,0,0});
+        add(e, "optional", {2,0,0});
+        e.deprecated_mods["middle"] = {DeprecationStatus::BrokenVersion, {1,0,0}};
+        e.enable_mod("parent", true, false);
+        require(e.is_mod_auto_enabled("middle") && e.is_mod_auto_enabled("leaf"), "required transitive dependency missing");
+        require(!e.is_mod_auto_enabled("optional"), "optional dependency was auto-enabled");
+        // General content API scenario: inactive custom-resource mods, all
+        // allow_runtime_toggle=true, then enabled after a game has started.
+        // Only initially active mods went through check_dependencies; these
+        // previously inactive resource handles retain their constructor policy.
+        ModContext f;
+        f.active_game = 0;
+        f.content_types = {{parent_on, parent_off}, {dependency_on, dependency_off}, {leaf_on, leaf_off}};
+        add(f, "parent", {1,0,0}, {{"library", {1,0,0}, false}});
+        add(f, "library", {2,0,0}, {{"leaf", {1,0,0}, false}});
+        add(f, "leaf", {2,0,0});
+        add(f, "other", {1,0,0});
+        f.opened_mods[0].content_types = {{0}};
+        f.opened_mods[1].content_types = {{1}};
+        f.opened_mods[2].content_types = {{2}};
+        f.enable_mod("parent", true, false);
+        require(f.events == std::vector<std::string>{"P+parent", "D+library", "L+leaf"},
+                "dependency enable dispatched parent handler/handle instead of its own");
+        f.enable_mod("parent", true, false);
+        require(f.events.size() == 3, "repeated parent enable dispatched again");
+        f.enable_mod("other", true, false);
+        f.enable_mod("other", false, false);
+        require(f.events.size() == 3 && f.is_mod_auto_enabled("library") && f.is_mod_auto_enabled("leaf"),
+                "unrelated recomputation duplicated/lost live dependency");
+        f.enable_mod("parent", false, false);
+        require(f.events.size() == 6 && std::count(f.events.begin(), f.events.end(), "P-parent") == 1 &&
+                std::count(f.events.begin(), f.events.end(), "D-library") == 1 &&
+                std::count(f.events.begin(), f.events.end(), "L-leaf") == 1,
+                "orphan disable handlers or handles changed");
+        // Shared dependencies activate once across two newly enabled parents.
+        ModContext shared;
+        shared.active_game = 0;
+        shared.content_types = {{parent_on, parent_off}, {dependency_on, dependency_off}};
+        add(shared, "first", {1,0,0}, {{"library", {1,0,0}, false}});
+        add(shared, "second", {1,0,0}, {{"library", {1,0,0}, false}});
+        add(shared, "library", {1,0,0});
+        shared.opened_mods[0].content_types = {{0}};
+        shared.opened_mods[1].content_types = {{0}};
+        shared.opened_mods[2].content_types = {{1}};
+        shared.enable_mod("first", true, false);
+        shared.enable_mod("second", true, false);
+        require(shared.events == std::vector<std::string>{"P+first", "D+library", "P+second"},
+                "shared dependency callback was missing or duplicated");
+        // Missing dependency has no content instance to invoke; bookkeeping
+        // remains unchanged for the existing later MissingDependency check.
+        ModContext missing;
+        missing.active_game = 0;
+        missing.content_types = {{parent_on, parent_off}};
+        add(missing, "parent", {1,0,0}, {{"missing", {1,0,0}, false}});
+        missing.opened_mods[0].content_types = {{0}};
+        missing.enable_mod("parent", true, false);
+        require(missing.events == std::vector<std::string>{"P+parent"} && missing.is_mod_auto_enabled("missing"),
+                "missing dependency incorrectly repeated parent callback or changed bookkeeping");
+        std::cout << "PASS installed-version and callback-identity enable/recompute/dependency cases\n";
+        return 0;
+    } catch (const std::exception& ex) {
+        std::cerr << "FAIL " << ex.what() << '\n';
+        return 1;
+    }
+}
