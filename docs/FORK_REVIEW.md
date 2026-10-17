@@ -305,3 +305,44 @@ they contain no claim of public release or completed gameplay qualification.
 | `SDK251-native-bank-production-runtime-53518.json` | `e00c7524302f03aa8d07bad88285b0c4dfc39ac7064484c1a49f9ea804801fd3` |
 | `SDK251-native-bank-key-runtime-53718.json` | `c35bcd8878df1fb31a80088d34f34fda6603faf7529cd32c14480b50015b630d` |
 | `SDK251-native-bank-key-runtime-53718.key-diagnostic.json` | `c7570bfa2798f761bad2bd803404608d1d3fc57783273588a59618d0ec07d181` |
+
+
+## Mod dependency fixes and production compile — October 17, 2026
+
+Two additional runtime dependency defects are fixed in local commit
+`536e0183e80b349f964aaf9db229d223927c6cba`. Auto-enablement now checks the
+installed dependency's version against its deprecation cutoff, instead of
+checking the requested minimum version. Runtime activation also invokes the
+dependency's own content handlers with its own `ModHandle`, instead of repeating
+the parent handlers and passing the parent handle. Missing-ID bookkeeping remains
+available to the existing load-time dependency validator.
+
+The canonical parent dependency patch contains both changes; upstream submodule
+HEADs and gitlinks remain pinned. Original source and patch backups are retained
+privately. The reusable regression reads complete current production methods and
+the `Version` definition each time; it does not keep duplicate implementations.
+Run it with `python scripts/test-mod-enable.py --cxx g++` using an existing C++20
+compiler. See [the focused test notes](../tests/README.md) for platform flags and
+the state-fixture limitations.
+
+On the isolated worker, the original production-method fixture failed at the
+installed-version regression; the version-only fixture failed at the callback
+identity regression; both corrections passed together. The final portable runner
+also passed with g++ 13. Ten mocked process/argument controls cover the runner;
+the Windows job-object branch has not been executed on Windows.
+
+The corrected complete `mods.cpp` translation unit additionally compiled with
+the retained clang-cl 18 Windows recipe and real headers, producing a
+9,212,321-byte AMD64 COFF object. All 14,274 historical source files, 1,187 build
+files, five tools, SDK overlay and pinned inputs stayed unchanged before and
+afterward; the compiler's owned process group was absent afterward. Only a new
+scratch object was produced: no historical object, library or executable was
+replaced. Private receipts are `recomp-both-mod-regressions-actual-68550.json`,
+`recomp-portable-mod-runner-actual-68570.json` and
+`recomp-mods-production-TU-actual-68582.json`.
+
+These checks qualify the two dependency fixes and the production translation
+unit. Full application startup and the remaining gameplay gates above remain
+open. The public fork's main revision was rechecked on October 17 and remains
+`6497e67257809401468cd47850393775952b31bb`; there is no newer fork source revision
+to integrate at that observation.
