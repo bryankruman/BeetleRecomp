@@ -46,8 +46,8 @@ void install();
 // These two are the whole bridge. main.cpp calls them from bar_poll_keyboard and from the
 // connected-device callback; nothing else in the port includes a recompinput header.
 
-// True when this N64 port has something driving it. Player one always does -- a keyboard is always
-// attached -- and ports two to four exist once a second, third or fourth pad has been plugged in.
+// True when this N64 port has an assigned input device. Fresh configurations assign a keyboard
+// to player one; imported configurations retain their saved assignments, including empty ports.
 bool port_assigned(int port);
 
 // This port's live N64 button mask, plus its analog stick in the N64's own +/-80 range. Returns 0
