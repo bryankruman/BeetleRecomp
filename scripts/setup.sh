@@ -21,4 +21,4 @@ find lib/N64Recomp/build -maxdepth 2 -type f \
   -exec cp -f {} . \;
 
 echo ">> Done."
-echo ">> Next: scripts/fetch-elf.sh, then ./N64Recomp BeetleRecomp.toml"
+echo ">> Next: scripts/fetch-elf.sh, then resolve private original bindings as shown in BUILDING.md before N64Recomp."

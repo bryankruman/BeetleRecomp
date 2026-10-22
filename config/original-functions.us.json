@@ -1,0 +1,240 @@
+{
+  "functions": [
+    {
+      "instruction_sha256": "4e2fcd47db1bf465afebdef97ea8cd2eae1575cad4327e71aa69baa06a50b7fa",
+      "name": "osPfsIsPlug",
+      "reference_name": "osPfsIsPlug",
+      "section": ".main",
+      "size": 416,
+      "vma": 2147584400
+    },
+    {
+      "instruction_sha256": "c712ac0a745fc480f88145668bea712daf4291aa787e8d4192603f0afb4048b7",
+      "name": "__osPfsRequestData",
+      "reference_name": "__osPfsRequestData",
+      "section": ".main",
+      "size": 208,
+      "vma": 2147584816
+    },
+    {
+      "instruction_sha256": "6fcd019c5ada66b414b9f9f7a9728eea210ae29cebbc39d82236c489efe319f0",
+      "name": "__osPfsGetInitData",
+      "reference_name": "__osPfsGetInitData",
+      "section": ".main",
+      "size": 208,
+      "vma": 2147585024
+    },
+    {
+      "instruction_sha256": "1cdc56689d589fe71eaf976c7218931310686c08bf2031dfd177089d53f72831",
+      "name": "__osContAddressCrc",
+      "reference_name": "func_80014BB0",
+      "section": ".main",
+      "size": 208,
+      "vma": 2147568560
+    },
+    {
+      "instruction_sha256": "230ee9ec94de62ddf9b4fc581d53c66c4ede11da3a91b054028815e1e3d1c7f4",
+      "name": "__osContDataCrc",
+      "reference_name": "func_80014C80",
+      "section": ".main",
+      "size": 148,
+      "vma": 2147568768
+    },
+    {
+      "instruction_sha256": "f700ff3240df81637fe9889d1f93f412e5e712c916798d7508a4918a9de21d94",
+      "name": "__osContRamWrite",
+      "reference_name": "__osContRamWrite",
+      "section": ".main",
+      "size": 540,
+      "vma": 2147572512
+    },
+    {
+      "instruction_sha256": "f569a7c9520bb4ff8ca99a6fda812f52e54465f75cb163f1fc99b56e6b44e755",
+      "name": "__osContRamRead",
+      "reference_name": "__osContRamRead",
+      "section": ".main",
+      "size": 508,
+      "vma": 2147569056
+    },
+    {
+      "instruction_sha256": "77aacc11a7a8d7a5a7ef68d1d164db5060fda2e2d2db6ebb5a79783c305d47ca",
+      "name": "__osMotorAccess",
+      "reference_name": "__osMotorAccess",
+      "section": ".main",
+      "size": 360,
+      "vma": 2147543072
+    },
+    {
+      "instruction_sha256": "01c579f4e5ce40378129b66eb357d855010242316bb2299d83101f21e2a34ebd",
+      "name": "osMotorInit",
+      "reference_name": "osMotorInit",
+      "section": ".main",
+      "size": 348,
+      "vma": 2147543700
+    },
+    {
+      "instruction_sha256": "0b75f24335e49afac667956d4c1cdbd535940cf554bebe83c8c3bc8953f7e492",
+      "name": "osPfsAllocateFile",
+      "reference_name": "osPfsAllocateFile",
+      "section": ".main",
+      "size": 820,
+      "vma": 2147544048
+    },
+    {
+      "instruction_sha256": "a97ec9bf5c0a28dbb6b787b23794d26f9f995c4dd017e52b08ba6b735ba3bff2",
+      "name": "osPfsFileState",
+      "reference_name": "osPfsFileState",
+      "section": ".main",
+      "size": 468,
+      "vma": 2147545824
+    },
+    {
+      "instruction_sha256": "4a6055223a3c524e07db38b7a51be3dd919c5541c30840009a659c08e74c89af",
+      "name": "__osPfsGetStatus",
+      "reference_name": "__osPfsGetStatus",
+      "section": ".main",
+      "size": 204,
+      "vma": 2147573056
+    },
+    {
+      "instruction_sha256": "7b1b7fd4049fc2cbc5a5dc920cef3b0e2b62938507c0ac56c956b28b4cf93401",
+      "name": "osPfsInitPak",
+      "reference_name": "osPfsInitPak",
+      "section": ".main",
+      "size": 496,
+      "vma": 2147547152
+    },
+    {
+      "instruction_sha256": "b261816fb57f7bc067d2cf05a0c8de5d89ef06818bb9ac5affbdd5f7492436e0",
+      "name": "osPfsChecker",
+      "reference_name": "osPfsChecker",
+      "section": ".main",
+      "size": 1336,
+      "vma": 2147573616
+    },
+    {
+      "instruction_sha256": "f02ca4b0686cf35b904a24dedacc2324ca7c29a053bf99ca1536ba093aec739a",
+      "name": "__osPfsRWInode",
+      "reference_name": "__osPfsRWInode",
+      "section": ".main",
+      "size": 724,
+      "vma": 2147571780
+    },
+    {
+      "instruction_sha256": "c82e9ae8ff635af4ba36b3347e80568bfd004d91801749c0f5d8b72eae491baa",
+      "name": "osPfsDeleteFile",
+      "reference_name": "osPfsDeleteFile",
+      "section": ".main",
+      "size": 472,
+      "vma": 2147545200
+    },
+    {
+      "instruction_sha256": "17d6b1032c35c5ed010675b52bf333511dd9c745143668507782684053bc1543",
+      "name": "osPfsFreeBlocks",
+      "reference_name": "osPfsFreeBlocks",
+      "section": ".main",
+      "size": 408,
+      "vma": 2147546736
+    },
+    {
+      "instruction_sha256": "02879f30396d7701aeca6ae5e0e37e341a69a5fd3837dbda56370758383b7aa1",
+      "name": "osPfsRepairId",
+      "reference_name": "osPfsRepairId",
+      "section": ".main",
+      "size": 88,
+      "vma": 2147549040
+    },
+    {
+      "instruction_sha256": "39bf4b4ae266f63dab2150f1d6153f527b62d9248a67c6756e697890aec83307",
+      "name": "osPfsReadWriteFile",
+      "reference_name": "osPfsReadWriteFile",
+      "section": ".main",
+      "size": 880,
+      "vma": 2147548148
+    },
+    {
+      "instruction_sha256": "baeea6ff0ed1ffeb0f7ed1685ba10553eb5e73f3054f3dc2132ea7ba219e0ed4",
+      "name": "osPfsNumFiles",
+      "reference_name": "osPfsNumFiles",
+      "section": ".main",
+      "size": 288,
+      "vma": 2147547648
+    },
+    {
+      "instruction_sha256": "bd450aba4c0b11ee9b4624500905df13dd79a9741f49ed1e92159182c0dfb96d",
+      "name": "osPfsFindFile",
+      "reference_name": "osPfsFindFile",
+      "section": ".main",
+      "size": 424,
+      "vma": 2147546304
+    },
+    {
+      "instruction_sha256": "8dbe80193c3df2c125205f2b4349204ef8eb6d9a953434ba2a4848e9b761609b",
+      "name": "__osPfsSelectBank",
+      "reference_name": "__osPfsSelectBank",
+      "section": ".main",
+      "size": 120,
+      "vma": 2147568928
+    },
+    {
+      "instruction_sha256": "a633ccfe59b4fb66512da0f77378b7cc6904ffc54974fbc31337b393a24df8b4",
+      "name": "__osPfsGetNextPage",
+      "reference_name": "__osPfsGetNextPage",
+      "section": ".main",
+      "size": 212,
+      "vma": 2147547936
+    },
+    {
+      "instruction_sha256": "6e231396e1630a3f4b8e65c7fd6bd01b7b5170bf5dc83731267e2c04889349c8",
+      "name": "__osCheckId",
+      "reference_name": "__osCheckId",
+      "section": ".main",
+      "size": 212,
+      "vma": 2147571568
+    },
+    {
+      "instruction_sha256": "a6ad7ce13a603755848973331653720fb43cf4bb6420b7d92f2b0732ed8e82f8",
+      "name": "__osGetId",
+      "reference_name": "__osGetId",
+      "section": ".main",
+      "size": 428,
+      "vma": 2147571140
+    },
+    {
+      "instruction_sha256": "217edc275d98794734ff5046395c3c8eb435a02e61be6fa25580daae98d8577a",
+      "name": "__osCheckPackId",
+      "reference_name": "__osCheckPackId",
+      "section": ".main",
+      "size": 356,
+      "vma": 2147570784
+    },
+    {
+      "instruction_sha256": "2b1668b6c174b2458b34b64cfedbb3c0f22b9ba182a6b98c25baf688fc52e8d3",
+      "name": "__osRepairPackId",
+      "reference_name": "__osRepairPackId",
+      "section": ".main",
+      "size": 848,
+      "vma": 2147569936
+    },
+    {
+      "instruction_sha256": "7f806fc73cff5e193cd18b759cf57b5e6c030b6f7089b11c2b3ad88c343cd1c3",
+      "name": "corrupted_init",
+      "reference_name": "corrupted_init",
+      "section": ".main",
+      "size": 716,
+      "vma": 2147574952
+    },
+    {
+      "instruction_sha256": "b820e2c0e2a8e0a90cc7086a48f2f4c509f63d9db3da350225d0176212618979",
+      "name": "corrupted",
+      "reference_name": "corrupted",
+      "section": ".main",
+      "size": 412,
+      "vma": 2147575668
+    }
+  ],
+  "original_rom_sha256": "6addd60de277c83351eff83099e4dab25ac45279b6401728cfda9eea2f1380df",
+  "reference_elf_sha256": "637ac32a1e7c4cb42536342ee72fee2bcf71bca9933acdb1026ec75c7818abd6",
+  "schema": 1,
+  "source_name_map_sha256": "08592f7f0817c8eb72029368ca383bf7bc3dd39a259b08373a289963d3548820"
+}

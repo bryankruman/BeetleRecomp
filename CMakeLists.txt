@@ -10,7 +10,8 @@
 # Prereqs before this will configure/build:
 #   1) scripts/setup.*  -> `git submodule update --init --recursive` (populates the NESTED
 #      submodules: N64ModernRuntime/N64Recomp, rt64/contrib, etc.) and builds N64Recomp.
-#   2) ./N64Recomp BeetleRecomp.toml  -> populates RecompiledFuncs/*.c (this file globs them).
+#   2) Resolve private original bindings (BUILDING.md), then run N64Recomp on the private config.
+#      This populates RecompiledFuncs/*.c (this file globs them).
 #   3) A C++20 toolchain: Windows = VS2022 + clang-cl + Ninja (RT64 -> D3D12);
 #      Linux = clang + ninja + SDL2/GTK (RT64 -> Vulkan). See BUILDING.md.
 
@@ -140,7 +141,7 @@ set(RECOMP_INCLUDES
 )
 
 # ---------------------------------------------------------------------------
-# RecompiledFuncs — N64Recomp output. Run `./N64Recomp BeetleRecomp.toml` FIRST,
+# RecompiledFuncs — N64Recomp output. Resolve and use the private original-binding config FIRST,
 # or this target will have no sources and CMake will error.
 # ---------------------------------------------------------------------------
 add_library(RecompiledFuncs STATIC)

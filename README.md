@@ -134,14 +134,25 @@ scripts/setup.sh                  # or scripts/setup.ps1 on Windows PowerShell
 #    (WSL) cd ~/projects/bar-decomp && source .venv/bin/activate && make recomp
 scripts/fetch-elf.sh              # or scripts/fetch-elf.ps1
 
-# 3. Recompile the game to C.
-./N64Recomp BeetleRecomp.toml     # emits RecompiledFuncs/*.c
+# 3. Verify all 29 original identities, then recompile the game to C.
+python3 scripts/generate-original-bindings.py resolve \
+  --elf elf/recomp.elf --policy config/original-functions.us.json \
+  --policy-sha256 a785fc8a8552d22e6cd39403535b247af340b0d6287d60082d7483caefb10a11 \
+  --base-config BeetleRecomp.toml --output-toml elf/BeetleRecomp.original-bound.toml
+./N64Recomp elf/BeetleRecomp.original-bound.toml  # emits RecompiledFuncs/*.c
 scripts/fix-recompiled.sh         # REQUIRED codegen fixup — re-run after every regeneration
 
 # 4. Configure + build the port (clang-cl on Windows, clang on Linux/macOS).
 cmake -S . -B build-cmake -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cmake -j
 ```
+
+The checked-in policy contains only names, addresses, positive function extents and hashes.
+The resolver verifies the exact ELF instructions before writing the private ignored binding
+file. A changed instruction, ambiguous provider, tracked output path or failed ignore check
+stops generation. For a fresh resolution, retire only an existing ignored
+`elf/BeetleRecomp.original-bound.toml` first; the resolver never overwrites it.
+Keep this file, ELFs and generated game code private.
 
 ## Status & roadmap
 

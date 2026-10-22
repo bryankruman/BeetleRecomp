@@ -70,12 +70,36 @@ out of public Git.
 
 ```bash
 DECOMP_DIR=/path/to/bar-decomp bash scripts/fetch-elf.sh
-./N64Recomp BeetleRecomp.toml
+python3 scripts/generate-original-bindings.py resolve \
+  --elf elf/recomp.elf --policy config/original-functions.us.json \
+  --policy-sha256 a785fc8a8552d22e6cd39403535b247af340b0d6287d60082d7483caefb10a11 \
+  --base-config BeetleRecomp.toml --output-toml elf/BeetleRecomp.original-bound.toml
+./N64Recomp elf/BeetleRecomp.original-bound.toml
 bash scripts/fix-recompiled.sh
 python3 tools/gen_reference_syms.py elf/recomp.elf syms/beetleadventurerac.us.syms.toml syms/beetleadventurerac.us.datasyms.toml
 PATCH_CC=clang-18 PATCH_LD=ld.lld-18 bash scripts/build-patches.sh
 ./N64Recomp patches.toml
 ```
+
+The original-function policy is metadata only. Its 29 logical requirements remain
+in `BeetleRecomp.toml`; the resolver verifies real positive ELF functions, extents
+and exact instructions, then emits expected bytes only under ignored
+`elf/*.original-bound.toml`. The patched recompiler validates every row before
+renaming the same existing function index. It rejects missing/ambiguous providers,
+stubs and intersecting mutation policies. Do not substitute a stub or remove a
+requirement when resolution fails.
+
+The resolver creates its output exclusively. Before intentionally regenerating,
+retire only the old ignored `elf/BeetleRecomp.original-bound.toml`, then rerun the
+resolver against the current ELF. Never commit or upload the private binding file.
+Dependency setup recognizes a pristine pinned N64Recomp checkout, the previous
+reviewed original-function patch, or the complete current patch. The previous
+patch migrates through a separate checked incremental patch; setup does not
+reset or reverse-write local source. An incompatible checkout fails during
+the shared preflight before any dependency patch is applied.
+
+Run `python3 tests/test_original_bindings.py` for lightweight synthetic parser,
+identity and Git privacy controls; those controls contain no game data.
 
 From Windows Git Bash the patch wrapper enters `WSL_DISTRO` (default `Ubuntu-24.04`).
 On another Linux host use native MIPS-capable LLVM 18. Do not disable fixup verification

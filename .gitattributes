@@ -15,3 +15,6 @@
 *.ico binary
 *.ttf binary
 *.otf binary
+
+# Unified patch context includes significant trailing spaces.
+/scripts/dependency-patches/*.patch -whitespace

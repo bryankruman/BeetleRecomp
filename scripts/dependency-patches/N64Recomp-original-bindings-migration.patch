@@ -1,0 +1,258 @@
+diff --git a/src/config.h b/src/config.h
+--- a/src/config.h
++++ b/src/config.h
+@@ -35,6 +35,16 @@
+         ManualFunction(const std::string& func_name, std::string section_name, uint32_t vram, uint32_t size) : func_name(std::move(func_name)), section_name(std::move(section_name)), vram(vram), size(size) {}
+     };
+ 
++    // Expected instruction bytes exist only in a private, ignored effective config.
++    struct OriginalFunctionBinding {
++        std::string name;
++        std::string elf_name;
++        std::string section;
++        uint32_t vram;
++        uint32_t size;
++        std::vector<uint8_t> instruction_bytes;
++    };
++
+     struct Config {
+         int32_t entrypoint;
+         int32_t functions_per_output_file;
+@@ -59,6 +69,7 @@
+         std::vector<std::string> ignored_funcs;
+         std::vector<std::string> renamed_funcs;
+         std::vector<std::string> original_funcs;
++        std::vector<OriginalFunctionBinding> original_bindings;
+         std::vector<InstructionPatch> instruction_patches;
+         std::vector<FunctionTextHook> function_hooks;
+         std::vector<FunctionSize> manual_func_sizes;
+diff --git a/src/config.cpp b/src/config.cpp
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -155,6 +155,50 @@
+     });
+ 
+     return func_sizes;
++}
++
++std::vector<N64Recomp::OriginalFunctionBinding> get_original_bindings(const toml::table* patches) {
++    std::vector<N64Recomp::OriginalFunctionBinding> result;
++    const auto node = (*patches)["original_bindings"];
++    if (!node) return result;
++    if (!node.is_array() || node.as_array()->size() != 29) {
++        throw toml::parse_error("original_bindings must contain exactly 29 entries", patches->source());
++    }
++    auto nibble = [](char ch) -> int {
++        if (ch >= '0' && ch <= '9') return ch - '0';
++        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
++        if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
++        return -1;
++    };
++    for (const auto& entry : *node.as_array()) {
++        const auto* row = entry.as_table();
++        if (!row || row->size() != 6) {
++            throw toml::parse_error("Invalid original binding schema", entry.source());
++        }
++        auto name = (*row)["name"].value<std::string>();
++        auto elf_name = (*row)["elf_name"].value<std::string>();
++        auto section = (*row)["section"].value<std::string>();
++        auto vram = (*row)["vram"].value<uint32_t>();
++        auto size = (*row)["size"].value<uint32_t>();
++        auto encoded = (*row)["instruction_bytes"].value<std::string>();
++        if (!name || !elf_name || !section || !vram || !size || !encoded ||
++            *size == 0 || *size > 65536 || (*size & 3) || (*vram & 3) ||
++            encoded->size() != size_t(*size) * 2) {
++            throw toml::parse_error("Invalid original binding fields", entry.source());
++        }
++        std::vector<uint8_t> bytes;
++        bytes.reserve(*size);
++        for (size_t offset = 0; offset < encoded->size(); offset += 2) {
++            int high = nibble((*encoded)[offset]);
++            int low = nibble((*encoded)[offset + 1]);
++            if (high < 0 || low < 0) {
++                throw toml::parse_error("Invalid private instruction encoding", entry.source());
++            }
++            bytes.push_back(uint8_t((high << 4) | low));
++        }
++        result.push_back({*name, *elf_name, *section, *vram, *size, std::move(bytes)});
++    }
++    return result;
+ }
+ 
+ std::vector<N64Recomp::InstructionPatch> get_instruction_patches(const toml::table* patches_data) {
+@@ -458,6 +502,7 @@
+             renamed_funcs = get_renamed_funcs(table);
+             // Explicitly retain selected original SDK implementations instead of host stubs.
+             original_funcs = get_renamed_funcs(table, "original");
++            original_bindings = get_original_bindings(table);
+ 
+             // Single-instruction patches (optional)
+             instruction_patches = get_instruction_patches(table);
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -13,6 +13,145 @@
+ #include "recompiler/context.h"
+ #include "config.h"
+ #include <set>
++
++// Validate the complete policy before changing names or creating output files.
++// A binding selects an existing code-bearing index, never an alias or a new body.
++bool bind_original_functions(N64Recomp::Context& context, const N64Recomp::Config& config) {
++    auto reject = [](const std::string& name, const char* reason) {
++        fmt::print(stderr, "Original binding {} rejected: {}\n", name, reason);
++        return false;
++    };
++    if (config.original_bindings.size() != 29 || config.original_bindings.size() != config.original_funcs.size() ||
++        config.original_funcs.empty() || !config.manual_functions.empty() ||
++        !config.manual_func_sizes.empty() || config.use_mdebug || config.use_absolute_symbols) {
++        return reject("policy", "count or symbol-promotion mode");
++    }
++    auto identifier = [](const std::string& name) {
++        if (name.empty()) return false;
++        auto alpha = [](char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_'; };
++        if (!alpha(name[0])) return false;
++        return std::all_of(name.begin(), name.end(), [&](char ch) { return alpha(ch) || (ch >= '0' && ch <= '9'); });
++    };
++    struct Plan { size_t index; std::string name; std::vector<std::string> erase; };
++    std::vector<Plan> plans;
++    std::unordered_set<std::string> required(config.original_funcs.begin(), config.original_funcs.end());
++    std::unordered_set<std::string> fulfilled;
++    std::unordered_set<size_t> used;
++    if (required.size() != config.original_funcs.size()) return reject("policy", "duplicate logical requirement");
++    for (const auto& binding : config.original_bindings) {
++        if (!identifier(binding.name) || !identifier(binding.elf_name) ||
++            !required.contains(binding.name) || !fulfilled.insert(binding.name).second) {
++            return reject(binding.name, "unknown or repeated logical requirement");
++        }
++        std::vector<size_t> sections;
++        for (size_t i = 0; i < context.sections.size(); i++) {
++            if (context.sections[i].name == binding.section) sections.push_back(i);
++        }
++        if (sections.size() != 1) return reject(binding.name, "missing or ambiguous section");
++        size_t section_index = sections[0];
++        if (section_index >= context.section_functions.size()) return reject(binding.name, "invalid section membership table");
++        const auto& section = context.sections[section_index];
++        if (!section.executable || binding.vram < section.ram_addr ||
++            uint64_t(binding.vram) + binding.size > uint64_t(section.ram_addr) + section.size) {
++            return reject(binding.name, "executable section bounds");
++        }
++        std::vector<size_t> candidates;
++        auto by_vram = context.functions_by_vram.find(binding.vram);
++        if (by_vram != context.functions_by_vram.end()) {
++            for (size_t index : by_vram->second) {
++                if (index >= context.functions.size()) return reject(binding.name, "invalid function index");
++                const auto& function = context.functions[index];
++                if (function.section_index == section_index && !function.words.empty()) {
++                    candidates.push_back(index);
++                }
++            }
++        }
++        if (candidates.size() != 1 || !used.insert(candidates[0]).second) {
++            return reject(binding.name, "missing, duplicated or reused real function");
++        }
++        size_t index = candidates[0];
++        const auto& function = context.functions[index];
++        if (function.stubbed || !function.function_hooks.empty()) {
++            return reject(binding.name, "existing stub or text hook on preserved original");
++        }
++        if (function.words.size() * sizeof(uint32_t) != binding.size ||
++            binding.instruction_bytes.size() != binding.size || function.vram != binding.vram ||
++            uint64_t(function.rom) != uint64_t(section.rom_addr) + binding.vram - section.ram_addr ||
++            uint64_t(function.rom) + binding.size > context.rom.size() ||
++            std::find(context.section_functions[section_index].begin(),
++                      context.section_functions[section_index].end(), index) == context.section_functions[section_index].end()) {
++            return reject(binding.name, "frozen extent or existing function membership");
++        }
++        const auto* actual = reinterpret_cast<const uint8_t*>(function.words.data());
++        if (!std::equal(binding.instruction_bytes.begin(), binding.instruction_bytes.end(), actual)) {
++            return reject(binding.name, "instruction identity");
++        }
++        // Prefer the logical spelling, then its parser suffix, then only the
++        // exact raw positive symbol authenticated by the private generator.
++        const std::vector<std::string> names = {binding.name, binding.name + "_recomp",
++                                               binding.elf_name, binding.elf_name + "_recomp"};
++        // Later CLI policy loops must not change the already verified original.
++        // Unrelated runtime bindings remain allowed. Names, current index aliases,
++        // and address windows independently close the selected original identity.
++        auto targets_original = [&](const std::string& name) {
++            if (name == "original_" + binding.name ||
++                std::find(names.begin(), names.end(), name) != names.end()) return true;
++            auto found = context.functions_by_name.find(name);
++            return found != context.functions_by_name.end() && found->second == index;
++        };
++        auto in_original = [&](int32_t address) {
++            const uint64_t value = uint32_t(address);
++            return value >= binding.vram && value < uint64_t(binding.vram) + binding.size;
++        };
++        for (const auto& name : config.stubbed_funcs)
++            if (targets_original(name)) return reject(binding.name, "later stub policy");
++        for (const auto& name : config.ignored_funcs)
++            if (targets_original(name)) return reject(binding.name, "later ignore policy");
++        for (const auto& name : config.renamed_funcs)
++            if (targets_original(name)) return reject(binding.name, "later rename policy");
++        for (const auto& patch : config.instruction_patches)
++            if (targets_original(patch.func_name) || in_original(patch.vram))
++                return reject(binding.name, "later instruction policy");
++        for (const auto& hook : config.function_hooks)
++            if (targets_original(hook.func_name) || (hook.before_vram != 0 && in_original(hook.before_vram)))
++                return reject(binding.name, "later text-hook policy");
++        size_t matched = size_t(-1);
++        Plan plan{index, "original_" + binding.name, {}};
++        for (const auto& name : names) {
++            auto it = context.functions_by_name.find(name);
++            if (it == context.functions_by_name.end()) continue;
++            if (it->second >= context.functions.size()) return reject(binding.name, "invalid name lookup index");
++            const auto& candidate = context.functions[it->second];
++            if (it->second == index) {
++                if (matched == size_t(-1)) matched = index;
++                plan.erase.push_back(name);
++            } else if (candidate.words.empty() && candidate.vram == binding.vram &&
++                       candidate.section_index == section_index) {
++                // Remove only its name lookup; do not promote this zero-code alias.
++                plan.erase.push_back(name);
++            } else {
++                return reject(binding.name, "canonical/raw lookup conflict");
++            }
++        }
++        if (matched != index || context.functions_by_name.contains(plan.name)) {
++            return reject(binding.name, "missing authenticated spelling or output-name conflict");
++        }
++        plans.push_back(std::move(plan));
++    }
++    if (fulfilled != required || used.size() != required.size()) return reject("policy", "incomplete binding");
++    // Only names and the existing original-policy flags change. All instruction,
++    // section, VMA-index, relocation, and caller-routing data remain untouched.
++    for (const auto& plan : plans) {
++        for (const auto& name : plan.erase) context.functions_by_name.erase(name);
++        auto& function = context.functions[plan.index];
++        function.name = plan.name;
++        function.ignored = false;
++        function.reimplemented = false;
++        context.functions_by_name.emplace(plan.name, plan.index);
++    }
++    fmt::print("Verified {} original function identities\n", plans.size());
++    return true;
++}
+ 
+ void add_manual_functions(N64Recomp::Context& context, const std::vector<N64Recomp::ManualFunction>& manual_funcs) {
+     auto exit_failure = [](const std::string& error_str) {
+@@ -500,6 +639,10 @@
+     }
+ 
+ 
++    if (!config.original_bindings.empty() && !bind_original_functions(context, config)) {
++        exit_failure("Strict original function binding failed before output creation\n");
++    }
++
+     fmt::print("Function count: {}\n", context.functions.size());
+ 
+     std::filesystem::create_directories(config.output_func_path);
+@@ -523,6 +666,7 @@
+     // Games that emulate the raw controller bus need the original filesystem and
+     // accessory probes, rather than the runtime's no-pak implementations. Resolve
+     // both parsed spellings and use a distinct name to avoid host symbol collisions.
++    if (config.original_bindings.empty())
+     for (const std::string& original : config.original_funcs) {
+         auto found = context.functions_by_name.find(original);
+         if (found == context.functions_by_name.end()) {

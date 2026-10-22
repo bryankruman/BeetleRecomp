@@ -27,9 +27,20 @@ def main():
             print(f"{name}: reviewed patch already applied")
             continue
         result = git(directory, "apply", "--check", str(patch))
+        selected_patch = patch
+        if result.returncode and name == "N64Recomp":
+            # A checkout may already contain the previous reviewed originals
+            # patch. Never reset it or reverse-write it. Admit migration only
+            # when the complete known legacy patch reverses and the strict
+            # legacy-to-current incremental patch applies without fuzz.
+            legacy = patch.with_name("N64Recomp-legacy-originals.patch")
+            migration = patch.with_name("N64Recomp-original-bindings-migration.patch")
+            if git(directory, "apply", "--reverse", "--check", str(legacy)).returncode == 0:
+                result = git(directory, "apply", "--check", str(migration))
+                selected_patch = migration
         if result.returncode:
             sys.exit(f"{name}: incompatible checkout; no patches applied.\n{result.stderr}")
-        pending.append((name, directory, patch))
+        pending.append((name, directory, selected_patch))
     for name, directory, patch in pending:
         result = git(directory, "apply", str(patch))
         if result.returncode:

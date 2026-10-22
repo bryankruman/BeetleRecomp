@@ -52,3 +52,6 @@ Thumbs.db
 /dist/
 __pycache__/
 *.pyc
+
+# Private verified instruction bindings; never commit or publish.
+/elf/*.original-bound.toml
