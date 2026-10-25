@@ -6,12 +6,19 @@
 #include "elements/ui_container.h"
 #include "elements/ui_binding_button.h"
 #include "elements/ui_select.h"
+#include "elements/ui_text_input.h"
+#include "librecomp/game.hpp"
+#include <algorithm>
 #include "recompinput/profiles.h"
 #include "recompui/config.h"
 
 namespace recompui {
 
 ConfigPageControls *controls_page = nullptr;
+static std::function<void()> auto_configure_players_callback;
+void set_auto_configure_players_callback(std::function<void()> callback) {
+    auto_configure_players_callback = std::move(callback);
+}
 
 const std::string_view active_state_style_name = "cont_opt_active";
 
@@ -241,6 +248,7 @@ void ConfigPageControls::force_update() {
 }
 
 void ConfigPageControls::render_all() {
+    set_current_profile_index();
     render_header();
     render_body();
     render_footer();
@@ -308,6 +316,7 @@ void ConfigPageControls::render_header() {
 
             show_or_hide_if_exists(header_elements.right.go_back_button, true);
             show_or_hide_if_exists(header_elements.right.assign_players_button, false);
+            show_or_hide_if_exists(header_elements.right.auto_configure_button, false);
         } else {
             if (header_elements.right.assign_players_button == nullptr) {
                 header_elements.right.assign_players_button = context.create_element<Button>(header_right, "Assign players", ButtonStyle::Primary);
@@ -319,10 +328,20 @@ void ConfigPageControls::render_header() {
                     recompui::AssignPlayersModal::open();
                 });
                 header_elements.right.assign_players_button->set_as_primary_focus(true);
+                if (auto_configure_players_callback) {
+                    auto auto_button = context.create_element<Button>(header_right, "Auto-configure", ButtonStyle::Secondary);
+                    auto_button->set_debug_id("AutoConfigureControllers");
+                    auto_button->add_pressed_callback([this]() {
+                        if (auto_configure_players_callback) auto_configure_players_callback();
+                        force_update();
+                    });
+                    header_elements.right.auto_configure_button = auto_button;
+                }
             }
 
             show_or_hide_if_exists(header_elements.right.go_back_button, false);
             show_or_hide_if_exists(header_elements.right.assign_players_button, true);
+            show_or_hide_if_exists(header_elements.right.auto_configure_button, true);
         }
     }
 }
@@ -347,17 +366,166 @@ void ConfigPageControls::render_body_mappings() {
     recompui::ContextId context = get_current_context();
     body->set_as_navigation_container(NavigationType::Horizontal);
 
-    // left side
-    {
-        render_control_mappings();
-    }
-
+    // Create the description before restoring mapping-row focus.
     // right side
     {
-        body->get_right()->clear_children();
-        description_container = context.create_element<Element>(body->get_right(), 0, "p", true);
+        auto right = body->get_right();
+        description_container = nullptr;
+        right->clear_children();
+        right->set_flex_direction(FlexDirection::Column);
+        right->set_gap(12.0f);
+        right->set_overflow_y(Overflow::Auto);
+        right->set_height(100.0f, Unit::Percent);
+        right->set_max_height(100.0f, Unit::Percent);
+        right->set_as_navigation_container(NavigationType::Vertical);
+        render_templates();
+        description_container = context.create_element<Element>(right, 0, "p", true);
         description_container->set_text("");
     }
+    render_control_mappings();
+}
+
+void ConfigPageControls::render_templates() {
+    using namespace recompinput;
+    auto context = get_current_context();
+    Element* restore_focus = nullptr;
+    auto panel = context.create_element<Container>(body->get_right(), FlexDirection::Column, JustifyContent::FlexStart, 0);
+    panel->set_gap(8.0f);
+    panel->set_width(100.0f, Unit::Percent);
+    panel->set_as_navigation_container(NavigationType::Vertical);
+    context.create_element<Label>(panel, "Binding templates", LabelStyle::Normal);
+    context.create_element<Label>(panel,
+        "Apply gameplay mappings to this profile. Menu controls stay unchanged. Templates work with any device of the same type.", LabelStyle::Small);
+    const auto device = get_player_input_device();
+    if (template_device != static_cast<int>(device)) {
+        template_device = static_cast<int>(device);
+        selected_template_index = -1;
+        template_name.clear();
+        template_status.clear();
+        confirm_template_delete = false;
+    }
+    const auto custom = profiles::get_indices_for_custom_profiles(device);
+    if (std::find(custom.begin(), custom.end(), selected_template_index) == custom.end()) selected_template_index = -1;
+    std::vector<SelectOption> options{{device == InputDevice::Controller ? "Default Gamepad" : "Default Keyboard", "-1"}};
+    for (int index : custom) options.emplace_back(profiles::get_input_profile_name(index), std::to_string(index));
+    auto select = context.create_element<Select>(panel, options, std::to_string(selected_template_index));
+    select->set_debug_id("BindingTemplateSelect");
+    if (template_focus == 1) restore_focus = select;
+    select->add_change_callback([this](SelectOption& option, int) {
+        template_focus = 1;
+        selected_template_index = std::stoi(option.value);
+        template_name = selected_template_index < 0 ? "" : profiles::get_input_profile_name(selected_template_index);
+        confirm_template_delete = false;
+        template_status.clear();
+        template_management_open = false;
+        force_update();
+    });
+    // Template operations save immediately. Ordinary remapping also retains
+    // the Controls tab's existing save-on-close behavior.
+    auto finish = [this](bool success, const std::string& message) {
+        if (!success) template_status = "No change: use a shorter, unique name for this device type.";
+        else if (!profiles::save_controls_config(recomp::get_config_path() / "controls.json"))
+            template_status = "Changed in memory, but saving failed. Check the configuration folder and try again.";
+        else template_status = message;
+        confirm_template_delete = false;
+        template_focus = 1;
+        force_update();
+    };
+    auto apply = context.create_element<Button>(panel, "Apply template", ButtonStyle::Primary, ButtonSize::Medium);
+    apply->set_debug_id("ApplyBindingTemplate");
+    apply->add_pressed_callback([this, finish]() {
+        bool success = true;
+        if (selected_template_index < 0) {
+            // Gameplay fields precede TOGGLE_MENU. Keep Accept/Back/Toggle
+            // untouched so applying a layout cannot strand menu navigation.
+            for (int i = 0; i < static_cast<int>(GameInput::TOGGLE_MENU); ++i)
+                profiles::reset_input_binding(selected_profile_index, get_player_input_device(), static_cast<GameInput>(i));
+        } else success = profiles::apply_input_profile(selected_template_index, selected_profile_index);
+        finish(success, "Gameplay template applied. Menu controls were preserved.");
+    });
+    context.create_element<Label>(panel, "Template name (optional for Save new)", LabelStyle::Small);
+    auto name = context.create_element<TextInput>(panel);
+    name->set_debug_id("BindingTemplateName");
+    name->set_max_length(64);
+    name->set_text(template_name);
+    name->add_text_changed_callback([this](const std::string& text) {
+        template_name = text;
+        confirm_template_delete = false;
+    });
+    auto save = context.create_element<Button>(panel, "Save new template", ButtonStyle::Secondary, ButtonSize::Medium);
+    save->add_pressed_callback([this, finish]() {
+        std::string name = template_name;
+        if (name.empty()) {
+            const auto device = get_player_input_device();
+            const std::string base = device == InputDevice::Controller ? "Gamepad template " : "Keyboard template ";
+            for (int n = 1; ; ++n) {
+                name = base + std::to_string(n);
+                bool exists = false;
+                for (int index : profiles::get_indices_for_custom_profiles(device)) {
+                    const auto& existing = profiles::get_input_profile_name(index);
+                    exists |= existing.size() == name.size() && std::equal(existing.begin(), existing.end(), name.begin(),
+                        [](unsigned char a, unsigned char b) {
+                            const auto lower = [](unsigned char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; };
+                            return lower(a) == lower(b);
+                        });
+                }
+                if (!exists) break;
+            }
+        }
+        int saved = -1;
+        const bool success = profiles::save_input_profile_as(selected_profile_index, name, saved);
+        if (success) {
+            selected_template_index = saved;
+            template_name = profiles::get_input_profile_name(saved);
+        }
+        finish(success, "Template saved. The current profile is still selected for editing.");
+    });
+    auto manage = context.create_element<Button>(panel, template_management_open ? "Hide template actions" : "Manage selected template", ButtonStyle::Tertiary, ButtonSize::Medium);
+    manage->set_enabled(selected_template_index >= 0);
+    if (template_focus == 2) restore_focus = manage;
+    manage->add_pressed_callback([this]() {
+        template_focus = 2;
+        template_management_open = !template_management_open;
+        confirm_template_delete = false;
+        force_update();
+    });
+    if (template_management_open && selected_template_index >= 0) {
+        auto update = context.create_element<Button>(panel, "Replace selected template", ButtonStyle::Secondary, ButtonSize::Medium);
+        update->set_enabled(selected_template_index >= 0);
+        update->add_pressed_callback([this, finish]() {
+            int saved = -1;
+            const auto name = profiles::get_input_profile_name(selected_template_index);
+            finish(profiles::save_input_profile_as(selected_profile_index, name, saved, true), "Selected template replaced with the current mappings.");
+        });
+        auto rename = context.create_element<Button>(panel, "Rename selected template", ButtonStyle::Tertiary, ButtonSize::Medium);
+        rename->set_enabled(selected_template_index >= 0);
+        rename->add_pressed_callback([this, finish]() {
+            finish(profiles::rename_input_profile(selected_template_index, template_name), "Template renamed.");
+        });
+        auto remove = context.create_element<Button>(panel, confirm_template_delete ? "Confirm delete template" : "Delete selected template", ButtonStyle::Danger, ButtonSize::Medium);
+        remove->set_enabled(selected_template_index >= 0);
+        if (template_focus == 3) restore_focus = remove;
+        remove->add_pressed_callback([this, finish]() {
+            if (!confirm_template_delete) {
+                template_focus = 3;
+                confirm_template_delete = true;
+                template_status = "Press Confirm delete template to remove it. Active controllers retain their mappings.";
+                force_update();
+                return;
+            }
+            const bool success = profiles::delete_input_profile(selected_template_index);
+            if (success) {
+                if (selected_profile_index == selected_template_index)
+                    selected_profile_index = profiles::get_input_profile_for_player(selected_player, get_player_input_device());
+                selected_template_index = -1;
+                template_name.clear();
+            }
+            finish(success, "Template deleted. Active controllers retain their mappings.");
+        });
+    }
+    context.create_element<Label>(panel, template_status, LabelStyle::Small);
+    if (restore_focus != nullptr) restore_focus->focus();
+    template_focus = 0;
 }
 
 void ConfigPageControls::render_body_players() {
@@ -442,15 +610,18 @@ void ConfigPageControls::render_body_players() {
 }
 
 void ConfigPageControls::on_select_player_profile(int player_index, int profile_index) {
-    auto& assigned_player = recompinput::players::get_player(player_index);
     recompinput::InputDevice device = recompinput::players::get_player_input_device(player_index);
     if (device != recompinput::InputDevice::COUNT) {
-        recompinput::profiles::set_input_profile_for_player(player_index, profile_index, device);
+        // Copy into the device's independent, persisted working profile. Selecting
+        // a template must not alias its bindings or disappear after reconnect.
+        recompinput::profiles::apply_input_profile_for_player(player_index, profile_index);
+        force_update();
     }
 }
 
 void ConfigPageControls::on_edit_player_profile(int player_index) {
     selected_player = player_index;
+    single_player_show_keyboard_mappings = false;
     recompinput::InputDevice device = recompinput::players::get_player_input_device(player_index);
     if (device != recompinput::InputDevice::COUNT) {
         selected_profile_index = recompinput::profiles::get_input_profile_for_player(player_index, device);
@@ -473,12 +644,17 @@ void ConfigPageControls::render_footer() {
     {
         auto footer_left = footer->get_left();
         footer_left->clear_children();
-        if (!multiplayer_enabled) {
+        const bool has_keyboard_fallback = multiplayer_enabled &&
+            recompinput::players::get_player_input_device(selected_player) == recompinput::InputDevice::Controller &&
+            recompinput::profiles::get_input_profile_for_player(selected_player, recompinput::InputDevice::Keyboard) >= 0;
+        if (!multiplayer_enabled || has_keyboard_fallback) {
             keyboard_toggle = context.create_element<IconToggle>(footer_left, "icons/Cont.svg", "icons/Keyboard.svg", ToggleSize::Large);
             keyboard_toggle->set_checked(single_player_show_keyboard_mappings);
             keyboard_toggle->add_checked_callback([this](bool checked) {
                 this->single_player_show_keyboard_mappings = checked;
+                this->set_current_profile_index();
                 this->update_control_mappings();
+                this->force_update();
             });
         }
     }
@@ -565,6 +741,16 @@ void ConfigPageControls::set_current_profile_index() {
         selected_profile_index = single_player_show_keyboard_mappings
             ? recompinput::profiles::get_sp_keyboard_profile_index()
             : recompinput::profiles::get_sp_controller_profile_index();
+    } else if (multiplayer_view_mappings) {
+        const auto device = get_player_input_device();
+        if (device == recompinput::InputDevice::COUNT) {
+            // A pad may unplug while its editor is open. Return to player cards
+            // instead of retaining a stale profile or capturing the wrong device.
+            multiplayer_view_mappings = false;
+            selected_profile_index = -1;
+        } else {
+            selected_profile_index = recompinput::profiles::get_input_profile_for_player(selected_player, device);
+        }
     }
 }
 
@@ -630,7 +816,11 @@ void ConfigPageControls::update_control_mappings() {
 
 recompinput::InputDevice ConfigPageControls::get_player_input_device() {
     if (multiplayer_enabled) {
-        return recompinput::players::get_player_input_device(this->selected_player);
+        const auto device = recompinput::players::get_player_input_device(this->selected_player);
+        if (device == recompinput::InputDevice::Controller && single_player_show_keyboard_mappings &&
+            recompinput::profiles::get_input_profile_for_player(selected_player, recompinput::InputDevice::Keyboard) >= 0)
+            return recompinput::InputDevice::Keyboard;
+        return device;
     }
 
     return single_player_show_keyboard_mappings

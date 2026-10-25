@@ -1,4 +1,7 @@
 #include "frontend/bar_frontend.h"
+#include "frontend/controller_defaults.hpp"
+#include "frontend/controller_assignment.hpp"
+#include "config/ui_config_page_controls.h"
 #include "main/bar_rumble.hpp"
 #include "main/bar_cheats.h"
 #include "main/bar_input.hpp"
@@ -49,6 +52,7 @@ std::array<std::atomic<uint64_t>, kMaxPlayers> g_port_samples{};
 std::array<std::atomic<uint64_t>, kMaxPlayers> g_background_port_samples{};
 std::array<std::atomic<bool>, kMaxPlayers> g_raw_rumble{};
 std::atomic<bool> g_menu_capturing{};
+std::atomic<bool> g_auto_configure_requested{};
 
 // Assets are resolved as <exe dir>/assets/<name> (recompui::file::get_asset_path). The primary font
 // is REQUIRED: recompui throws "No primary font was registered" without it. The family name is what
@@ -292,6 +296,8 @@ void bar::frontend::install() {
         trace("launcher init callback: menu built");
     });
 
+    register_controller_defaults();
+
     // The keyboard scheme, declared as the frontend's DEFAULTS rather than left to RecompFrontend,
     // whose own defaults are a different scheme again (WASD and space).
     //
@@ -424,6 +430,11 @@ void bar::frontend::install() {
     // done for BAR. wave-race-64-recomp has the option because that work was done there.
 
     recompui::config::create_controls_tab();
+    recompui::set_auto_configure_players_callback([]() {
+        // UI callback may run on another thread. SDL and player state stay on
+        // the event owner thread, immediately after the next event drain.
+        g_auto_configure_requested.store(true, std::memory_order_relaxed);
+    });
     auto& accessories = recompui::config::create_config_tab("Accessories", "accessories", true);
     using bar::input_config::PakType;
     const auto input_settings = bar::input_config::get();
@@ -548,88 +559,151 @@ void refresh_players() {
         } else ++it;
     }
 
-    // The first call always assigns, even with nothing connected. Comparing against the last set
-    // alone is what breaks input entirely on a machine with no pad attached: an empty set matches an
-    // empty set, so nothing is ever assigned, player one does not exist, and the game is told it has
-    // no controller at all -- keyboard included.
-    //
-    // Each pad's controller profile is part of the comparison too. auto_assign_controllers gives a
-    // player the profile recompinput created for its pad when SDL reported it; a pad assigned before
-    // that profile existed would drive nothing -- player two present, its buttons mapped to nothing --
-    // and, with the pad set unchanged, would never be looked at again. Re-assigning once the profile
-    // appears closes that gap.
+    using namespace bar::frontend::controller_assignment;
+    static bool initialized = false;
+    static Slots preferred{}, published{};
+    static std::array<LegacyDevice, kMaxPlayers> imported_devices{};
+    static std::array<int, kMaxPlayers> keyboard_profiles{-1, -1, -1, -1};
+    static std::unordered_map<SDL_GameController*, std::string> previous_keys;
+    static std::vector<SDL_JoystickID> assigned_ids;
+    static std::vector<int> assigned_profiles;
+
+    std::vector<std::string> keys;
+    std::vector<Device> devices;
     std::vector<int> pad_profiles;
-    for (SDL_GameController* pad : connected) {
+    std::unordered_map<SDL_GameController*, std::string> current_keys;
+    for (auto* pad : connected) {
+        const auto identity = recompinput::profiles::get_guid_from_sdl_controller(pad);
+        const auto key = recompinput::profiles::get_string_from_controller_guid(identity);
+        keys.push_back(key);
+        char guid[33]{};
+        SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(pad)), guid, sizeof(guid));
+        devices.push_back({key, guid, std::string(guid) + "!" + identity.serial});
+        current_keys.emplace(pad, key);
         pad_profiles.push_back(recompinput::profiles::get_controller_profile_index_from_sdl_controller(pad));
     }
-    static bool assigned_once = false;
-    static std::vector<SDL_JoystickID> assigned;
-    static std::vector<int> assigned_profiles;
-    if (assigned_once && connected_ids == assigned && pad_profiles == assigned_profiles) {
+    // Never cache an assignment that the backend would refuse while the modal
+    // owns assignment. Retain old pointer identities until its commit is seen.
+    if (recompinput::playerassignment::is_active()) return;
+
+    const auto live_slots = [&]() {
+        Slots live{};
+        for (int port = 0; port < kMaxPlayers; ++port) {
+            const auto& player = recompinput::players::get_player(port);
+            live[port].keyboard = has_keyboard(
+                recompinput::players::get_player_is_assigned(port), player.keyboard_enabled,
+                recompinput::profiles::get_input_profile_for_player(port, recompinput::InputDevice::Keyboard));
+            if (auto it = current_keys.find(player.controller); it != current_keys.end()) {
+                live[port].controller = it->second;
+            } else if (auto old = previous_keys.find(player.controller); old != previous_keys.end()) {
+                live[port].controller = old->second;
+            }
+        }
+        return live;
+    };
+    const auto same_assignment = [](const Slots& a, const Slots& b) {
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (a[i].controller != b[i].controller || a[i].keyboard != b[i].keyboard) return false;
+        }
+        return true;
+    };
+    const Slots live = live_slots();
+    if (!initialized) {
+        bool imported = false;
+        const auto legacy = bar::input_config::get();
+        for (int port = 0; port < kMaxPlayers; ++port) {
+            const auto prefix = "legacy_port_" + std::to_string(port);
+            imported |= recompinput::profiles::get_input_profile_by_key(prefix + "_keyboard") >= 0;
+            imported |= recompinput::profiles::get_input_profile_by_key(prefix + "_controller") >= 0;
+        }
+        if (imported) {
+            for (int port = 0; port < kMaxPlayers; ++port) {
+                const auto& old = legacy.ports[port];
+                if (!old.connected || old.device.type == bar::input_config::DeviceType::None) continue;
+                preferred[port].reserved = true;
+                if (old.device.type == bar::input_config::DeviceType::Keyboard) {
+                    preferred[port].keyboard = true;
+                    keyboard_profiles[port] = recompinput::profiles::get_input_profile_by_key(
+                        "legacy_port_" + std::to_string(port) + "_keyboard");
+                    continue;
+                }
+                imported_devices[port] = {old.device.guid, old.device.uid};
+            }
+            if (!preferred[0].reserved) {
+                preferred[0].keyboard = true;
+                preferred[0].share_keyboard = true;
+            }
+        } else {
+            preferred = automatic(keys, false);
+        }
+    } else if (!same_assignment(live, published)) {
+        // A completed manual assignment supersedes the imported layout. Keep
+        // deliberate gaps and the chosen ports when any other pad hotplugs.
+        preferred = live;
+        imported_devices = {};
+        for (int port = 0; port < kMaxPlayers; ++port) {
+            preferred[port].reserved = true;
+            keyboard_profiles[port] = recompinput::profiles::get_input_profile_for_player(
+                port, recompinput::InputDevice::Keyboard);
+        }
+        published = live;
+    }
+
+    const bool requested = g_auto_configure_requested.exchange(false, std::memory_order_relaxed);
+    if (requested) {
+        int keyboard_profile = recompinput::profiles::get_sp_keyboard_profile_index();
+        for (int port = 0; port < kMaxPlayers; ++port) {
+            if (!live[port].keyboard) continue;
+            const int profile = recompinput::profiles::get_input_profile_for_player(port, recompinput::InputDevice::Keyboard);
+            if (profile >= 0) { keyboard_profile = profile; break; }
+        }
+        preferred = automatic(keys, true);
+        imported_devices = {};
+        keyboard_profiles.fill(-1);
+        for (int port = 0; port < kMaxPlayers; ++port) {
+            if (preferred[port].keyboard) keyboard_profiles[port] = keyboard_profile;
+        }
+    }
+    if (initialized && !requested && connected_ids == assigned_ids && pad_profiles == assigned_profiles) {
+        previous_keys = std::move(current_keys);
         return;
     }
-    assigned_once = true;
-    assigned = connected_ids;
-    assigned_profiles = pad_profiles;
-
-    bool has_imported_slots = false;
+    resolve_legacy(preferred, imported_devices, devices);
+    const Slots resolved = reconcile(preferred, keys);
+    std::array<recompinput::Player, kMaxPlayers> slots{};
     for (int port = 0; port < kMaxPlayers; ++port) {
-        has_imported_slots |= recompinput::profiles::get_input_profile_by_key(
-            "legacy_port_" + std::to_string(port) + "_keyboard") >= 0;
-        has_imported_slots |= recompinput::profiles::get_input_profile_by_key(
-            "legacy_port_" + std::to_string(port) + "_controller") >= 0;
-    }
-    if (has_imported_slots) {
-        const auto legacy = bar::input_config::get();
-        std::array<recompinput::Player, kMaxPlayers> slots{};
-        std::array<bool, kMaxPlayers> reserved{};
-        std::vector<bool> used(connected.size());
-        for (int port = 0; port < kMaxPlayers; ++port) {
-            const auto& old = legacy.ports[port];
-            if (!old.connected || old.device.type == bar::input_config::DeviceType::None) continue;
-            reserved[port] = true;
-            if (old.device.type == bar::input_config::DeviceType::Keyboard) {
-                slots[port].keyboard_enabled = true;
-                continue;
-            }
-            for (size_t i = 0; i < connected.size(); ++i) {
-                if (used[i]) continue;
-                char guid[33]{};
-                SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(connected[i])), guid, sizeof(guid));
-                if (old.device.guid != guid) continue;
-                const auto identity = recompinput::profiles::get_guid_from_sdl_controller(connected[i]);
-                const std::string uid = std::string(guid) + "!" + identity.serial;
-                if (!old.device.uid.empty() && old.device.uid != uid) continue;
-                slots[port].controller = connected[i];
-                used[i] = true;
-                break;
-            }
+        slots[port].keyboard_enabled = resolved[port].keyboard;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (resolved[port].controller == keys[i]) slots[port].controller = connected[i];
         }
-        // New pads may use free slots, but cannot steal an imported device's slot
-        // while that device is temporarily unplugged.
-        for (size_t i = 0; i < connected.size(); ++i) {
-            if (used[i]) continue;
-            for (int port = 0; port < kMaxPlayers; ++port) {
-                if (reserved[port] || slots[port].controller != nullptr || slots[port].keyboard_enabled) continue;
-                slots[port].controller = connected[i];
-                break;
-            }
-        }
-        // Retain a keyboard fallback when player one has no imported keyboard map.
-        if (!reserved[0]) slots[0].keyboard_enabled = true;
-        recompinput::players::auto_assign_players(slots.data(), slots.size());
-    } else {
-        recompinput::players::auto_assign_controllers(connected.data(), connected.size());
     }
+    recompinput::players::auto_assign_players(slots.data(), slots.size());
+    for (int port = 0; port < kMaxPlayers; ++port) {
+        if (!resolved[port].keyboard) continue;
+        int profile = keyboard_profiles[port];
+        if (profile < 0) profile = recompinput::profiles::get_sp_keyboard_profile_index();
+        recompinput::profiles::set_input_profile_for_player(port, profile, recompinput::InputDevice::Keyboard);
+    }
+    // Only cache effective assignments; a later manual commit is compared with
+    // this exact published layout, rather than silently reverting to legacy data.
+    published = live_slots();
+    previous_keys = std::move(current_keys);
+    assigned_ids = connected_ids;
+    assigned_profiles = pad_profiles;
+    initialized = true;
 
     std::fprintf(stderr, "[BeetleRecomp] %zu controller%s connected; assigned to "
                          "%zu player%s\n",
                  connected.size(), connected.size() == 1 ? "" : "s",
                  recompinput::players::get_number_of_assigned_players(),
                  recompinput::players::get_number_of_assigned_players() == 1 ? "" : "s");
-    for (size_t i = 0; i < connected.size(); i++) {
-        std::fprintf(stderr, "[BeetleRecomp]   player %zu: %s (controller profile %d)\n",
-                     i + 1, SDL_GameControllerName(connected[i]), pad_profiles[i]);
+    for (int port = 0; port < kMaxPlayers; ++port) {
+        const auto& player = recompinput::players::get_player(port);
+        if (!recompinput::players::get_player_is_assigned(port)) continue;
+        std::fprintf(stderr, "[BeetleRecomp]   player %d: %s (controller profile %d)%s\n",
+                     port + 1, player.controller ? SDL_GameControllerName(player.controller) : "Keyboard",
+                     recompinput::profiles::get_input_profile_for_player(port, recompinput::InputDevice::Controller),
+                     player.controller && player.keyboard_enabled ? " + keyboard" : "");
     }
     std::fflush(stderr);
 }

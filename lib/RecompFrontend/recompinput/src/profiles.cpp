@@ -4,6 +4,8 @@
 #include <string>
 #include <cstring>
 #include <unordered_set>
+#include <algorithm>
+#include <cctype>
 #include "recompinput/profiles.h"
 #include "./json.h"
 #include "xxHash/xxh3.h"
@@ -18,10 +20,15 @@ struct InputProfile {
     recompinput::InputDevice device;
     input_mapping_array mappings;
     bool custom = false;
+    bool deleted = false;
 };
 
 static std::vector<InputProfile> input_profiles{};
-static std::array<std::pair<int, int>, recompinput::max_num_players_supported> players_input_profile_indices{};
+static std::array<std::pair<int, int>, recompinput::max_num_players_supported> players_input_profile_indices = [] {
+    std::array<std::pair<int, int>, recompinput::max_num_players_supported> indices;
+    indices.fill(std::pair<int, int>{-1, -1});
+    return indices;
+}();
 static std::unordered_map<std::string, int> input_profile_key_index_map{};
 static std::vector<int> input_profile_custom_indices[static_cast<size_t>(recompinput::InputDevice::COUNT)]{};
 
@@ -58,6 +65,81 @@ static const std::array n64_button_values = {
 using json = nlohmann::json;
 
 namespace recompinput {
+    static bool valid_device(InputDevice device) {
+        return device == InputDevice::Controller || device == InputDevice::Keyboard;
+    }
+
+    static bool valid_profile(int index) {
+        return index >= 0 && static_cast<size_t>(index) < input_profiles.size() && !input_profiles[index].deleted;
+    }
+
+    static bool profile_name(const std::string& value, std::string& trimmed) {
+        const auto first = value.find_first_not_of(" \t\r\n\f\v");
+        if (first == std::string::npos) return false;
+        trimmed = value.substr(first, value.find_last_not_of(" \t\r\n\f\v") - first + 1);
+        if (trimmed.size() > 64) return false;
+        return std::none_of(trimmed.begin(), trimmed.end(), [](unsigned char c) { return std::iscntrl(c) != 0; });
+    }
+
+    static bool same_profile_name(const std::string& a, const std::string& b) {
+        return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](unsigned char x, unsigned char y) {
+            const auto lower = [](unsigned char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; };
+            return lower(x) == lower(y);
+        });
+    }
+
+    static std::string new_profile_key(InputDevice device, bool custom) {
+        static uint64_t sequence = 0;
+        std::string key;
+        do {
+            key = std::string(custom ? "custom_" : "working_") +
+                (device == InputDevice::Controller ? "controller_" : "keyboard_") + std::to_string(++sequence);
+        } while (input_profile_key_index_map.contains(key));
+        return key;
+    }
+
+    // Copy before vector growth; no working map aliases the template's storage.
+    static int independent_profile_copy(int source, const std::string& preferred_key, const std::string& name) {
+        const InputProfile copy = input_profiles[source];
+        int target = profiles::get_input_profile_by_key(preferred_key);
+        if (!valid_profile(target) || input_profiles[target].custom || input_profiles[target].device != copy.device) {
+            const std::string key = input_profile_key_index_map.contains(preferred_key)
+                ? new_profile_key(copy.device, false) : preferred_key;
+            target = profiles::add_input_profile(key, name, copy.device, false);
+        }
+        input_profiles[target].mappings = copy.mappings;
+        return target;
+    }
+
+    static void detach_profile_users(int source) {
+        // Preserve unplugged devices too: their associations are saved by key.
+        for (auto& controller : controllers) {
+            if (controller.profile_index == source) {
+                controller.profile_index = independent_profile_copy(source,
+                    profiles::get_string_from_controller_guid(controller.guid), "Controller");
+            }
+        }
+        const InputDevice device = input_profiles[source].device;
+        for (size_t i = 0; i < players_input_profile_indices.size(); ++i) {
+            int& current = device == InputDevice::Controller
+                ? players_input_profile_indices[i].first : players_input_profile_indices[i].second;
+            if (current != source) continue;
+            if (device == InputDevice::Controller && players::get_player_is_assigned(static_cast<int>(i))) {
+                auto* pad = players::get_player(static_cast<int>(i)).controller;
+                if (pad != nullptr) {
+                    const int replacement = profiles::get_controller_profile_index_from_sdl_controller(pad);
+                    if (valid_profile(replacement) && replacement != source) {
+                        current = replacement;
+                        continue;
+                    }
+                }
+            }
+            current = independent_profile_copy(source,
+                "working_player_" + std::to_string(i) + (device == InputDevice::Controller ? "_controller" : "_keyboard"),
+                device == InputDevice::Controller ? "Controller" : "Keyboard");
+        }
+    }
+
     // Due to an RmlUi limitation this can't be const. Ideally it would return a const reference or even just a straight up copy.
     recompinput::InputField& profiles::get_input_binding(int profile_index, GameInput input, size_t binding_index) {
         input_mapping& cur_input_mapping = input_profiles[profile_index].mappings.at(static_cast<size_t>(input));
@@ -129,9 +211,10 @@ namespace recompinput {
     }
 
     int profiles::add_input_profile(const std::string &key, const std::string &name, InputDevice device, bool custom) {
+        if (key.empty() || !valid_device(device)) return -1;
         auto it = input_profile_key_index_map.find(key);
         if (it != input_profile_key_index_map.end()) {
-            return it->second;
+            return valid_profile(it->second) && input_profiles[it->second].device == device ? it->second : -1;
         }
 
         int index = (int)(input_profiles.size());
@@ -183,7 +266,91 @@ namespace recompinput {
     }
 
     bool profiles::is_input_profile_custom(int profile_index) {
-        return input_profiles[profile_index].custom;
+        return valid_profile(profile_index) && input_profiles[profile_index].custom;
+    }
+
+    bool profiles::save_input_profile_as(int source_index, const std::string& name, int& saved_index, bool overwrite) {
+        saved_index = -1;
+        std::string trimmed;
+        if (!valid_profile(source_index) || !profile_name(name, trimmed)) return false;
+        const auto device = input_profiles[source_index].device;
+        for (int i = 0; i < static_cast<int>(input_profiles.size()); ++i) {
+            if (!valid_profile(i) || input_profiles[i].device != device || !same_profile_name(input_profiles[i].name, trimmed)) continue;
+            if (!overwrite || !input_profiles[i].custom) return false;
+            const auto mappings = input_profiles[source_index].mappings;
+            detach_profile_users(i);
+            input_profiles[i].mappings = mappings;
+            input_profiles[i].name = trimmed;
+            saved_index = i;
+            return true;
+        }
+        const auto mappings = input_profiles[source_index].mappings;
+        saved_index = add_input_profile(new_profile_key(device, true), trimmed, device, true);
+        input_profiles[saved_index].mappings = mappings;
+        return true;
+    }
+
+    bool profiles::apply_input_profile(int template_index, int target_index, bool include_menu_bindings) {
+        if (!valid_profile(template_index) || !valid_profile(target_index) ||
+            input_profiles[template_index].device != input_profiles[target_index].device) return false;
+        const size_t count = include_menu_bindings ? num_game_inputs : static_cast<size_t>(GameInput::TOGGLE_MENU);
+        for (size_t i = 0; i < count; ++i) input_profiles[target_index].mappings[i] = input_profiles[template_index].mappings[i];
+        return true;
+    }
+
+    bool profiles::apply_input_profile_for_player(int player_index, int template_index) {
+        if (player_index < 0 || static_cast<size_t>(player_index) >= max_num_players_supported ||
+            !valid_profile(template_index) || !players::get_player_is_assigned(player_index)) return false;
+        const auto device = input_profiles[template_index].device;
+        const auto& player = players::get_player(player_index);
+        int target = get_input_profile_for_player(player_index, device);
+        if (device == InputDevice::Controller) {
+            if (player.controller == nullptr) return false;
+            const auto guid = get_guid_from_sdl_controller(player.controller);
+            const int controller_index = get_controller_by_guid(guid);
+            if (controller_index < 0) return false;
+            target = controllers[controller_index].profile_index;
+            const int seed = valid_profile(target) ? target : controller_sp_profile_index;
+            if (!valid_profile(seed)) return false;
+            // A template selection affects this pad, never the shared SP map.
+            target = independent_profile_copy(seed, get_string_from_controller_guid(guid), "Controller");
+            if (!apply_input_profile(template_index, target)) return false;
+            controllers[controller_index].profile_index = target;
+        } else {
+            // Player one can have the automatic merged keyboard fallback even
+            // when its primary assigned device is a pad.
+            if (!player.keyboard_enabled && player.controller != nullptr && !valid_profile(target)) return false;
+            if (!valid_profile(target) || input_profiles[target].custom) {
+                const int seed = valid_profile(target) ? target : keyboard_sp_profile_index;
+                if (!valid_profile(seed)) return false;
+                target = independent_profile_copy(seed, get_mp_keyboard_profile_key(player_index), get_mp_keyboard_profile_name(player_index));
+            }
+            if (!apply_input_profile(template_index, target)) return false;
+        }
+        set_input_profile_for_player(player_index, target, device);
+        return true;
+    }
+
+    bool profiles::rename_input_profile(int profile_index, const std::string& name) {
+        std::string trimmed;
+        if (!is_input_profile_custom(profile_index) || !profile_name(name, trimmed)) return false;
+        for (int i = 0; i < static_cast<int>(input_profiles.size()); ++i) {
+            if (i != profile_index && valid_profile(i) && input_profiles[i].device == input_profiles[profile_index].device &&
+                same_profile_name(input_profiles[i].name, trimmed)) return false;
+        }
+        input_profiles[profile_index].name = trimmed;
+        return true;
+    }
+
+    bool profiles::delete_input_profile(int profile_index) {
+        if (!is_input_profile_custom(profile_index)) return false;
+        detach_profile_users(profile_index);
+        auto& profile = input_profiles[profile_index];
+        auto& indices = input_profile_custom_indices[static_cast<size_t>(profile.device)];
+        indices.erase(std::remove(indices.begin(), indices.end(), profile_index), indices.end());
+        input_profile_key_index_map.erase(profile.key);
+        profile.deleted = true;
+        return true;
     }
 
     int profiles::get_input_profile_count() {
@@ -205,6 +372,8 @@ namespace recompinput {
     }
 
     void profiles::set_input_profile_for_player(int player_index, int profile_index, InputDevice device) {
+        if (player_index < 0 || static_cast<size_t>(player_index) >= max_num_players_supported || !valid_device(device) ||
+            (profile_index != -1 && (!valid_profile(profile_index) || input_profiles[profile_index].device != device))) return;
         switch (device) {
         case InputDevice::Controller:
             players_input_profile_indices[player_index].first = profile_index;
@@ -219,6 +388,7 @@ namespace recompinput {
     }
 
     int profiles::get_input_profile_for_player(int player_index, InputDevice device) {
+        if (player_index < 0 || static_cast<size_t>(player_index) >= max_num_players_supported) return -1;
         switch (device) {
         case InputDevice::Controller:
             return players_input_profile_indices[player_index].first;
@@ -231,6 +401,7 @@ namespace recompinput {
     }
 
     int profiles::add_controller(ControllerGUID guid, int profile_index) {
+        if (!valid_profile(profile_index) || input_profiles[profile_index].device != InputDevice::Controller) return -1;
         const auto key = profiles::get_string_from_controller_guid(guid);
         auto it = controller_guid_index_map.find(key);
         if (it != controller_guid_index_map.end()) {
@@ -492,12 +663,14 @@ namespace recompinput {
         int controller_count = profiles::get_controller_count();
         json config_json{};
         config_json["version"] = profiles::controls_config_version;
-        config_json["profiles"] = std::vector<json>(profile_count);
+        config_json["profiles"] = json::array();
         config_json["controllers"] = std::vector<json>(controller_count);
 
         json &profiles = config_json["profiles"];
         for (int i = 0; i < profile_count; i++) {
-            json &profile = profiles[i];
+            if (!valid_profile(i)) continue;
+            profiles.push_back(json::object());
+            json &profile = profiles.back();
             profile["key"] = profiles::get_input_profile_key(i);
             profile["name"] = profiles::get_input_profile_name(i);
             profile["device"] = profiles::get_input_profile_device(i);
@@ -519,13 +692,7 @@ namespace recompinput {
         return recompinput::save_json_with_backups(path, config_json);
     }
 
-    static void assign_mapping(int profile_index, GameInput input, const std::vector<InputField>& value) {
-        for (size_t binding_index = 0; binding_index < std::min(value.size(), recompinput::num_bindings_per_input); binding_index++) {
-            profiles::set_input_binding(profile_index, input, binding_index, value[binding_index]);
-        }
-    }
-
-    // same as assign_mapping, except will clear unassigned bindings if not in value
+    // Clear unassigned slots as well as replacing the provided bindings.
     static void assign_mapping_complete(int profile_index, GameInput input, const std::vector<InputField>& value) {
         for (size_t binding_index = 0; binding_index < recompinput::num_bindings_per_input; binding_index++) {
             if (binding_index >= value.size()) {
@@ -559,7 +726,7 @@ namespace recompinput {
             // Check if the json object for the given input exists and that it's an array.
             auto find_input_it = mappings_json.find(input_name);
             if (find_input_it == mappings_json.end() || !find_input_it->is_array()) {
-                assign_mapping(
+                assign_mapping_complete(
                     profile_index,
                     cur_input,
                     recompinput::get_default_mapping_for_input(device, cur_input)
@@ -567,6 +734,7 @@ namespace recompinput {
                 continue;
             }
             const json& input_json = *find_input_it;
+            profiles::clear_input_binding(profile_index, cur_input);
 
             // Deserialize all the bindings from the json array (up to the max number of bindings per input).
             for (size_t binding_index = 0; binding_index < std::min(recompinput::num_bindings_per_input, input_json.size()); binding_index++) {
@@ -581,6 +749,10 @@ namespace recompinput {
 
     bool profiles::load_controls_config(const std::filesystem::path& path) {
         profiles::initialize_input_bindings();
+        // Modern files may contain only custom/device maps. Start SP profiles
+        // from registered game/menu defaults before applying saved overrides.
+        assign_all_mappings(profiles::get_sp_keyboard_profile_index(), InputDevice::Keyboard);
+        assign_all_mappings(profiles::get_sp_controller_profile_index(), InputDevice::Controller);
 
         json config_json{};
         if (!recompinput::read_json_with_backups(path, config_json)) {
@@ -601,8 +773,9 @@ namespace recompinput {
                 std::string name = profile.value("name", std::string());
                 InputDevice device = profile.value("device", InputDevice::COUNT);
                 bool custom = profile.value("custom", false);
-                if (!key.empty() && !name.empty() && device != InputDevice::COUNT) {
+                if (!key.empty() && !name.empty() && valid_device(device)) {
                     int profile_index = profiles::add_input_profile(key, name, device, custom);
+                    if (profile_index < 0) continue;
                     if (!load_input_device_from_json(profile, profile_index, device, "mappings")) {
                         assign_all_mappings(profile_index, device);
                     }

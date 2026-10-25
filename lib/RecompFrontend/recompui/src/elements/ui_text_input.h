@@ -17,6 +17,7 @@ namespace recompui {
         TextInput(ResourceId rid, Element *parent, bool text_visible = true);
         void set_text(std::string_view text) override;
         const std::string &get_text();
+        void set_max_length(size_t length) { set_attribute("maxlength", std::to_string(length)); }
         void add_text_changed_callback(std::function<void(const std::string &)> callback);
         void set_focus_callback(std::function<void(bool)> callback);
     };

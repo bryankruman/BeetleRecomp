@@ -155,6 +155,13 @@ protected:
     on_player_bind_callback on_player_bind;
     Element *nav_up_element = nullptr;
     Element *first_nav_element = nullptr;
+    int selected_template_index = -1; // -1 is the built-in device default.
+    int template_device = -1;
+    int template_focus = 0; // Restore selector/management/confirmation after rebuild.
+    bool confirm_template_delete = false;
+    bool template_management_open = false;
+    std::string template_name;
+    std::string template_status;
 
     struct {
         struct {
@@ -165,6 +172,7 @@ protected:
         struct {
             Button *go_back_button = nullptr;
             Button *assign_players_button = nullptr;
+            Button *auto_configure_button = nullptr;
         } right;
     } header_elements;
 
@@ -191,6 +199,7 @@ private:
     void render_body();
     void render_body_players();
     void render_body_mappings();
+    void render_templates();
     void render_control_mappings();
     void render_footer();
 
@@ -208,5 +217,7 @@ public:
 };
 
 extern ConfigPageControls *controls_page;
+// The host supplies device enumeration; this menu remains independent of a game.
+void set_auto_configure_players_callback(std::function<void()> callback);
 
 } // namespace recompui

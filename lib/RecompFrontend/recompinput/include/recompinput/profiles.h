@@ -43,6 +43,16 @@ namespace recompinput {
         const std::string &get_input_profile_name(int profile_index);
         InputDevice get_input_profile_device(int profile_index);
         bool is_input_profile_custom(int profile_index);
+        // Names are trimmed, nonempty, and at most 64 bytes, unique per device
+        // (ASCII case-insensitive). Explicit overwrite can only replace a custom profile.
+        bool save_input_profile_as(int source_index, const std::string& name, int& saved_index, bool overwrite = false);
+        // Copy gameplay bindings by default, preserving the target's menu controls.
+        bool apply_input_profile(int template_index, int target_index, bool include_menu_bindings = false);
+        // Copy to the assigned device's independent working map and persist its association.
+        bool apply_input_profile_for_player(int player_index, int template_index);
+        bool rename_input_profile(int profile_index, const std::string& name);
+        // Preserve live mappings and all indices; built-in profiles cannot be deleted.
+        bool delete_input_profile(int profile_index);
         int get_input_profile_count();
         const std::vector<int> get_indices_for_custom_profiles(InputDevice device);
         void set_input_profile_for_player(int player_index, int profile_index, InputDevice device);
