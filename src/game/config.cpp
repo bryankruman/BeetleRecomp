@@ -3,12 +3,15 @@
 #define _CRT_SECURE_NO_WARNINGS   // std::getenv on MSVC (project also builds with -Wno-everything)
 
 #include "config.hpp"
+#include "config_paths.hpp"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #include "json/json.hpp"   // nlohmann::json (vendored by ultramodern; same header config.hpp uses)
 
@@ -17,6 +20,10 @@
 #       define WIN32_LEAN_AND_MEAN
 #   endif
 #   include <Windows.h>
+#elif defined(__APPLE__)
+#   include <mach-o/dyld.h>
+#   include <pwd.h>
+#   include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -33,6 +40,18 @@ fs::path executable_dir() {
         return fs::current_path();
     }
     return fs::path(buf, buf + n).parent_path();
+#elif defined(__APPLE__)
+    // Finder does not launch from the executable directory, and macOS has no
+    // /proc/self/exe. Resolve the actual binary before looking for portable.txt.
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> path(size);
+    if (size != 0 && _NSGetExecutablePath(path.data(), &size) == 0) {
+        std::error_code ec;
+        const fs::path resolved = fs::weakly_canonical(path.data(), ec);
+        return (ec ? fs::path(path.data()) : resolved).parent_path();
+    }
+    return fs::current_path();
 #else
     std::error_code ec;
     fs::path p = fs::read_symlink("/proc/self/exe", ec);
@@ -43,16 +62,47 @@ fs::path executable_dir() {
 #endif
 }
 
+#if defined(__APPLE__)
+fs::path macos_home_directory() {
+    if (const char* home = std::getenv("HOME"); home && *home) return home;
+    // LaunchServices normally provides HOME, but the account database remains
+    // authoritative when a launcher strips the environment. Never default a
+    // normal Mac installation's saves to Finder's possibly unwritable cwd.
+    std::vector<char> buffer(4096);
+    struct passwd account{};
+    struct passwd* result = nullptr;
+    int error;
+    while ((error = getpwuid_r(getuid(), &account, buffer.data(), buffer.size(), &result)) == ERANGE &&
+           buffer.size() < 1024 * 1024) buffer.resize(buffer.size() * 2);
+    if (error == 0 && result && account.pw_dir && *account.pw_dir) return account.pw_dir;
+    return {};
+}
+#endif
+
 fs::path compute_app_config_directory() {
     std::error_code ec;
     const fs::path exe_dir = executable_dir();
     if (fs::exists(exe_dir / "portable.txt", ec)) {
         return exe_dir;
     }
+#if defined(__APPLE__)
+    const fs::path bundle_parent = bar::config::paths::macos_bundle_parent(exe_dir);
+    if (!bundle_parent.empty() && fs::exists(bundle_parent / "portable.txt", ec)) return bundle_parent;
+#endif
 #if defined(_WIN32)
     if (const char* local = std::getenv("LOCALAPPDATA")) {
         return fs::path(local) / "BeetleRecomp";
     }
+#elif defined(__APPLE__)
+    const fs::path home = macos_home_directory();
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    const fs::path directory = bar::config::paths::macos_directory(
+        home, xdg ? fs::path(xdg) : fs::path{},
+        [](const fs::path& candidate) {
+            std::error_code error;
+            return fs::is_directory(candidate, error);
+        });
+    if (!directory.empty()) return directory;
 #else
     if (const char* xdg = std::getenv("XDG_CONFIG_HOME")) {
         return fs::path(xdg) / "BeetleRecomp";

@@ -58,11 +58,14 @@ static std::filesystem::path g_default_rom_path;
 
 #define SDL_MAIN_HANDLED                      // we provide our own main()/entry; don't let SDL hijack it
 #include <SDL.h>
+#if defined(_WIN32) || defined(__APPLE__)
+#include <SDL_syswm.h> // Native HWND/Cocoa window. Avoid X11's conflicting macros on Linux.
+#endif
+#ifdef __APPLE__
+#include <SDL_metal.h>
+static SDL_MetalView g_metal_view = nullptr;
+#endif
 #ifdef _WIN32
-#include <SDL_syswm.h>                        // SDL_GetWindowWMInfo -> native HWND. Windows only: on Linux the
-                                             //   WindowHandle is the SDL_Window* itself (see renderer_context.hpp),
-                                             //   and this header would drag in <X11/X.h>, whose `None` macro
-                                             //   collides with our enum values (SaveType::None, Pak::None, ...).
 #include <timeapi.h>                          // timeBeginPeriod (1ms timer resolution); links winmm
 #endif
 
@@ -276,6 +279,11 @@ static ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callba
         // path). The modal dialog above has already been dismissed by the user by this point.
         std::_Exit(EXIT_FAILURE);
 #endif
+#if defined(__APPLE__)
+        bar_user_message(SDL_MESSAGEBOX_ERROR,
+            "Could not create the macOS Metal window. See the terminal log for the SDL error.");
+        std::_Exit(EXIT_FAILURE);
+#endif
         return {};
     }
 #ifdef BEETLE_ENABLE_UI
@@ -295,6 +303,23 @@ static ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callba
         return {};
     }
     return ultramodern::renderer::WindowHandle{ wm_info.info.win.window, GetCurrentThreadId() };
+#elif defined(__APPLE__)
+    // RT64 needs the Cocoa window and CAMetalLayer, not the SDL_Window or NSView.
+    // Create the view on the SDL/main thread and retain it until the renderer has stopped.
+    SDL_SysWMinfo wm_info{};
+    SDL_VERSION(&wm_info.version);
+    if (SDL_GetWindowWMInfo(g_window, &wm_info) != SDL_TRUE ||
+        wm_info.subsystem != SDL_SYSWM_COCOA || wm_info.info.cocoa.window == nullptr) {
+        bar_user_message(SDL_MESSAGEBOX_ERROR, "Could not obtain the macOS Cocoa window.");
+        std::_Exit(EXIT_FAILURE);
+    }
+    g_metal_view = SDL_Metal_CreateView(g_window);
+    void* layer = g_metal_view ? SDL_Metal_GetLayer(g_metal_view) : nullptr;
+    if (layer == nullptr) {
+        bar_user_message(SDL_MESSAGEBOX_ERROR, "Could not create the macOS Metal rendering layer.");
+        std::_Exit(EXIT_FAILURE);
+    }
+    return {wm_info.info.cocoa.window, layer};
 #else
     // Linux/Android: WindowHandle is the SDL_Window* itself (RT64 derives the native handle from it).
     return g_window;
@@ -1257,6 +1282,13 @@ int main(int argc, char** argv) {
     // Blocks until the game exits.
     recomp::start(config);
     bar_stop_preempt_timer();
+#ifdef __APPLE__
+    // recomp::start joins the graphics threads before returning; the layer is no longer in use.
+    if (g_metal_view) SDL_Metal_DestroyView(g_metal_view);
+    g_metal_view = nullptr;
+    if (g_window) SDL_DestroyWindow(g_window);
+    g_window = nullptr;
+#endif
     if (std::getenv("BAR_TEST_QUIT_AFTER_MS") != nullptr) {
         std::fprintf(stderr, "[BAR_TEST_QUIT_AFTER_MS] runtime returned; shutdown completed\n");
     }

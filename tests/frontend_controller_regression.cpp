@@ -1,4 +1,6 @@
 #define SDL_MAIN_HANDLED
+#include "../lib/RecompFrontend/recompui/lib/RmlUi/Backends/RmlUi_SDL_shortcuts.h"
+#include "game/config_paths.hpp"
 #include <iostream>
 #include <stdexcept>
 #include <unordered_map>
@@ -11,6 +13,27 @@ static void require(bool value, const char* message) {
 }
 int main() {
     try {
+        require(RmlSDL::UsesTextShortcutModifier(KMOD_LGUI, true), "left Command must support Mac template text shortcuts");
+        require(RmlSDL::UsesTextShortcutModifier(KMOD_RGUI, true), "right Command must support Mac template text shortcuts");
+        require(RmlSDL::UsesTextShortcutModifier(KMOD_LCTRL, false), "Ctrl shortcuts must remain enabled off Mac");
+        require(!RmlSDL::UsesTextShortcutModifier(KMOD_LGUI, false), "Windows key must not become Ctrl");
+        require(!RmlSDL::UsesTextShortcutModifier(KMOD_LALT, true), "Mac Option must not become a clipboard shortcut");
+        namespace fs = std::filesystem;
+        const fs::path home = fs::path("Users") / "Beetle Player";
+        require(bar::config::paths::macos_bundle_parent(fs::path("Applications") / "BeetleRecomp.app" / "Contents" / "MacOS") == fs::path("Applications"), "bundle portable marker must be resolved beside the app");
+        require(bar::config::paths::macos_bundle_parent(fs::path("Applications") / "BeetleRecomp" / "Contents" / "MacOS").empty(), "non-bundle layout must not use parent portable markers");
+        require(bar::config::paths::macos_bundle_parent(fs::path("Applications") / "BeetleRecomp.app" / "Other" / "MacOS").empty(), "nonstandard bundle layout must not use parent portable markers");
+        require(bar::config::paths::macos_bundle_parent(fs::path("Downloads")).empty(), "loose executable must retain its own portable directory");
+        const auto native = home / "Library" / "Application Support" / "BeetleRecomp";
+        const auto legacy_config = home / ".config" / "BeetleRecomp";
+        const fs::path xdg = "custom-config";
+        using bar::config::paths::macos_directory;
+        require(macos_directory(home, {}, [](const fs::path&) { return false; }) == native, "new Mac config must use Application Support");
+        require(macos_directory(home, {}, [&](const fs::path& p) { return p == legacy_config; }) == legacy_config, "Mac upgrade hid legacy saves");
+        require(macos_directory(home, xdg, [&](const fs::path& p) { return p == xdg / "BeetleRecomp"; }) == xdg / "BeetleRecomp", "Mac upgrade hid XDG saves");
+        require(macos_directory(home, xdg, [](const fs::path&) { return true; }) == native, "existing native Mac directory must win");
+        require(macos_directory({}, xdg, [](const fs::path&) { return false; }) == xdg / "BeetleRecomp", "missing HOME should retain explicit XDG fallback");
+        require(macos_directory({}, {}, [](const fs::path&) { return false; }).empty(), "missing environment should defer to cwd fallback");
         using namespace recompinput;
         bar::frontend::register_controller_defaults();
         const auto mapping = [](GameInput input) -> const std::vector<InputField>& {
@@ -88,7 +111,7 @@ int main() {
         preferred[0].controller = "expected-key";
         resolve_legacy(preferred, legacy, expected_serial);
         require(preferred[2].controller == "expected-key" && preferred[0].controller.empty(), "reclaimed reservation duplicated an automatically assigned pad");
-        std::cout << "PASS: BAR defaults, menu bindings, automatic discovery, explicit keyboard seat, imported reservations and manual hotplug policy\n";
+        std::cout << "PASS: macOS shortcuts and config migration, BAR defaults, menu bindings, automatic discovery, explicit keyboard seat, imported reservations and manual hotplug policy\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';

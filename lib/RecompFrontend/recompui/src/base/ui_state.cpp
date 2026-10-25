@@ -1,10 +1,9 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
-#include <SDL_video.h>
-#else
-#include <SDL2/SDL_video.h>
 #endif
+#include <SDL_video.h>
 #include <chrono>
+#include "ui_pixel_coordinates.h"
 
 #include "rt64_render_hooks.h"
 
@@ -520,7 +519,17 @@ void init_hook(plume::RenderInterface* interface, plume::RenderDevice* device) {
 moodycamel::ConcurrentQueue<SDL_Event> ui_event_queue{};
 
 void recompui::queue_event(const SDL_Event& event) {
-    ui_event_queue.enqueue(event);
+    // SDL mouse/resize events use logical window coordinates. RmlUi renders in drawable
+    // pixels, which differ on Retina displays. Convert on the window-owning thread.
+    SDL_Event pixel_event = event;
+    if (window && (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN ||
+                   event.type == SDL_MOUSEBUTTONUP || event.type == SDL_WINDOWEVENT)) {
+        int logical_width, logical_height, pixel_width, pixel_height;
+        SDL_GetWindowSize(window, &logical_width, &logical_height);
+        SDL_GetWindowSizeInPixels(window, &pixel_width, &pixel_height);
+        recompui::detail::event_to_pixels(pixel_event, logical_width, logical_height, pixel_width, pixel_height);
+    }
+    ui_event_queue.enqueue(pixel_event);
 }
 
 bool recompui::try_deque_event(SDL_Event& out) {
@@ -798,6 +807,10 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
             // Send the event to RmlUi if this type of event is being captured.
             if (is_mouse_input) {
                 if (context_capturing_mouse) {
+                    // A click can arrive without a preceding move (first click after focus).
+                    if (cur_event.type == SDL_MOUSEBUTTONDOWN || cur_event.type == SDL_MOUSEBUTTONUP) {
+                        ui_state->context->ProcessMouseMove(cur_event.button.x, cur_event.button.y, RmlSDL::GetKeyModifierState());
+                    }
                     RmlSDL::InputEventHandler(ui_state->context, cur_event);
                 }
             }

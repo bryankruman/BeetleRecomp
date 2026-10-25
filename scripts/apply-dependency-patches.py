@@ -20,7 +20,8 @@ def main():
     # an already reviewed/dirty dependency without resetting or replaying it.
     for name, dependency in (("N64ModernRuntime", "N64ModernRuntime"),
                              ("rt64", "rt64"), ("N64Recomp", "N64Recomp"),
-                             ("rt64-windows-dxil", "rt64")):
+                             ("rt64-windows-dxil", "rt64"),
+                             ("N64ModernRuntime-code-memory", "N64ModernRuntime")):
         directory = ROOT / "lib" / dependency
         patch = ROOT / "scripts" / "dependency-patches" / (name + ".patch")
         if git(directory, "apply", "--reverse", "--check", str(patch)).returncode == 0:

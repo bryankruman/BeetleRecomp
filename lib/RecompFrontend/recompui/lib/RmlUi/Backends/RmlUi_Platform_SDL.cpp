@@ -27,6 +27,7 @@
  */
 
 #include "RmlUi_Platform_SDL.h"
+#include "RmlUi_SDL_shortcuts.h"
 #include <RmlUi/Core/Context.h>
 #include <RmlUi/Core/Input.h>
 #include <RmlUi/Core/StringUtilities.h>
@@ -289,7 +290,12 @@ int RmlSDL::GetKeyModifierState()
 
 	int retval = 0;
 
-	if (sdl_mods & KMOD_CTRL)
+#if defined(__APPLE__)
+	constexpr bool macos_shortcuts = true;
+#else
+	constexpr bool macos_shortcuts = false;
+#endif
+	if (UsesTextShortcutModifier(sdl_mods, macos_shortcuts))
 		retval |= Rml::Input::KM_CTRL;
 
 	if (sdl_mods & KMOD_SHIFT)

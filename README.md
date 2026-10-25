@@ -1,5 +1,7 @@
 # BeetleRecomp
 
+Apple Silicon preparation and remaining native qualification are tracked in [the macOS review](docs/MACOS_REVIEW.md). A fully qualified M1 build is not yet available.
+
 A work-in-progress **native PC port of _Beetle Adventure Racing!_ (N64, USA)** built by
 **static recompilation** with the [N64Recomp][N64Recomp] toolchain — the same approach
 behind [Zelda 64: Recompiled](https://github.com/Zelda64Recomp/Zelda64Recomp).

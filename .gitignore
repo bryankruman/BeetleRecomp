@@ -55,3 +55,6 @@ __pycache__/
 
 # Private verified instruction bindings; never commit or publish.
 /elf/*.original-bound.toml
+
+# Native Apple Silicon builds
+/build-macos/

@@ -18,6 +18,15 @@
 cmake_minimum_required(VERSION 3.20)
 project(BeetleRecomp LANGUAGES C CXX)
 
+# Frontend Cocoa helpers live outside RT64's CMake directory. Enable their
+# languages here so sibling targets inherit the Objective-C++ toolchain.
+if (APPLE)
+    enable_language(OBJC OBJCXX)
+    set(CMAKE_OBJCXX_STANDARD 20)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+    include(cmake/MacOSSupport.cmake)
+endif()
+
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -64,6 +73,11 @@ if (WIN32)
     include(cmake/WindowsShaderLibraries.cmake)
 endif()
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/rt64 ${CMAKE_BINARY_DIR}/rt64)
+if (APPLE)
+    # Pinned RT64 disables Plume's Retina option in its child scope. The frontend
+    # uses drawable pixels, so the Metal swapchain must use the same backing scale.
+    target_compile_definitions(plume PRIVATE PLUME_APPLE_RETINA_ENABLED)
+endif()
 # RT64 vendors SDL2 2.26.3, whose SDL_endian.h manually defines _m_prefetch (an old Clang-11
 # workaround). clang 17+ provides it as a builtin -> "definition of builtin function" error.
 # Defining SDL's own guard macro makes it skip that definition and use the compiler builtin.
@@ -115,6 +129,8 @@ if (BEETLE_ENABLE_FRONTEND)
         set(DXC "LD_LIBRARY_PATH=${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/x64" "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc-linux")
     elseif (CMAKE_SYSTEM_NAME MATCHES "Linux")
         set(DXC "LD_LIBRARY_PATH=${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/x64" "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc-linux")
+    elseif (APPLE)
+        beetle_macos_shader_compiler(DXC "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/dxc" "${CMAKE_HOST_SYSTEM_PROCESSOR}")
     endif()
 
     set(RECOMP_FRONTEND_N64MODERNRUNTIME_PATH ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime CACHE PATH "" FORCE)
@@ -310,6 +326,18 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
         "-latomic -static-libstdc++" ${CMAKE_DL_LIBS} Threads::Threads SDL2::SDL2)
 endif()
 
+# ---- macOS: native Metal rendering, Cocoa frontend and Finder app bundle ----
+if (APPLE)
+    find_package(SDL2 REQUIRED)
+    target_include_directories(BeetleRecomp PRIVATE ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(BeetleRecomp PRIVATE SDL2::SDL2 "-framework Cocoa" "-framework Foundation")
+    set_target_properties(BeetleRecomp PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.beetlerecomp.BeetleRecomp"
+        MACOSX_BUNDLE_BUNDLE_NAME "BeetleRecomp"
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/cmake/BeetleRecomp-Info.plist.in")
+endif()
+
 # ---- Link the runtime + generated code ----
 target_link_libraries(BeetleRecomp PRIVATE
     RecompiledFuncs
@@ -358,16 +386,22 @@ if (BEETLE_ENABLE_FRONTEND)
     # This mirrors wave-race-64-recomp, this project's reference port, so the two launchers draw
     # their text from the same set of faces.
     set(BEETLE_RMLUI_ASSETS "${CMAKE_SOURCE_DIR}/lib/RecompFrontend/recompui/lib/RmlUi/Samples/assets")
+    if (APPLE)
+        # NSBundle.resourcePath is Contents/Resources, not Contents/MacOS.
+        set(BEETLE_ASSET_DESTINATION "$<TARGET_BUNDLE_CONTENT_DIR:BeetleRecomp>/Resources/assets")
+    else()
+        set(BEETLE_ASSET_DESTINATION "$<TARGET_FILE_DIR:BeetleRecomp>/assets")
+    endif()
     add_custom_command(TARGET BeetleRecomp POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/assets/ui"
-                "$<TARGET_FILE_DIR:BeetleRecomp>/assets"
+                "${BEETLE_ASSET_DESTINATION}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${BEETLE_RMLUI_ASSETS}/LatoLatin-Regular.ttf"
                 "${BEETLE_RMLUI_ASSETS}/LatoLatin-Bold.ttf"
                 "${BEETLE_RMLUI_ASSETS}/LatoLatin-Italic.ttf"
                 "${BEETLE_RMLUI_ASSETS}/NotoEmoji-Regular.ttf"
-                "$<TARGET_FILE_DIR:BeetleRecomp>/assets"
+                "${BEETLE_ASSET_DESTINATION}"
         COMMENT "Staging RecompFrontend assets (stylesheet, fonts, icons)")
 endif()
 # ---------------------------------------------------------------------------

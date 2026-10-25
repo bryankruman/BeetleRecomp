@@ -218,6 +218,9 @@ RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::WindowHandle win
     RT64::Application::Core core{};
 #if defined(_WIN32)
     core.window = window_handle.window;
+#elif defined(__APPLE__)
+    core.window.window = window_handle.window;
+    core.window.view = window_handle.view;
 #else
     core.window = window_handle;
 #endif

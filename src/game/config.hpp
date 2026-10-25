@@ -21,8 +21,11 @@ namespace bar::config {
 
 // Per-user config/data directory, created if missing. Resolution order:
 //   1. If a file named "portable.txt" sits next to the executable -> the executable's directory
-//      (portable install; settings + saves stay with the app).
+//      (portable install; settings + saves stay with the app). On macOS a marker
+//      beside the .app bundle is also supported, saving beside that bundle.
 //   2. Windows:  %LOCALAPPDATA%\BeetleRecomp\
+//      macOS:    ~/Library/Application Support/BeetleRecomp
+//                (keeps an existing XDG or ~/.config directory from older builds)
 //      Linux:    $XDG_CONFIG_HOME/BeetleRecomp  (else ~/.config/BeetleRecomp)
 //   3. Fallback: the current working directory.
 // The result is cached after the first call.

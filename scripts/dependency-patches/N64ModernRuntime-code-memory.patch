@@ -1,0 +1,120 @@
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -2,6 +2,8 @@
+ #include <fstream>
+ #include <sstream>
+ #include <functional>
++#include <stdexcept>
++#include <utility>
+ 
+ #include "librecomp/files.hpp"
+ #include "librecomp/mods.hpp"
+@@ -149,26 +151,31 @@
+ 
+ void unprotect(void* target_func, uint64_t* old_flags) {
+     DWORD old_flags_dword;
+-    BOOL result = VirtualProtect(target_func,
+-        16,
+-        PAGE_READWRITE,
+-        &old_flags_dword);
++    if (!VirtualProtect(target_func, 16, PAGE_READWRITE, &old_flags_dword)) {
++        throw std::runtime_error("Cannot make code-mod function writable");
++    }
+     *old_flags = old_flags_dword;
+-    (void)result;
+ }
+ 
+ void protect(void* target_func, uint64_t old_flags) {
+     DWORD dummy_old_flags;
+-    BOOL result = VirtualProtect(target_func,
+-        16,
+-        static_cast<DWORD>(old_flags),
+-        &dummy_old_flags);
+-    (void)result;
++    if (!VirtualProtect(target_func, 16, static_cast<DWORD>(old_flags), &dummy_old_flags)) {
++        throw std::runtime_error("Cannot restore code-mod function protection");
++    }
++    if (!FlushInstructionCache(GetCurrentProcess(), target_func, 16)) {
++        throw std::runtime_error("Cannot synchronize code-mod instructions");
++    }
+ }
+ #else
+ #  include <unistd.h>
+ #  include <dlfcn.h>
+ #  include <sys/mman.h>
++#  if defined(__APPLE__)
++#    include <mach/mach.h>
++#    include <mach/mach_vm.h>
++#    include <mach/mach_error.h>
++#    include <libkern/OSCacheControl.h>
++#  endif
+ 
+ class recomp::mods::DynamicLibrary {
+ public:
+@@ -227,25 +234,52 @@
+     uint32_t api_version;
+ };
+ 
++// A replacement occupies at most 16 bytes. Include the following page if an
++// entry point falls near a boundary; Apple Silicon commonly uses 16 KiB pages.
++std::pair<uintptr_t, size_t> patch_page_range(void* target_func) {
++    const uintptr_t address = reinterpret_cast<uintptr_t>(target_func);
++    const size_t page_size = static_cast<size_t>(getpagesize());
++    const uintptr_t first = address / page_size * page_size;
++    const uintptr_t end = (address + 15) / page_size * page_size + page_size;
++    return {first, static_cast<size_t>(end - first)};
++}
++
+ void unprotect(void* target_func, uint64_t* old_flags) {
+-    // Align the address to a page boundary.
+-    uintptr_t page_start = (uintptr_t)target_func;
+-    int page_size = getpagesize();
+-    page_start = (page_start / page_size) * page_size;
+-
+-    int result = mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE);
++    const auto [first, length] = patch_page_range(target_func);
++#if defined(__APPLE__)
++    // Executable image pages need a private copy before their instructions can
++    // be replaced. Never request writable and executable protection together.
++    const auto result = mach_vm_protect(mach_task_self(), first, length, false,
++        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
++    if (result != KERN_SUCCESS) {
++        throw std::runtime_error(std::string("Cannot make code-mod function writable: ") + mach_error_string(result));
++    }
++#else
++    if (mprotect(reinterpret_cast<void*>(first), length, PROT_READ | PROT_WRITE) != 0) {
++        throw std::runtime_error("Cannot make code-mod function writable");
++    }
++#endif
+     *old_flags = 0;
+-    (void)result;
+ }
+ 
+ void protect(void* target_func, uint64_t old_flags) {
+-    // Align the address to a page boundary.
+-    uintptr_t page_start = (uintptr_t)target_func;
+-    int page_size = getpagesize();
+-    page_start = (page_start / page_size) * page_size;
+-
+-    int result = mprotect((void*)page_start, page_size, PROT_READ | PROT_EXEC);
+-    (void)result;
++    (void)old_flags;
++    const auto [first, length] = patch_page_range(target_func);
++#if defined(__APPLE__)
++    const auto result = mach_vm_protect(mach_task_self(), first, length, false,
++        VM_PROT_READ | VM_PROT_EXECUTE);
++    if (result != KERN_SUCCESS) {
++        throw std::runtime_error(std::string("Cannot restore code-mod function protection: ") + mach_error_string(result));
++    }
++    // ARM instruction caches are not coherent with writes through the data cache.
++    // Both replacement and unload/restoration pass through this function.
++    sys_icache_invalidate(target_func, 16);
++#else
++    if (mprotect(reinterpret_cast<void*>(first), length, PROT_READ | PROT_EXEC) != 0) {
++        throw std::runtime_error("Cannot restore code-mod function protection");
++    }
++    __builtin___clear_cache(static_cast<char*>(target_func), static_cast<char*>(target_func) + 16);
++#endif
+ }
+ #endif
+ 

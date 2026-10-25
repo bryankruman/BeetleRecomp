@@ -1,7 +1,7 @@
 # Building BeetleRecomp
 
 The host application uses CMake, Ninja and a C++20 compiler: clang-cl with the Windows
-SDK on Windows, or Clang on Linux. RT64 uses D3D12 on Windows and Vulkan on Linux.
+SDK on Windows, Clang on Linux, or Apple Clang on macOS. RT64 uses D3D12 on Windows, Vulkan on Linux, and native Metal on macOS.
 The MIPS viewport patches use a separate MIPS-capable **LLVM 18** Clang/LLD toolchain.
 Those patches are required for the integrated release's widescreen behavior.
 
@@ -134,3 +134,78 @@ Heavy builds/searches for this workstation belong on the isolated pve worker; Ne
 requires approval for fleet changes; this campaign has a scoped worker-build authorization. Package with `scripts/package-release.ps1`,
 including corresponding source and license notices. Never package user ROMs, saves,
 configurations or private credentials.
+
+
+## Apple Silicon / M1 MacBook Air
+
+The macOS source path now creates `BeetleRecomp.app`, compiles the frontend's Metal
+shaders with the pinned native ARM64 compiler, and stages fonts/styles/icons under
+`Contents/Resources/assets`, where the Cocoa frontend actually reads them. This
+is source preparation, not a passed macOS release qualification. A native Mac
+build and the runtime checklist in `docs/MACOS_REVIEW.md` remain required.
+
+Use a native ARM64 terminal and an Xcode installation with working `metal` and
+`metallib` tools (`xcrun --sdk macosx --find metal`). Install CMake, Ninja, Python 3,
+SDL2 development files and Freetype using your chosen package manager before
+building. Select Xcode in the normal developer-tools configuration if necessary.
+The wrapper installs nothing. Use the existing verified generated game/patch C;
+Apple's Clang need not provide the separate MIPS backend needed to regenerate it.
+
+```bash
+bash scripts/setup.sh
+# Generate or privately transfer verified RecompiledFuncs/ and RecompiledPatches/
+# using the original-binding and fixup procedure above, then:
+BAR_JOBS=4 bash scripts/build-macos.sh
+open build-macos/BeetleRecomp.app
+```
+
+The wrapper refuses Rosetta shells and missing Metal tools/generated patches.
+`BAR_BUILD_DIR` and `BAR_JOBS` override its build directory and parallelism.
+For this campaign, do not run a full build on Skytech; the approved Linux worker
+cannot validate Cocoa, Apple Clang, Metal, or the M1 GPU without an Apple SDK/host.
+
+The development `.app` links local SDL2/Freetype and their dependencies. It is **not
+self-contained** for copying to another Mac until those libraries have been bundled,
+relocated and signed. Do not publish a development app as a portable release.
+Build on the target Mac for personal testing, or finish native package qualification
+before distributing it. A release must include dependency/font licenses and matching
+source while excluding all ROMs, ELFs, saves and user configuration. No notarized or
+signed macOS release has been produced by this Windows review.
+
+After a native build, stage a self-contained app for personal testing with:
+
+```bash
+python3 scripts/package-macos.py --version 0.3.0-mac-test \
+  --sdl-license /path/to/SDL2-COPYING.txt \
+  --dependency-licenses /path/to/actual-macos-dependency-notices
+```
+
+This opt-in packager copies only the executable, Info.plist and UI assets into a
+new `dist/` folder, collects vendored/SDL licenses plus the supplied notices for
+the actual external SDL/Freetype/transitive-library builds, uses CMake BundleUtilities to relocate the
+required dynamic libraries, rejects unresolved/Homebrew dependencies and non-ARM64
+libraries, records the highest minimum macOS version required by any bundled ARM64
+image in Info.plist, then signs nested code and the app ad-hoc. It verifies the signature
+before creating the zip. Existing outputs are never overwritten. This is not
+Developer ID signing or notarization; macOS may still require the normal explicit
+user approval for downloaded unsigned software. Do not disable system security.
+The provided notice directory must cover the exact external library builds; the
+packager checks text/file boundaries, not legal completeness. The script has not
+been executed on macOS in this review. Distribution still needs
+its native runtime checks and exact corresponding source obligations satisfied.
+
+Run `python3 tests/test_macos_build.py` for host-tool selection, missing-tool rejection
+and bundle resource contract checks. These do not compile or execute Apple code.
+
+For a native check of Retina coordinate conversion after building, run:
+
+```bash
+c++ -std=c++20 $(sdl2-config --cflags) \
+  -Ilib/RecompFrontend/recompui/src tests/retina_coordinates_regression.cpp \
+  -o build-macos/retina_coordinates_regression
+./build-macos/retina_coordinates_regression
+```
+
+The minimum supported macOS version follows the actual linked SDK/dependency
+artifacts. The packager derives it from every bundled ARM64 Mach-O image; this
+source review does not promise support for a particular older macOS release.
