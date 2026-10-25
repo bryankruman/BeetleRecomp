@@ -165,8 +165,25 @@ namespace recompinput {
         }
     }
 
+    static std::function<bool(SDL_GameController*, GameInput, std::vector<InputField>&)> controller_defaults;
+
+    void profiles::set_controller_default_mapping_callback(std::function<bool(SDL_GameController*, GameInput, std::vector<InputField>&)> callback) {
+        controller_defaults = std::move(callback);
+    }
+
+    static std::vector<InputField> default_mappings(int profile_index, InputDevice device, GameInput input) {
+        auto mappings = recompinput::get_default_mapping_for_input(device, input);
+        if (device != InputDevice::Controller || !controller_defaults) return mappings;
+        for (int i = 0; i < SDL_NumJoysticks(); ++i) {
+            auto* pad = SDL_GameControllerFromInstanceID(SDL_JoystickGetDeviceInstanceID(i));
+            if (pad != nullptr && profiles::get_controller_profile_index_from_sdl_controller(pad) == profile_index &&
+                controller_defaults(pad, input, mappings)) break;
+        }
+        return mappings;
+    }
+
     void profiles::reset_input_binding(int profile_index, InputDevice device, GameInput input) {
-        std::vector<InputField> new_mappings = recompinput::get_default_mapping_for_input(device, input);
+        std::vector<InputField> new_mappings = default_mappings(profile_index, device, input);
         for (size_t binding_index = 0; binding_index < recompinput::num_bindings_per_input; binding_index++) {
             if (binding_index >= new_mappings.size()) {
                 profiles::set_input_binding(profile_index, input, binding_index, InputField{});
@@ -199,7 +216,7 @@ namespace recompinput {
                 continue;
             }
 
-            auto &new_mappings = recompinput::get_default_mapping_for_input(device, input);
+            auto new_mappings = default_mappings(profile_index, device, input);
             for (size_t binding_index = 0; binding_index < recompinput::num_bindings_per_input; binding_index++) {
                 if (binding_index >= new_mappings.size()) {
                     profiles::set_input_binding(profile_index, input, binding_index, InputField{});

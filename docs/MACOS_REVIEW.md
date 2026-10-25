@@ -68,8 +68,16 @@ passing a short test does not establish sustained performance. Native-resolution
 MSAA and supersampling limits depend on the GPU and chosen settings; unlimited
 frame rate or every quality setting at maximum is not a compatibility promise.
 
-The user's actual macOS version and controller models/transport were requested
-and remain to be recorded. No remote Mac access was established in this review.
+The intended controller is the raphnet ADAP-2XN64-USB dual adapter with original
+N64 controllers. Its verified default firmware layouts, separate player profiles,
+menu chord, and bounded rumble fallback are implemented; see CONTROLLER_SUPPORT.md.
+The actual macOS version remains unknown. The deliberate build baseline is macOS
+13.0 (Ventura), with intended coverage of 13, 14, 15 and 26 on Apple Silicon.
+The package checks every bundled ARM64 library against that baseline and refuses
+a library that needs a newer OS. This prevents silently narrowing compatibility;
+it is not a substitute for running the same package on those macOS releases.
+macOS 11/12 are outside this build policy because the renderer uses Metal 3 GPU
+address features. No remote Mac access was established in this review.
 The decomp campaign and its automation remain paused.
 
 ## Primary references

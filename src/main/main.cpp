@@ -58,6 +58,9 @@ static std::filesystem::path g_default_rom_path;
 
 #define SDL_MAIN_HANDLED                      // we provide our own main()/entry; don't let SDL hijack it
 #include <SDL.h>
+#ifdef BEETLE_ENABLE_FRONTEND
+#include "recompinput/rumble.h"
+#endif
 #if defined(_WIN32) || defined(__APPLE__)
 #include <SDL_syswm.h> // Native HWND/Cocoa window. Avoid X11's conflicting macros on Linux.
 #endif
@@ -1282,6 +1285,10 @@ int main(int argc, char** argv) {
     // Blocks until the game exits.
     recomp::start(config);
     bar_stop_preempt_timer();
+#ifdef BEETLE_ENABLE_FRONTEND
+    // Stop and close adapter effects while their joysticks and SDL are still alive.
+    recompinput::release_all_controller_rumble();
+#endif
 #ifdef __APPLE__
     // recomp::start joins the graphics threads before returning; the layer is no longer in use.
     if (g_metal_view) SDL_Metal_DestroyView(g_metal_view);

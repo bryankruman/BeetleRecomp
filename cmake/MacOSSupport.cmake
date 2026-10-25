@@ -1,3 +1,11 @@
+# Metal 3 / buffer GPU addresses are the baseline for the M1 renderer.
+# Call before project() so compiler checks use the same minimum as the app.
+function(beetle_validate_macos_target value)
+    if (NOT value MATCHES "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$" OR value VERSION_LESS "13.0")
+        message(FATAL_ERROR "BeetleRecomp requires a numeric macOS deployment target >= 13.0, got '${value}'")
+    endif()
+endfunction()
+
 # These tools run on the build host, independently of the target architecture.
 function(beetle_macos_shader_compiler output dxc_root host_processor)
     if (host_processor MATCHES "^(arm64|aarch64)$")

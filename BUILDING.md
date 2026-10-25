@@ -161,6 +161,21 @@ open build-macos/BeetleRecomp.app
 
 The wrapper refuses Rosetta shells and missing Metal tools/generated patches.
 `BAR_BUILD_DIR` and `BAR_JOBS` override its build directory and parallelism.
+The default deployment target is **macOS 13.0 Ventura**, independent of the build
+Mac's OS. This is a compatibility target, not a claim of completed native testing.
+It covers the intended 13 (Ventura), 14 (Sonoma), 15 (Sequoia), and 26 (Tahoe)
+release families without making a new app for each OS. Apple lists Metal 3 on
+[M1 with macOS Ventura 13 or later](https://support.apple.com/en-us/102894).
+The renderer uses Metal 3 buffer GPU addresses; macOS 11 and 12 are outside this
+baseline. Later macOS releases still need qualification when they appear.
+
+`BAR_MACOS_MIN_VERSION` can deliberately raise the minimum (for example `14.0`),
+but cannot lower it below 13.0. It sets the same deployment target for C/C++,
+Objective-C++, Metal shaders, and the app's Info.plist. A newer Xcode SDK is fine;
+the SDK version and the oldest runnable OS are different settings. The dependency
+patch preserves this parent target instead of RT64 replacing it with 10.15.
+External SDL2/Freetype and every transitive dylib must also be built for the chosen
+minimum; installing a recent Homebrew bottle alone does not establish that.
 For this campaign, do not run a full build on Skytech; the approved Linux worker
 cannot validate Cocoa, Apple Clang, Metal, or the M1 GPU without an Apple SDK/host.
 
@@ -184,8 +199,12 @@ This opt-in packager copies only the executable, Info.plist and UI assets into a
 new `dist/` folder, collects vendored/SDL licenses plus the supplied notices for
 the actual external SDL/Freetype/transitive-library builds, uses CMake BundleUtilities to relocate the
 required dynamic libraries, rejects unresolved/Homebrew dependencies and non-ARM64
-libraries, records the highest minimum macOS version required by any bundled ARM64
-image in Info.plist, then signs nested code and the app ad-hoc. It verifies the signature
+libraries, and checks every ARM64 Mach-O image against the explicit deployment
+baseline before signing. By default the package must run on macOS 13.0: a library
+requiring 14.0 or even 13.1 is rejected instead of silently dropping older Macs.
+Rebuild the named dependency with `MACOSX_DEPLOYMENT_TARGET=13.0` or deliberately
+choose a newer app build target and matching `--minimum-macos`. The app's declared
+minimum must match that option. The packager then signs nested code and the app ad-hoc. It verifies the signature
 before creating the zip. Existing outputs are never overwritten. This is not
 Developer ID signing or notarization; macOS may still require the normal explicit
 user approval for downloaded unsigned software. Do not disable system security.
@@ -194,8 +213,9 @@ packager checks text/file boundaries, not legal completeness. The script has not
 been executed on macOS in this review. Distribution still needs
 its native runtime checks and exact corresponding source obligations satisfied.
 
-Run `python3 tests/test_macos_build.py` for host-tool selection, missing-tool rejection
-and bundle resource contract checks. These do not compile or execute Apple code.
+Run `python3 tests/test_macos_build.py` for host-tool selection, missing-tool rejection,
+real CMake deployment-policy checks, newer-dependency rejection, Mach-O platform
+checks and bundle resource contracts. These do not compile or execute Apple code.
 
 For a native check of Retina coordinate conversion after building, run:
 
@@ -206,6 +226,9 @@ c++ -std=c++20 $(sdl2-config --cflags) \
 ./build-macos/retina_coordinates_regression
 ```
 
-The minimum supported macOS version follows the actual linked SDK/dependency
-artifacts. The packager derives it from every bundled ARM64 Mach-O image; this
-source review does not promise support for a particular older macOS release.
+Before calling a package supported, test that same packaged artifact on M1 hardware
+at the 13.0 baseline and each claimed release family (13, 14, 15, 26): Finder launch,
+controller discovery and reconnect, templates, saves, audio, mods, fullscreen/Retina
+menus, and a sustained race. A Mach-O minimum check cannot prove runtime API or
+GPU behavior, and no native macOS build or version-matrix run has been completed
+by this Windows review. Do not mark a release family passed until its result exists.

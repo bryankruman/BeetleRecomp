@@ -16,6 +16,12 @@
 #      Linux = clang + ninja + SDL2/GTK (RT64 -> Vulkan). See BUILDING.md.
 
 cmake_minimum_required(VERSION 3.20)
+include(cmake/MacOSSupport.cmake)
+if (CMAKE_HOST_APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    # A newer build host must not silently raise the release's minimum OS.
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Minimum macOS version")
+    beetle_validate_macos_target("${CMAKE_OSX_DEPLOYMENT_TARGET}")
+endif()
 project(BeetleRecomp LANGUAGES C CXX)
 
 # Frontend Cocoa helpers live outside RT64's CMake directory. Enable their

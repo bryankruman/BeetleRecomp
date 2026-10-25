@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <string>
+#include <functional>
 #include "recompinput.h"
 #include "json/json.hpp"
 
@@ -35,6 +36,8 @@ namespace recompinput {
         recompinput::InputField& get_input_binding(int profile_index, GameInput input, size_t binding_index);
         void set_input_binding(int profile_index, recompinput::GameInput input, size_t binding_index, recompinput::InputField value);
         void clear_input_binding(int profile_index, GameInput input);
+        // Host-specific defaults for a connected device, used only by explicit reset.
+        void set_controller_default_mapping_callback(std::function<bool(SDL_GameController*, GameInput, std::vector<InputField>&)> callback);
         void reset_input_binding(int profile_index, InputDevice device, GameInput input);
         void reset_profile_bindings(int profile_index, InputDevice device);
         int add_input_profile(const std::string &key, const std::string &name, InputDevice device, bool custom);

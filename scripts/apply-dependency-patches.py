@@ -21,6 +21,7 @@ def main():
     for name, dependency in (("N64ModernRuntime", "N64ModernRuntime"),
                              ("rt64", "rt64"), ("N64Recomp", "N64Recomp"),
                              ("rt64-windows-dxil", "rt64"),
+                             ("rt64-macos-baseline", "rt64"),
                              ("N64ModernRuntime-code-memory", "N64ModernRuntime")):
         directory = ROOT / "lib" / dependency
         patch = ROOT / "scripts" / "dependency-patches" / (name + ".patch")

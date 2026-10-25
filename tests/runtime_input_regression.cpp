@@ -296,6 +296,25 @@ int main() {
         profiles::set_input_binding(attached_live, GameInput::A, 0, source_a);
         require(profiles::get_input_binding(profiles::get_controller_profile_index_from_sdl_controller(pad_second), GameInput::A, 0) == source_a,
                 "editing detached live profile missed device map");
+        // Device-specific defaults apply only when explicitly reset, never during
+        // discovery or JSON load. An ordinary pad/profile must keep generic defaults.
+        profiles::set_controller_default_mapping_callback([pad_second](SDL_GameController* pad, GameInput input, std::vector<InputField>& fields) {
+            if (pad != pad_second || input != GameInput::C_UP) return false;
+            fields = {InputField::controller_digital(SDL_CONTROLLER_BUTTON_Y)};
+            return true;
+        });
+        const auto custom_c = InputField::controller_digital(SDL_CONTROLLER_BUTTON_B);
+        profiles::set_input_binding(attached_live, GameInput::C_UP, 0, custom_c);
+        require(profiles::save_controls_config(controls_path) && profiles::load_controls_config(controls_path), "device default fixture roundtrip failed");
+        require(profiles::get_input_binding(attached_live, GameInput::C_UP, 0) == custom_c, "device defaults replaced saved customization");
+        profiles::reset_input_binding(attached_live, InputDevice::Controller, GameInput::C_UP);
+        require(profiles::get_input_binding(attached_live, GameInput::C_UP, 0) == InputField::controller_digital(SDL_CONTROLLER_BUTTON_Y), "single reset lost device default");
+        profiles::set_input_binding(attached_live, GameInput::C_UP, 0, custom_c);
+        profiles::reset_profile_bindings(attached_live, InputDevice::Controller);
+        require(profiles::get_input_binding(attached_live, GameInput::C_UP, 0) == InputField::controller_digital(SDL_CONTROLLER_BUTTON_Y), "full reset lost device default");
+        profiles::reset_input_binding(a, InputDevice::Controller, GameInput::C_UP);
+        require(profiles::get_input_binding(a, GameInput::C_UP, 0) == get_default_mapping_for_input(InputDevice::Controller, GameInput::C_UP).front(), "device defaults leaked to unrelated profile");
+        profiles::set_controller_default_mapping_callback({});
         require(SDL_JoystickDetachVirtual(virtual_first) == 0, "virtual unplug failed");
         require(profiles::get_guid_from_sdl_controller(pad_second).serial == "#2", "remaining pad changed identity on unplug");
         SDL_GameControllerClose(pad_first);

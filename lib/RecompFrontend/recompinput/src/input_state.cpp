@@ -5,6 +5,7 @@
 
 #include "recompinput/recompinput.h"
 #include "recompinput/input_state.h"
+#include "recompinput/rumble.h"
 #include "recompinput/input_binding.h"
 #include "recompinput/players.h"
 #include "recompui/config.h"
@@ -88,8 +89,7 @@ void recompinput::update_rumble() {
         if (state.rumble_failed) {
            return;
         }
-        int err = SDL_JoystickRumble(joystick, 0, rumble_strength, duration);
-        if (err != 0) {
+        if (!send_controller_rumble(controller, rumble_strength, rumble_strength, duration)) {
             state.rumble_failed = true;
         }
     };
@@ -396,6 +396,7 @@ void recompinput::add_controller_state(SDL_JoystickID joystick_id, SDL_GameContr
 
 void recompinput::remove_controller_state(SDL_JoystickID joystick_id) {
     std::lock_guard lock{ InputState.controllers_mutex };
+    release_controller_rumble(joystick_id);
     InputState.controller_states.erase(joystick_id);
 }
 

@@ -59,25 +59,50 @@ def parse_rpaths(output):
     return result
 
 
+def parse_version(value):
+    if not re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,2}', value):
+        raise ValueError(f'Invalid macOS version: {value}')
+    parts = tuple(int(part) for part in value.split('.'))
+    return parts + (0,) * (3 - len(parts))
+
+
+def validate_baseline(value):
+    version = parse_version(value)
+    if version < (13, 0, 0):
+        raise ValueError('The Metal renderer baseline is macOS 13.0 or newer')
+    return version
+
+
 def parse_minimum_macos(output):
-    # Read the ARM64 slice only; a universal dependency can have a different
-    # Intel minimum. The app must advertise the newest minimum in its closure.
-    lines = output.splitlines()
+    # Read only the ARM64 slice. SDK version is not the deployment minimum.
+    commands = re.split(r'(?m)^\s*cmd ', output)[1:]
     minimums = []
-    for i, line in enumerate(lines):
-        command = line.strip()
-        if command not in ('cmd LC_BUILD_VERSION', 'cmd LC_VERSION_MIN_MACOSX'):
+    for command in commands:
+        rows = command.splitlines()
+        name = rows[0].strip()
+        if name not in ('LC_BUILD_VERSION', 'LC_VERSION_MIN_MACOSX'):
             continue
-        field = 'minos' if command == 'cmd LC_BUILD_VERSION' else 'version'
-        for row in lines[i+1:i+7]:
-            match = re.fullmatch(r'\s*' + field + r' (\d+(?:\.\d+){0,2})', row)
-            if match:
-                parts = tuple(int(part) for part in match.group(1).split('.'))
-                minimums.append(parts + (0,) * (3 - len(parts)))
-                break
+        if name == 'LC_BUILD_VERSION':
+            platforms = re.findall(r'(?m)^\s*platform (\S+)\s*$', command)
+            # otool versions print either the numeric constant or its name.
+            if platforms not in (['1'], ['macos']):
+                raise ValueError('Expected a macOS Mach-O slice, not iOS/Catalyst')
+        field = 'minos' if name == 'LC_BUILD_VERSION' else 'version'
+        versions = re.findall(r'(?m)^\s*' + field + r' (\S+)\s*$', command)
+        if len(versions) != 1:
+            raise ValueError('Malformed minimum macOS load command')
+        minimums.append(parse_version(versions[0]))
     if not minimums:
         raise ValueError('Mach-O lacks a recognized minimum macOS version')
     return max(minimums)
+
+
+def require_compatible_minimum(image, minimum, baseline):
+    if minimum > baseline:
+        version = '.'.join(map(str, minimum))
+        target = '.'.join(map(str, baseline))
+        raise ValueError(f'{image} requires macOS {version}, newer than selected {target}; '
+                         'rebuild this dependency for the selected deployment target')
 
 
 def resolve_dependency(dependency, image, app, rpaths):
@@ -115,11 +140,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir', type=Path, default=Path('build-macos'))
     parser.add_argument('--version', required=True)
+    parser.add_argument('--minimum-macos', default='13.0',
+                        help='Oldest OS this package must run on; must match the build target (default: 13.0)')
     parser.add_argument('--sdl-license', type=Path, required=True)
     parser.add_argument('--dependency-licenses', type=Path, required=True,
                         help='Directory of license/notice texts for the actual external dylib closure')
     parser.add_argument('--out-dir', type=Path, default=Path('dist'))
     args = parser.parse_args()
+    try:
+        baseline = validate_baseline(args.minimum_macos)
+    except ValueError as error:
+        parser.error(str(error))
     if platform.system() != 'Darwin':
         parser.error('Run on macOS after a successful native build.')
     if not re.fullmatch(r'[0-9A-Za-z][0-9A-Za-z._-]*', args.version):
@@ -156,6 +187,12 @@ def main():
     plist = plistlib.loads((source / 'Contents/Info.plist').read_bytes())
     if plist.get('CFBundleExecutable') != 'BeetleRecomp':
         parser.error('Unexpected app executable in Info.plist.')
+    try:
+        declared = validate_baseline(plist.get('LSMinimumSystemVersion', ''))
+    except ValueError as error:
+        parser.error(f'App has no valid explicit deployment baseline: {error}')
+    if declared != baseline:
+        parser.error('App deployment target differs from --minimum-macos; rebuild for the selected baseline.')
     out = (ROOT / args.out_dir).resolve()
     if out == ROOT or not out.is_relative_to(ROOT):
         parser.error('Output must be a subdirectory of this repository.')
@@ -190,7 +227,9 @@ def main():
             raise ValueError(f'Non-ARM64 dependency: {image}')
         load_commands = run('otool', '-arch', 'arm64', '-l', image)
         image_rpaths = parse_rpaths(load_commands)
-        minimum_versions.append(parse_minimum_macos(load_commands))
+        minimum = parse_minimum_macos(load_commands)
+        require_compatible_minimum(image, minimum, baseline)
+        minimum_versions.append(minimum)
         # Expand executable rpaths with the executable as loader, not this dylib.
         inherited = [str((app / 'Contents/MacOS') / r[len('@loader_path/'):])
                      if r.startswith('@loader_path/') else r for r in executable_rpaths]
@@ -198,7 +237,7 @@ def main():
             resolve_dependency(dependency, image, app, image_rpaths + inherited)
     if not minimum_versions:
         raise ValueError('No Mach-O executable found after bundle relocation')
-    plist['LSMinimumSystemVersion'] = '.'.join(str(value) for value in max(minimum_versions))
+    plist['LSMinimumSystemVersion'] = '.'.join(str(value) for value in baseline)
     (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(plist))
     # Relocation changes load commands, invalidating original signatures.
     # Sign nested code before the outer app; ad-hoc signing is for local testing.

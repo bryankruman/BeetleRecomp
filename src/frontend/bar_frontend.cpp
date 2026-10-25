@@ -1,5 +1,7 @@
 #include "frontend/bar_frontend.h"
 #include "frontend/controller_defaults.hpp"
+#include "frontend/n64_adapter.hpp"
+#include "recompinput/input_binding.h"
 #include "frontend/controller_assignment.hpp"
 #include "config/ui_config_page_controls.h"
 #include "main/bar_rumble.hpp"
@@ -22,6 +24,7 @@
 #include "recompinput/input_events.h"
 #include "recompinput/input_mapping.h"
 #include "recompinput/input_state.h"
+#include "recompinput/rumble.h"
 #include "recompinput/players.h"
 #include "recompinput/profiles.h"
 #include "librecomp/game.hpp"
@@ -297,6 +300,8 @@ void bar::frontend::install() {
     });
 
     register_controller_defaults();
+    recompinput::set_controller_profile_initializer(initialize_n64_adapter_profile);
+    recompinput::profiles::set_controller_default_mapping_callback(n64_adapter_default_mapping);
 
     // The keyboard scheme, declared as the frontend's DEFAULTS rather than left to RecompFrontend,
     // whose own defaults are a different scheme again (WASD and space).
@@ -713,6 +718,9 @@ void refresh_players() {
 void bar::frontend::pump_events() {
     // recompinput owns the SDL pump: it polls, filters, forwards to recompui, and applies cursor
     // visibility / relative-mouse mode from recompui's flag (recompui itself never calls SDL).
+    // Register verified adapter layouts before the backend handles a new device.
+    SDL_PumpEvents();
+    register_n64_adapter_mappings();
     recompinput::handle_events();
 
     // poll_inputs() is what fills recompinput's keyboard snapshot from SDL, and like update_rumble
@@ -724,6 +732,41 @@ void bar::frontend::pump_events() {
 
     refresh_players();
 
+    // Original N64 controllers have no spare Back/Guide button. L+R+Start opens
+    // settings once per press; binding scans and unfocused windows never trigger it.
+    static std::unordered_map<SDL_JoystickID, bool> previous_chords;
+    std::unordered_map<SDL_JoystickID, bool> current_chords;
+    const bool chord_allowed = SDL_GetKeyboardFocus() != nullptr &&
+        !recompinput::all_input_disabled() && !recompinput::binding::is_binding() &&
+        !recompinput::binding::should_skip_events() && !recompui::is_context_capturing_input();
+    bool open_from_chord = false;
+    std::array<bool, kMaxPlayers> adapter_chord_held{};
+    for (int port = 0; port < kMaxPlayers; ++port) {
+        auto* pad = recompinput::players::get_player(port).controller;
+        if (!has_n64_adapter_mapping(pad)) continue;
+        auto* joystick = SDL_GameControllerGetJoystick(pad);
+        const auto id = SDL_JoystickInstanceID(joystick);
+        bool previous = previous_chords[id];
+        const bool held = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) &&
+            SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) &&
+            SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START);
+        adapter_chord_held[port] = held;
+        open_from_chord |= n64_menu_chord_edge(held, chord_allowed, previous);
+        current_chords.emplace(id, previous);
+    }
+    previous_chords = std::move(current_chords);
+    if (open_from_chord) {
+        SDL_Event event{};
+        event.type = SDL_KEYDOWN;
+        event.key.state = SDL_PRESSED;
+        event.key.keysym.scancode = SDL_SCANCODE_ESCAPE;
+        event.key.keysym.sym = SDLK_ESCAPE;
+        recompui::queue_event(event);
+        event.type = SDL_KEYUP;
+        event.key.state = SDL_RELEASED;
+        recompui::queue_event(event);
+    }
+
     // Read mutable configuration only on the existing event/UI owner thread.
     const bool background_input = recompui::config::general::get_background_input_mode_enabled();
 
@@ -733,7 +776,10 @@ void bar::frontend::pump_events() {
         uint16_t buttons = 0;
         float x = 0.0f, y = 0.0f;
         const bool assigned = recompinput::players::get_player_is_assigned(port);
-        if (assigned) recompinput::profiles::get_n64_input(port, &buttons, &x, &y);
+        if (assigned && !adapter_chord_held[port])
+            recompinput::profiles::get_n64_input(port, &buttons, &x, &y);
+        // Queueing the menu event reaches the UI on its next update. Suppress
+        // this chord immediately so Start cannot pause the race before then.
         if (!std::isfinite(x)) x = 0.0f;
         if (!std::isfinite(y)) y = 0.0f;
         const auto sx = static_cast<uint8_t>(static_cast<int8_t>(std::lround(std::clamp(x, -1.0f, 1.0f) * 80.0f)));
@@ -746,7 +792,7 @@ void bar::frontend::pump_events() {
         // ports publish neutral on every pump; the mapper still honors UI capture.
         uint16_t background_buttons = 0;
         float background_x = 0.0f, background_y = 0.0f;
-        if (assigned && background_input) {
+        if (assigned && background_input && !adapter_chord_held[port]) {
             recompinput::profiles::get_n64_input(port, &background_buttons, &background_x, &background_y, false);
         }
         if (!std::isfinite(background_x)) background_x = 0.0f;
@@ -777,7 +823,7 @@ void bar::frontend::pump_events() {
             if (!send[port] || !recompinput::players::get_player_is_assigned(port)) continue;
             SDL_GameController* pad = recompinput::players::get_player(port).controller;
             if (pad != nullptr) {
-                SDL_GameControllerRumble(pad, strength[port], strength[port],
+                recompinput::send_controller_rumble(pad, strength[port], strength[port],
                                          strength[port] != 0 ? bar::rumble::kSendDurationMs : 0);
             }
         }

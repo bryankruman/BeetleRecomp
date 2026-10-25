@@ -43,6 +43,17 @@ endif()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Unsupported" if host == "powerpc" else "Missing pinned", result.stderr)
 
+    def test_explicit_deployment_target(self):
+        with tempfile.TemporaryDirectory(prefix="mac-target-", dir=ROOT / ".review") as tmp:
+            script = Path(tmp) / "check.cmake"
+            for version, expected in (("13.0", True), ("14.0", True), ("15.2.1", True),
+                                      ("26.0", True), ("12.7", False), ("10.15", False),
+                                      ("", False), ("newest", False), ("13.0junk", False)):
+                script.write_text(f'include("{(ROOT / "cmake/MacOSSupport.cmake").as_posix()}")\n'
+                                  f'beetle_validate_macos_target("{version}")\n')
+                result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, expected, result.stderr)
+
     def test_package_dependency_boundaries(self):
         spec = importlib.util.spec_from_file_location("mac_package", ROOT / "scripts/package-macos.py")
         package = importlib.util.module_from_spec(spec)
@@ -53,6 +64,27 @@ endif()
         self.assertEqual(package.parse_minimum_macos("cmd LC_VERSION_MIN_MACOSX\ncmdsize 16\nversion 11.0\nsdk 14.0\n"), (11, 0, 0))
         with self.assertRaises(ValueError):
             package.parse_minimum_macos("cmd LC_UUID\n")
+        for os_version in ('13.0', '14.0', '15.0', '26.0'):
+            baseline = package.validate_baseline(os_version)
+            package.require_compatible_minimum('old SDL', (11, 0, 0), baseline)
+            package.require_compatible_minimum('app', baseline, baseline)
+            with self.assertRaisesRegex(ValueError, 'rebuild this dependency'):
+                package.require_compatible_minimum('new SDL', (baseline[0] + 1, 0, 0), baseline)
+        with self.assertRaises(ValueError):
+            package.validate_baseline('12.7')
+        for command in ('cmd LC_BUILD_VERSION\nplatform 6\nminos 13.0\n',
+                        'cmd LC_BUILD_VERSION\nplatform 2\nminos 13.0\n',
+                        'cmd LC_BUILD_VERSION\nplatform 1\nsdk 15.0\n',
+                        'cmd LC_BUILD_VERSION\nplatform 1\nminos 13.0junk\n'):
+            with self.assertRaises(ValueError):
+                package.parse_minimum_macos(command)
+        self.assertEqual(package.parse_minimum_macos('cmd LC_BUILD_VERSION\nplatform macos\nminos 13.0\nsdk 26.0\n'), (13, 0, 0))
+        self.assertEqual(package.parse_minimum_macos(
+            'fat.dylib (architecture arm64):\nLoad command 1\ncmd LC_BUILD_VERSION\nplatform 1\nminos 13.0\nsdk 26.0\n'
+            'Load command 2\ncmd LC_UUID\ncmdsize 24\nuuid placeholder\n'
+            'Load command 3\ncmd LC_VERSION_MIN_MACOSX\nversion 14.2\nsdk 26.0\n'), (14, 2, 0))
+
+
         self.assertEqual(package.parse_rpaths("Load command 1\n          cmd LC_RPATH\n      cmdsize 40\n         path @loader_path/../Frameworks (offset 12)\n"), ["@loader_path/../Frameworks"])
         with tempfile.TemporaryDirectory(prefix="mac-package-", dir=ROOT / ".review") as tmp:
             app = Path(tmp) / "Application with spaces.app"
@@ -82,6 +114,7 @@ endif()
         plist = plistlib.loads((ROOT / "cmake/BeetleRecomp-Info.plist.in").read_bytes())
         self.assertEqual(plist["CFBundlePackageType"], "APPL")
         self.assertTrue(plist["NSHighResolutionCapable"])
+        self.assertEqual(plist["LSMinimumSystemVersion"], "${CMAKE_OSX_DEPLOYMENT_TARGET}")
         cmake = (ROOT / "CMakeLists.txt").read_text()
         self.assertIn('MACOSX_BUNDLE TRUE', cmake)
         self.assertIn('$<TARGET_BUNDLE_CONTENT_DIR:BeetleRecomp>/Resources/assets', cmake)

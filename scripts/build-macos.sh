@@ -10,6 +10,10 @@ fi
 JOBS="${BAR_JOBS:-4}"
 case "$JOBS" in ''|*[!0-9]*|0) echo "BAR_JOBS must be a positive integer." >&2; exit 1 ;; esac
 BUILD_DIR="${BAR_BUILD_DIR:-build-macos}"
+# The runtime baseline is independent of the OS/SDK used to build it. CMake
+# rejects targets below 13.0; external dylibs must also meet this target.
+MIN_MACOS="${BAR_MACOS_MIN_VERSION:-13.0}"
+export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS"
 for tool in cmake ninja python3 xcrun; do
     command -v "$tool" >/dev/null || { echo "Missing $tool; see BUILDING.md." >&2; exit 1; }
 done
@@ -30,7 +34,7 @@ done
 cmake -S . -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_C_COMPILER="$(xcrun --find clang)" \
     -DCMAKE_CXX_COMPILER="$(xcrun --find clang++)" \
-    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET="$MIN_MACOS" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DBEETLE_ENABLE_FRONTEND=ON -DBEETLE_REQUIRE_PATCHES=ON
 cmake --build "$BUILD_DIR" --target BeetleRecomp --parallel "$JOBS"

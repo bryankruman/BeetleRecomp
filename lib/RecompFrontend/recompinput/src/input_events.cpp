@@ -18,21 +18,29 @@ void queue_if_enabled(SDL_Event* event) {
 }
 
 // Controllers plugged in while in single player mode will create profiles after switching to multiplayer.
-static std::unordered_map<uint64_t, ControllerGUID> deferred_controller_profiles;
+static std::unordered_map<SDL_JoystickID, ControllerGUID> deferred_controller_profiles;
+static std::function<void(SDL_GameController*, int)> controller_profile_initializer;
 
-static int get_or_create_controller_profile_index(ControllerGUID guid) {
+void set_controller_profile_initializer(std::function<void(SDL_GameController*, int)> initializer) {
+    controller_profile_initializer = std::move(initializer);
+}
+
+static int get_or_create_controller_profile_index(ControllerGUID guid, SDL_GameController* controller) {
     std::string default_profile_key = profiles::get_string_from_controller_guid(guid);
     int profile_index = profiles::get_input_profile_by_key(default_profile_key);
     if (profile_index < 0) {
         profile_index = profiles::add_input_profile(default_profile_key, "Controller", InputDevice::Controller, false);
         profiles::reset_profile_bindings(profile_index, InputDevice::Controller);
+        if (controller_profile_initializer) controller_profile_initializer(controller, profile_index);
     }
     return profile_index;
 }
 
 void purge_deferred_controller_profiles() {
     for (auto &guid_pair : deferred_controller_profiles) {
-        int profile_index = get_or_create_controller_profile_index(guid_pair.second);
+        auto* controller = get_controller_from_joystick_id(guid_pair.first);
+        if (controller == nullptr || !SDL_GameControllerGetAttached(controller)) continue;
+        int profile_index = get_or_create_controller_profile_index(guid_pair.second, controller);
         profiles::add_controller(guid_pair.second, profile_index);
     }
     deferred_controller_profiles.clear();
@@ -77,7 +85,8 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
         printf("Controller added: %d\n", controller_event->which);
         if (controller != nullptr) {
             printf("  Instance ID: %d\n", SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller)));
-            printf("  Path: %s\n", SDL_JoystickPath(SDL_GameControllerGetJoystick(controller)));
+            const char* path = SDL_JoystickPath(SDL_GameControllerGetJoystick(controller));
+            printf("  Path: %s\n", path != nullptr ? path : "(unavailable)");
             recompinput::add_controller_state(SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller)), controller);
 
             if (SDL_GameControllerHasSensor(controller, SDL_SensorType::SDL_SENSOR_GYRO) && SDL_GameControllerHasSensor(controller, SDL_SensorType::SDL_SENSOR_ACCEL)) {
@@ -86,12 +95,13 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
             }
         }
         
+        if (controller == nullptr) break;
         ControllerGUID guid = profiles::get_guid_from_sdl_controller(controller);
         if (profiles::get_controller_by_guid(guid) < 0) {
             if (players::is_single_player_mode()) {
-                deferred_controller_profiles[guid.hash] = guid;
+                deferred_controller_profiles[SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller))] = guid;
             } else {
-                int profile_index = get_or_create_controller_profile_index(guid);
+                int profile_index = get_or_create_controller_profile_index(guid, controller);
                 profiles::add_controller(guid, profile_index);
             }
         }
@@ -101,6 +111,7 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
     {
         SDL_ControllerDeviceEvent* controller_event = &event->cdevice;
         printf("Controller removed: %d\n", controller_event->which);
+        deferred_controller_profiles.erase(controller_event->which);
         recompinput::remove_controller_state(controller_event->which);
     }
     break;
