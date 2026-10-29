@@ -1,0 +1,20 @@
+--- a/src/hle/rt64_application_window.cpp
++++ b/src/hle/rt64_application_window.cpp
+@@ -37,6 +37,17 @@
+             HookedApplicationWindow = nullptr;
+         }
+ 
++        // Restore the previous SDL event filter so SDL never calls back into this destroyed window.
++        if (sdlEventFilterInstalled) {
++            SDL_EventFilter currentFilter = nullptr;
++            void *currentUserdata = nullptr;
++            if (SDL_GetEventFilter(&currentFilter, &currentUserdata) && (currentFilter == &ApplicationWindow::sdlEventFilter) && (currentUserdata == this)) {
++                SDL_SetEventFilter(sdlEventFilterStored, sdlEventFilterUserdata);
++            }
++
++            sdlEventFilterInstalled = false;
++        }
++
+ #   ifdef _WIN32
+         if (windowHook != nullptr) {
+             UnhookWindowsHookEx(windowHook);

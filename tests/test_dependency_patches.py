@@ -93,7 +93,9 @@ def check_N64Recomp_migration_states():
                 # to change them, or any different operation, fails the test.
                 assert args[:3] == ('apply', '--reverse', '--check')
                 assert Path(args[-1]).name in {
-                    'N64ModernRuntime.patch', 'rt64.patch', 'rt64-windows-dxil.patch'}
+                    'N64ModernRuntime.patch', 'rt64.patch', 'rt64-windows-dxil.patch',
+                    'rt64-macos-baseline.patch', 'rt64-sdl-filter-restore.patch',
+                    'plume-metal-encoder-retain.patch', 'N64ModernRuntime-code-memory.patch'}
                 mocked_other_checks.append(Path(args[-1]).name)
                 return subprocess.CompletedProcess(args, 0, '', '')
 
@@ -117,7 +119,10 @@ def check_N64Recomp_migration_states():
                 assert mutations == [] and after == before
             expected_other = {'N64ModernRuntime.patch', 'rt64.patch'}
             if not rejected:
-                expected_other.add('rt64-windows-dxil.patch')
+                expected_other.update({
+                    'rt64-windows-dxil.patch', 'rt64-macos-baseline.patch',
+                    'rt64-sdl-filter-restore.patch', 'plume-metal-encoder-retain.patch',
+                    'N64ModernRuntime-code-memory.patch'})
             assert set(mocked_other_checks) == expected_other
             print('N64Recomp: production helper ' + state + ' regression passed')
 
