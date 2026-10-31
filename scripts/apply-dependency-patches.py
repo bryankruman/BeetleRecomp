@@ -24,7 +24,8 @@ def main():
                              ("rt64-macos-baseline", "rt64"),
                              ("rt64-sdl-filter-restore", "rt64"),
                              ("plume-metal-encoder-retain", "rt64/src/contrib/plume"),
-                             ("N64ModernRuntime-code-memory", "N64ModernRuntime")):
+                             ("N64ModernRuntime-code-memory", "N64ModernRuntime"),
+                             ("N64ModernRuntime-interrupt-mask", "N64ModernRuntime")):
         directory = ROOT / "lib" / dependency
         patch = ROOT / "scripts" / "dependency-patches" / (name + ".patch")
         if git(directory, "apply", "--reverse", "--check", str(patch)).returncode == 0:

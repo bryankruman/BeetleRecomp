@@ -110,6 +110,16 @@ else
         "hardware-register stub rename (${fn})" "RECOMP_FUNC void ${fn}("
 fi
 
+# Frame delta: func_uvgfxmgr_rom_00401004 returns the seconds since the previous frame, measured on
+# the wall clock, and the game steps its simulation by it. Rename the generated body so
+# src/main/bar_config.cpp can wrap it (bounding host hitches; BAR_DBG_TIME / BAR_TIME_SCALE).
+fn=func_uvgfxmgr_rom_00401004
+if grep -rlq "RECOMP_FUNC void ${fn}(" "$RF"/*.c 2>/dev/null; then
+    sed -i "s/RECOMP_FUNC void ${fn}(/RECOMP_FUNC void ${fn}__frame_delta_orig(/" "$RF"/*.c
+fi
+require "$(count_in_funcs "${fn}__frame_delta_orig")" 1 \
+    "frame-delta wrapper rename (${fn})" "RECOMP_FUNC void ${fn}("
+
 # ---------------------------------------------------------------------------------------------
 # BAR runtime correctness fixes. Address-anchored; each verifies its sentinel afterwards.
 # ---------------------------------------------------------------------------------------------

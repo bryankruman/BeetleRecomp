@@ -512,7 +512,20 @@ suspect (inferred) -- as is anything Beetle-specific, since Hybrid Heaven and Bo
 same WSLg setup. Next: repeat runs to characterise, log the offending guest pointer, and test on native
 Linux.
 
-## OPEN -- Intermittent crash at boot in `_uvScDoneAud` -> `osSendMesg`
+## LIKELY FIXED (pending a long play session) -- Intermittent crash in `_uvScDoneAud` -> `osSendMesg`
+
+**28 Oct 2026, macOS:** the same stack recurred after several rounds of a 4-player Beetle Battle,
+faulting in `ultramodern::thread_queue_insert` on an odd, unaligned "thread pointer" -- the audio
+message queue's waiting-thread list was corrupt. Probable cause: `osSetIntMask`, `__osDisableInt` and
+`__osRestoreInt` were no-ops in librecomp, so the cooperative preemption below could yield the App
+thread *inside* a section the game had masked. The game masks around libultra's audio event queue
+(`alEvtqPostEvent`, `alEvtqNextEvent`, `alEvtqFlush`, `alSynAddPlayer`/`RemovePlayer`), so the audio
+manager could run on a half-linked event list -- consistent with the corrupted/circular event list
+in the audio hang above. The mask is now tracked per N64 thread
+(`scripts/dependency-patches/N64ModernRuntime-interrupt-mask.patch`) and `bar_consume_yield` never
+yields while it is set. Not yet confirmed by a long session; reopen with the stack if it recurs.
+
+The original report:
 
 **Seen once, 11 Sep 2026**, on a launch of the frontend build that had started cleanly on the
 immediately preceding and following attempts with the same binary and the same settings folder. The

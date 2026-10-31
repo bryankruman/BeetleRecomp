@@ -95,7 +95,8 @@ def check_N64Recomp_migration_states():
                 assert Path(args[-1]).name in {
                     'N64ModernRuntime.patch', 'rt64.patch', 'rt64-windows-dxil.patch',
                     'rt64-macos-baseline.patch', 'rt64-sdl-filter-restore.patch',
-                    'plume-metal-encoder-retain.patch', 'N64ModernRuntime-code-memory.patch'}
+                    'plume-metal-encoder-retain.patch', 'N64ModernRuntime-code-memory.patch',
+                    'N64ModernRuntime-interrupt-mask.patch'}
                 mocked_other_checks.append(Path(args[-1]).name)
                 return subprocess.CompletedProcess(args, 0, '', '')
 
@@ -122,7 +123,7 @@ def check_N64Recomp_migration_states():
                 expected_other.update({
                     'rt64-windows-dxil.patch', 'rt64-macos-baseline.patch',
                     'rt64-sdl-filter-restore.patch', 'plume-metal-encoder-retain.patch',
-                    'N64ModernRuntime-code-memory.patch'})
+                    'N64ModernRuntime-code-memory.patch', 'N64ModernRuntime-interrupt-mask.patch'})
             assert set(mocked_other_checks) == expected_other
             print('N64Recomp: production helper ' + state + ' regression passed')
 

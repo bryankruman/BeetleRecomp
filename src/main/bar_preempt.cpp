@@ -37,6 +37,13 @@ static std::atomic<bool> g_preempt_run{true};
 // low-priority App thread (pri ~10), the one running the heavy straight-line compute, should yield.
 static constexpr int kBarMaxPreemptPriority = 100;   // audio mgr ~110, scheduler 127 are above this
 
+// Nonzero while this N64 thread has interrupts masked (osSetIntMask / __osDisableInt; librecomp). On
+// hardware nothing preempts a thread inside such a section, and the game relies on that: it edits
+// libultra's audio event queue (alEvtqPostEvent and friends) masked while the audio manager reads it.
+// Yielding there let the audio manager walk a half-linked list, corrupting audio state until a later
+// osSendMesg in _uvScDoneAud crashed on a garbage queue.
+extern "C" int recomp_interrupts_masked();
+
 extern "C" int bar_consume_yield(uint8_t* rdram) {
     static const bool bar_no_preempt = std::getenv("BAR_NO_PREEMPT") != nullptr;  // R6 bisect: BAR_NO_PREEMPT=1 disables cooperative-preempt
     if (bar_no_preempt) return 0;
@@ -44,6 +51,7 @@ extern "C" int bar_consume_yield(uint8_t* rdram) {
     if (!ultramodern::is_game_thread())  return 0;                   // never yield off game threads (RSP task / gfx)
     if (!ultramodern::is_game_started()) return 0;
     if (ultramodern::this_thread_priority(rdram) >= kBarMaxPreemptPriority) return 0;  // only the App thread, never audio/sched
+    if (recomp_interrupts_masked()) return 0;   // inside a critical section; the flag stays set for the next prologue
     bool expected = true;
     return g_should_yield.compare_exchange_strong(expected, false) ? 1 : 0;  // one yield per tick
 }

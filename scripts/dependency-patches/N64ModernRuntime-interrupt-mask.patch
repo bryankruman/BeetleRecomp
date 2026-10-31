@@ -1,0 +1,39 @@
+diff --git a/librecomp/src/ultra_translation.cpp b/librecomp/src/ultra_translation.cpp
+index e0d367e..cabade2 100644
+--- a/librecomp/src/ultra_translation.cpp
++++ b/librecomp/src/ultra_translation.cpp
+@@ -118,16 +118,31 @@ extern "C" void osWritebackDCacheAll_recomp(uint8_t * rdram, recomp_context * ct
+     ;
+ }
+ 
++// There are no interrupts to mask, but the game uses these calls to mark critical sections (for
++// example libultra's audio event queue, which the game thread edits while the audio thread reads it).
++// A port that yields game threads cooperatively must not yield inside one, so track the mask per N64
++// thread (each runs on its own host thread) and expose it through recomp_interrupts_masked().
++static constexpr uint32_t os_im_all = 0x003FFF01;   // OS_IM_ALL
++static thread_local uint32_t thread_int_mask = os_im_all;
++static thread_local bool thread_ints_enabled = true;
++
++extern "C" int recomp_interrupts_masked() {
++    return !thread_ints_enabled || (thread_int_mask & os_im_all) != os_im_all;
++}
++
+ extern "C" void osSetIntMask_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ;
++    const uint32_t previous = thread_int_mask;
++    thread_int_mask = (uint32_t)ctx->r4;
++    ctx->r2 = (int32_t)previous;
+ }
+ 
+ extern "C" void __osDisableInt_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ;
++    ctx->r2 = thread_ints_enabled ? 1 : 0;
++    thread_ints_enabled = false;
+ }
+ 
+ extern "C" void __osRestoreInt_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ;
++    thread_ints_enabled = ctx->r4 != 0;
+ }
+ 
+ extern "C" void __osSetFpcCsr_recomp(uint8_t * rdram, recomp_context * ctx) {
