@@ -5,7 +5,15 @@
 #include "ui_element.h"
 #include "../core/ui_context.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cstdio>
+#if !defined(_WIN32)
+#include <execinfo.h>
+#endif
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 namespace recompui {
 
@@ -27,6 +35,7 @@ Element::Element(ResourceId rid, Element* parent, uint32_t events_enabled, Rml::
         base = parent->base->AppendChild(std::move(base_owning));
         parent->add_child(this);
         this->parent = parent;
+        this->parent_is_shim = parent->shim;
     }
     else {
         base = base_owning.get();
@@ -38,8 +47,33 @@ Element::Element(ResourceId rid, Element* parent, uint32_t events_enabled, Rml::
     register_event_listeners(events_enabled);
 }
 
+// An element destroyed directly while its parent still lists it would leave the parent holding a
+// dangling child, which the parent later destroys again ("Attempted to destroy a UI resource that
+// doesn't exist"). Detach it instead, and log who destroyed it so the caller can be fixed.
+static void report_direct_destroy(Rml::Element* child, Rml::Element* parent) {
+    fprintf(stderr, "[recompui] %s destroyed while still a child of %s; detaching it. Destroyed from:\n",
+        child->GetId().c_str(), parent->GetId().c_str());
+#if !defined(_WIN32)
+    void* frames[64];
+    const int frame_count = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, frame_count, fileno(stderr));
+#endif
+#if defined(__APPLE__)
+    fprintf(stderr, "[recompui] executable load address: %p\n", static_cast<const void*>(_dyld_get_image_header(0)));
+#endif
+    fflush(stderr);
+}
+
 Element::~Element() {
     if (!shim) {
+        if (parent != nullptr && !parent_is_shim) {
+            auto& siblings = parent->children;
+            auto it = std::find(siblings.begin(), siblings.end(), this);
+            if (it != siblings.end()) {
+                report_direct_destroy(base, parent->base);
+                siblings.erase(it);
+            }
+        }
         clear_children();
         if (!base_owning) {
             base->GetParentNode()->RemoveChild(base);
@@ -71,6 +105,7 @@ void Element::set_parent(Element *new_parent) {
     
         base = parent->base->AppendChild(std::move(base_owning), true);
         parent->add_child(this);
+        parent_is_shim = parent->shim;
     }
 
 }
@@ -349,13 +384,30 @@ void Element::clear_children() {
     }
     ContextId context = get_current_context();
 
-    // Remove the children from the context.
-    for (Element* child : children) {
+    // Take the list first: each child's destructor checks it, and must not find itself there.
+    std::vector<Element*> to_destroy = std::move(children);
+    children.clear();
+    for (size_t i = 0; i < to_destroy.size(); i++) {
+        Element* child = to_destroy[i];
+        if (!context.owns_element(child)) {
+            // Destroying it here would be fatal ("doesn't exist in the current context"). Leak it and
+            // log where it actually lives, so the code that put it under this parent can be fixed.
+            const std::string owner = describe_element_owner(child);
+            fprintf(stderr, "[recompui] %s child %zu/%zu is not owned by the open context (%s); skipping it.\n",
+                base != nullptr ? base->GetId().c_str() : "?", i + 1, to_destroy.size(), owner.c_str());
+            fflush(stderr);
+            const bool child_alive = owner.rfind("no context", 0) != 0;
+            // Keep its RmlUi node alive with it: this parent's RmlUi subtree is about to be freed.
+            if (child_alive && child->base != nullptr && child->base->GetParentNode() != nullptr && !child->base_owning) {
+                child->base_owning = child->base->GetParentNode()->RemoveChild(child->base);
+            }
+            if (child_alive) {
+                child->parent = nullptr;
+            }
+            continue;
+        }
         context.destroy_resource(child);
     }
-
-    // Clear the child list.
-    children.clear();
 }
 
 bool Element::remove_child(ResourceId child, bool remove_from_context) {

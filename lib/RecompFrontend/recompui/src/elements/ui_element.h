@@ -62,6 +62,8 @@ private:
     std::unordered_multimap<std::string_view, uint32_t> style_name_index_map;
     std::vector<UICallback> callbacks;
     Element *parent = nullptr;
+    // A shim parent can be a temporary, so it is never dereferenced on destruction.
+    bool parent_is_shim = false;
     std::vector<Element *> children;
     std::string id;
     std::string debug_id = "";

@@ -43,6 +43,8 @@ namespace recompui {
         void destroy_resource(Style* resource);
         void destroy_resource(ResourceId resource);
         void clear_children();
+        // True if this (open) context holds exactly this element under its resource id.
+        bool owns_element(const Element* element);
 
         Rml::ElementDocument* get_document();
         Document* get_root_element();
@@ -71,6 +73,8 @@ namespace recompui {
     void destroy_context(ContextId id);
     ContextId get_current_context();
     ContextId get_context_from_document(Rml::ElementDocument* document);
+    // Diagnostics: which context, if any, holds this element pointer. Never dereferences it.
+    std::string describe_element_owner(const Element* element);
     void destroy_all_contexts();
 
     void register_ui_exports();

@@ -2,6 +2,13 @@
 #include <string>
 #include <unordered_map>
 #include <fstream>
+#include <cstdio>
+#if !defined(_WIN32)
+#include <execinfo.h>
+#endif
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 #include "slot_map.h"
 #include "RmlUi/Core/StreamMemory.h"
@@ -163,6 +170,19 @@ void context_error(recompui::ContextId id, ContextErrorType type) {
             error_message = "Unknown UI context error";
             break;
     }
+
+    // The process exits below, so leave the call site in the log for diagnosis.
+    fprintf(stderr, "[recompui] UI context error: %s\n", error_message);
+#if !defined(_WIN32)
+    void* frames[64];
+    const int frame_count = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, frame_count, fileno(stderr));
+#endif
+#if defined(__APPLE__)
+    // Release builds export few symbols; with the load address, atos -l can symbolicate the frames.
+    fprintf(stderr, "[recompui] executable load address: %p\n", static_cast<const void*>(_dyld_get_image_header(0)));
+#endif
+    fflush(stderr);
 
     // This assumes the error is coming from a mod, as it's unlikely that an end user will see a UI context error
     // in the base recomp.
@@ -676,6 +696,37 @@ void recompui::ContextId::destroy_resource(ResourceId resource) {
     if (!pop_result.has_value()) {
         context_error(*this, ContextErrorType::DestroyResourceNotFound);
     }
+}
+
+bool recompui::ContextId::owns_element(const Element* element) {
+    if (opened_context_id == ContextId::null() || *this != opened_context_id || element == nullptr) {
+        return false;
+    }
+    std::unique_ptr<Style>* slot = opened_context->resources.get(resource_slotmap::key{ element->resource_id.slot_id });
+    return slot != nullptr && slot->get() == element;
+}
+
+std::string recompui::describe_element_owner(const Element* element) {
+    std::lock_guard lock{ context_state.all_contexts_lock };
+    std::vector<context_slotmap::key> keys{};
+    for (const auto& [key, item] : context_state.all_contexts.items()) {
+        keys.push_back(key);
+    }
+    for (auto key : keys) {
+        Context* ctx = context_state.all_contexts.get(key);
+        std::vector<resource_slotmap::key> resource_keys{};
+        for (const auto& [resource_key, item] : ctx->resources.items()) {
+            resource_keys.push_back(resource_key);
+        }
+        for (auto resource_key : resource_keys) {
+            std::unique_ptr<Style>* resource = ctx->resources.get(resource_key);
+            if (resource != nullptr && resource->get() == element) {
+                return "context " + std::to_string(key.raw) + (ContextId{ key.raw } == opened_context_id ? " (open)" : " (not open)") +
+                    ", slot " + std::to_string(resource_key.raw);
+            }
+        }
+    }
+    return "no context (already destroyed)";
 }
 
 void recompui::ContextId::clear_children() {
