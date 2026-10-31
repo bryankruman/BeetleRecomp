@@ -4,7 +4,8 @@
 #include "elements/ui_element.h"
 #include "elements/ui_svg.h"
 #include "elements/ui_button.h"
-#include "elements/ui_pill_button.h"
+#include "elements/ui_icon_button.h"
+#include "elements/ui_label.h"
 #include "elements/ui_select.h"
 
 namespace recompui {
@@ -28,7 +29,12 @@ protected:
     Element *card = nullptr;
     Svg* icon = nullptr;
     Select *profile_select = nullptr;
-    PillButton *multiplayer_pill = nullptr;
+    // Assignment cards only: which device fills the slot, and a button to empty it.
+    Label *caption = nullptr;
+    std::string caption_text;
+    IconButton *remove_button = nullptr;
+    bool remove_pressed = false;
+    bool selected = false;
     Button *edit_profile_button = nullptr;
     int player_index = -1;
     bool is_assignment_card = false;
@@ -36,8 +42,10 @@ protected:
     bool was_player_assigning = false;
     bool queue_focus_on_edit_profile_button = false;
     bool force_instant_scroll = false;
+    bool activity_highlighted = false;
 
     on_select_player_profile_callback on_select_profile_callback;
+    std::function<void(int)> on_pressed_callback;
     on_edit_player_profile_callback on_edit_profile_callback;
 
     virtual void process_event(const Event &e) override;
@@ -45,7 +53,7 @@ protected:
 private:
     void on_select_player_profile(int profile_index);
     void on_edit_profile();
-    void create_add_multiplayer_pill();
+    void update_activity_highlight();
 public:
     PlayerCard(ResourceId rid, Element *parent, int player_index, bool is_assignment_card = false);
     virtual ~PlayerCard();
@@ -57,6 +65,11 @@ public:
     void set_on_edit_profile_callback(on_edit_player_profile_callback callback) {
         on_edit_profile_callback = std::move(callback);
     }
+    // Assignment cards: called with the player index when the card is clicked or accepted.
+    void set_on_pressed_callback(std::function<void(int)> callback) {
+        on_pressed_callback = std::move(callback);
+    }
+    void set_selected(bool is_selected) { selected = is_selected; }
 
     // Has to be queued.
     // Non-assignment Player cards are in a scroll container that hasn't calculated its layout yet.

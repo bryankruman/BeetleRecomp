@@ -93,6 +93,9 @@ protected:
     // for tracking forced updates to entire page (major changes like player reassignment or singleplayer mode)
     int last_update_index = 0;
     int update_index = 0;
+    // Player assignment the page was last rendered with. Assignment also changes outside this page
+    // (startup auto-assignment, hotplug), and the player cards must be rebuilt when it does.
+    std::vector<uintptr_t> rendered_assignment;
 
     int selected_player = 0;
     int selected_profile_index = -1;

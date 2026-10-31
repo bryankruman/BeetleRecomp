@@ -703,6 +703,18 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
             }
         }
 
+        // While players are being assigned, pads are joining and identifying themselves, not driving
+        // the menu: they must not hide the cursor, move focus or press dialog buttons. The mouse stays
+        // in control and Escape cancels the dialog. Joining is handled by recompinput separately.
+        if (recompinput::playerassignment::is_active() &&
+            (cur_event.type == SDL_EventType::SDL_CONTROLLERBUTTONDOWN ||
+             cur_event.type == SDL_EventType::SDL_CONTROLLERBUTTONUP ||
+             cur_event.type == SDL_EventType::SDL_CONTROLLERAXISMOTION ||
+             cur_event.type == SDL_EventType::SDL_USEREVENT)) {
+            latest_controller_key_pressed = SDLK_UNKNOWN;   // no held-direction repeats into the dialog
+            continue;
+        }
+
         if (!all_input_is_disabled) {
             bool is_mouse_input = false;
             // Implement some additional behavior for specific events on top of what RmlUi normally does with them.

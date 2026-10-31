@@ -30,6 +30,8 @@
 #include "librecomp/game.hpp"
 #include "ultramodern/config.hpp"
 #include <filesystem>
+#include <fstream>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -56,6 +58,57 @@ std::array<std::atomic<uint64_t>, kMaxPlayers> g_background_port_samples{};
 std::array<std::atomic<bool>, kMaxPlayers> g_raw_rumble{};
 std::atomic<bool> g_menu_capturing{};
 std::atomic<bool> g_auto_configure_requested{};
+
+// The player layout from "Assign players" / Auto-configure, kept across launches. Each port records
+// the keyboard and the pad's GUID + uid, the same identity resolve_legacy() matches imported ports by.
+struct SavedPort {
+    bool keyboard = false;
+    std::string guid;
+    std::string uid;
+};
+using SavedLayout = std::array<SavedPort, kMaxPlayers>;
+
+std::filesystem::path player_layout_path() {
+    return recomp::get_config_path() / "player_layout.json";
+}
+
+std::optional<SavedLayout> load_player_layout() {
+    std::ifstream file(player_layout_path());
+    if (!file) return std::nullopt;
+    const nlohmann::json json = nlohmann::json::parse(file, nullptr, false);
+    if (json.is_discarded() || !json.contains("ports") || !json["ports"].is_array() ||
+        json["ports"].size() != kMaxPlayers) {
+        std::fprintf(stderr, "[BeetleRecomp] ignoring unreadable %s\n", player_layout_path().string().c_str());
+        return std::nullopt;
+    }
+    SavedLayout layout{};
+    for (int port = 0; port < kMaxPlayers; ++port) {
+        const auto& entry = json["ports"][port];
+        layout[port].keyboard = entry.value("keyboard", false);
+        layout[port].guid = entry.value("guid", std::string{});
+        layout[port].uid = entry.value("uid", std::string{});
+    }
+    return layout;
+}
+
+void save_player_layout(const bar::frontend::controller_assignment::Slots& slots,
+                        const std::vector<bar::frontend::controller_assignment::Device>& devices) {
+    nlohmann::json ports = nlohmann::json::array();
+    for (const auto& slot : slots) {
+        nlohmann::json entry{{"keyboard", slot.keyboard}, {"guid", ""}, {"uid", ""}};
+        for (const auto& device : devices) {
+            if (!slot.controller.empty() && device.key == slot.controller) {
+                entry["guid"] = device.guid;
+                entry["uid"] = device.uid;
+                break;
+            }
+        }
+        ports.push_back(std::move(entry));
+    }
+    std::ofstream file(player_layout_path());
+    file << nlohmann::json{{"version", 1}, {"ports", ports}}.dump(2);
+    if (!file) std::fprintf(stderr, "[BeetleRecomp] could not save %s\n", player_layout_path().string().c_str());
+}
 
 // Assets are resolved as <exe dir>/assets/<name> (recompui::file::get_asset_path). The primary font
 // is REQUIRED: recompui throws "No primary font was registered" without it. The family name is what
@@ -621,7 +674,18 @@ void refresh_players() {
             imported |= recompinput::profiles::get_input_profile_by_key(prefix + "_keyboard") >= 0;
             imported |= recompinput::profiles::get_input_profile_by_key(prefix + "_controller") >= 0;
         }
-        if (imported) {
+        // A layout saved from "Assign players" or Auto-configure wins: it is the player's latest choice.
+        // Pads are matched by GUID + uid as they reconnect; a missing pad leaves its port reserved.
+        if (const auto saved = load_player_layout()) {
+            for (int port = 0; port < kMaxPlayers; ++port) {
+                preferred[port].reserved = true;
+                preferred[port].keyboard = (*saved)[port].keyboard;
+                if (!(*saved)[port].guid.empty()) imported_devices[port] = {(*saved)[port].guid, (*saved)[port].uid};
+            }
+        }
+        // An untouched first-run input.json only says "keyboard on port 1"; it is not a layout the
+        // player chose, so it must not reserve port 1 ahead of connected pads.
+        else if (imported && !bar::input_config::has_default_port_layout(legacy)) {
             for (int port = 0; port < kMaxPlayers; ++port) {
                 const auto& old = legacy.ports[port];
                 if (!old.connected || old.device.type == bar::input_config::DeviceType::None) continue;
@@ -652,6 +716,7 @@ void refresh_players() {
                 port, recompinput::InputDevice::Keyboard);
         }
         published = live;
+        save_player_layout(preferred, devices);
     }
 
     const bool requested = g_auto_configure_requested.exchange(false, std::memory_order_relaxed);
@@ -668,6 +733,7 @@ void refresh_players() {
         for (int port = 0; port < kMaxPlayers; ++port) {
             if (preferred[port].keyboard) keyboard_profiles[port] = keyboard_profile;
         }
+        save_player_layout(preferred, devices);
     }
     if (initialized && !requested && connected_ids == assigned_ids && pad_profiles == assigned_profiles) {
         previous_keys = std::move(current_keys);
@@ -769,6 +835,9 @@ void bar::frontend::pump_events() {
 
     // Read mutable configuration only on the existing event/UI owner thread.
     const bool background_input = recompui::config::general::get_background_input_mode_enabled();
+
+    // Lets the Controls and Assign Players cards highlight whichever pad is being pressed.
+    recompinput::players::update_controller_activity();
 
     // Profiles and SDL handles belong to the event/UI thread. Publish coherent samples
     // for the game's controller thread instead of reading mutable profiles there.

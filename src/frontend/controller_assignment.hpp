@@ -59,19 +59,18 @@ inline void resolve_legacy(Slots& preferred, const std::array<LegacyDevice, 4>& 
 }
 
 
-// Automatic discovery merges keys into P1. The explicit menu action instead
-// gives the keyboard the next free console port, as the original menu did.
+// Controllers come first: with any pad connected, nobody is given the keyboard automatically; it is
+// added deliberately in Assign players. With no pad, the keyboard is player one -- shared during
+// automatic discovery, so a pad plugged in later merges with it, or a port of its own for the
+// explicit Auto-configure action.
 inline Slots automatic(const std::vector<std::string>& connected, bool separate_keyboard) {
     Slots slots{};
-    size_t port = 0;
-    for (; port < slots.size() && port < connected.size(); ++port) {
+    for (size_t port = 0; port < slots.size() && port < connected.size(); ++port) {
         slots[port].controller = connected[port];
     }
-    if (separate_keyboard) {
-        if (port < slots.size()) slots[port].keyboard = true;
-    } else {
+    if (connected.empty()) {
         slots[0].keyboard = true;
-        slots[0].share_keyboard = true;
+        slots[0].share_keyboard = !separate_keyboard;
     }
     return slots;
 }

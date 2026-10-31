@@ -139,6 +139,11 @@ NLOHMANN_JSON_SERIALIZE_ENUM(PakType, {
 // library is seeded with "Default Keyboard" and "Default Gamepad".
 InputConfig default_input_config();
 
+// True if the port layout is still the built-in default above (keyboard with the historical keymap on
+// port 0, ports 1-3 unplugged). Paks and the profile library are ignored. Lets the frontend tell an
+// auto-written first-run input.json apart from a layout the player actually chose.
+bool has_default_port_layout(const InputConfig& config);
+
 // True if input.json already exists (i.e. NOT a first run). Call before load() to decide whether to
 // apply first-run defaults (e.g. defaulting port 0 to a detected controller).
 bool config_file_exists();

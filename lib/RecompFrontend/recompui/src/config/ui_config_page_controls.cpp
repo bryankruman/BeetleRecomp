@@ -232,6 +232,19 @@ void ConfigPageControls::process_event(const Event &e) {
                 config::get_config_modal()->render_menu_actions();
             }
         }
+        {
+            std::vector<uintptr_t> assignment;
+            for (size_t i = 0; i < recompinput::players::get_max_number_of_players(); i++) {
+                const int player = static_cast<int>(i);
+                const bool assigned = recompinput::players::get_player_is_assigned(player);
+                assignment.push_back(assigned ? 1 + static_cast<uintptr_t>(recompinput::players::get_player_input_device(player)) : 0);
+                assignment.push_back(assigned ? reinterpret_cast<uintptr_t>(recompinput::players::get_player(player).controller) : 0);
+            }
+            if (assignment != rendered_assignment) {
+                rendered_assignment = std::move(assignment);
+                force_update();
+            }
+        }
         if (last_update_index != update_index) {
             last_update_index = update_index;
             render_all();
@@ -322,9 +335,8 @@ void ConfigPageControls::render_header() {
                 header_elements.right.assign_players_button = context.create_element<Button>(header_right, "Assign players", ButtonStyle::Primary);
                 header_elements.right.assign_players_button->set_debug_id("AssignPlayersButton");
                 header_elements.right.assign_players_button->add_pressed_callback([]() {
-                    if (!recompinput::players::has_enough_players_assigned()) {
-                        recompinput::playerassignment::start();
-                    }
+                    // Edit the current layout rather than re-entering every player.
+                    recompinput::playerassignment::start_from_current();
                     recompui::AssignPlayersModal::open();
                 });
                 header_elements.right.assign_players_button->set_as_primary_focus(true);

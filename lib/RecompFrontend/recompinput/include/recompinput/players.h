@@ -36,11 +36,30 @@ namespace recompinput {
         // Preserve explicit console slots, including unassigned gaps and imported
         // per-player keyboard profiles. Manual assignment takes precedence.
         void auto_assign_players(const Player* slots, size_t count);
+
+        // Live "is this pad being used" state for the UI, so players can tell their controllers apart.
+        // Refresh once per tick on the SDL event thread; query from any thread.
+        void update_controller_activity();
+        bool is_controller_active(SDL_GameController* controller);
+        // 1-based position of the pad among connected controllers ("Pad 2"), or 0 if not connected.
+        int get_controller_number(SDL_GameController* controller);
     }
 
     namespace playerassignment {
         bool is_active();
+        // Starts with every slot empty.
         void start();
+        // Starts from the committed players so they can be edited rather than re-entered.
+        void start_from_current();
+        // Players in the session; slots may be empty, so this is not the highest slot number.
+        size_t get_assigned_count();
+        // The slot the next joining device fills, or -1 when full or inactive.
+        int get_next_free_slot();
+        void remove_player(int player_index);
+        bool can_undo();
+        void undo_last_join();
+        // Swaps two slots, either of which may be empty (moving a player into a gap).
+        void swap_players(int first, int second);
         void stop();
         void stop_and_close_modal();
         void commit_player_assignment();

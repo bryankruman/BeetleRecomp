@@ -11,7 +11,8 @@ PlayerCard::PlayerCard(
     Element *parent,
     int player_index,
     bool is_assignment_card
-) : Element(rid, parent, Events(EventType::Focus), "div", false),
+) : Element(rid, parent, Events(EventType::Focus, EventType::Update, EventType::Click),
+        is_assignment_card ? "button" : "div", false),
     player_index(player_index),
     is_assignment_card(is_assignment_card)
 {
@@ -49,11 +50,27 @@ PlayerCard::PlayerCard(
     card->set_background_color(theme::color::Transparent);
 
     if (is_assignment_card) {
+        // Clicking (or accepting) a card selects it for a swap; see AssignPlayersModal.
+        enable_focus();
+        set_cursor(Cursor::Pointer);
+
         auto player_label = context.create_element<Label>(card, "P" + std::to_string(player_index + 1), LabelStyle::Annotation);
         player_label->set_position(Position::Absolute);
         player_label->set_top(8.0f);
         player_label->set_left(8.0f);
         player_label->set_color(theme::color::TextDim);
+
+        remove_button = context.create_element<IconButton>(card, "icons/X.svg", ButtonStyle::Tertiary, IconButtonSize::Mini);
+        remove_button->set_position(Position::Absolute);
+        remove_button->set_top(6.0f);
+        remove_button->set_right(6.0f);
+        remove_button->set_display(Display::None);
+        remove_button->set_debug_id("RemovePlayer" + std::to_string(player_index + 1));
+        remove_button->add_pressed_callback([this]() {
+            // The click also bubbles to this card; don't treat it as a selection.
+            remove_pressed = true;
+            recompinput::playerassignment::remove_player(this->player_index);
+        });
     }
 
     icon = context.create_element<Svg>(card, "icons/RecordBorder.svg");
@@ -61,6 +78,13 @@ PlayerCard::PlayerCard(
     icon->set_height(icon_size, Unit::Dp);
     icon->set_color(theme::color::TextDim);
     icon->set_display(Display::None);
+
+    if (is_assignment_card) {
+        caption = context.create_element<Label>(this, "", LabelStyle::Small);
+        caption->set_width(100.0f, Unit::Percent);
+        caption->set_text_align(TextAlign::Center);
+        caption->set_color(theme::color::TextDim);
+    }
 
     if (!is_assignment_card) {
         auto player = recompinput::players::get_player(player_index, is_assignment_card);
@@ -126,10 +150,35 @@ PlayerCard::PlayerCard(
         });
         edit_profile_button->set_width(100.0f, Unit::Percent);
         edit_profile_button->set_enabled(player_is_assigned);
+        // The context sends one update once the card is registered; process_event then re-queues it
+        // every frame so the card lights up while its pad is in use. Queueing here, mid-construction,
+        // is rejected because the card is not in the context yet.
     }
 }
 
 PlayerCard::~PlayerCard() {
+}
+
+void PlayerCard::update_activity_highlight() {
+    bool use_temp_state = is_assignment_card && recompinput::playerassignment::is_active();
+    bool active = false;
+    if (recompinput::players::get_player_is_assigned(player_index, use_temp_state)) {
+        active = recompinput::players::is_controller_active(recompinput::players::get_player(player_index, use_temp_state).controller);
+    }
+    if (active == activity_highlighted) {
+        return;
+    }
+
+    activity_highlighted = active;
+    // Assignment cards repaint their border and background every frame in update_assignment_player_card.
+    if (!is_assignment_card) {
+        card->set_border_color(active ? theme::color::SuccessL : theme::color::BorderSoft);
+        if (active) {
+            card->set_background_color(theme::color::SuccessA30);
+        } else {
+            card->set_background_color(theme::color::Transparent);
+        }
+    }
 }
 
 void PlayerCard::process_event(const Event &e) {
@@ -155,6 +204,17 @@ void PlayerCard::process_event(const Event &e) {
                 force_instant_scroll = true;
                 edit_profile_button->focus();
             }
+        }
+        if (!is_assignment_card) {
+            update_activity_highlight();
+            queue_update();
+        }
+        break;
+    case EventType::Click:
+        if (remove_pressed) {
+            remove_pressed = false;
+        } else if (is_assignment_card && on_pressed_callback) {
+            on_pressed_callback(player_index);
         }
         break;
     default:
@@ -215,27 +275,11 @@ void PlayerCard::update_player_card_icon() {
     }
 }
 
-void PlayerCard::create_add_multiplayer_pill() {
-    if (multiplayer_pill != nullptr) {
-        return;
-    }
-
-    ContextId cur_context = get_current_context();
-    multiplayer_pill = cur_context.create_element<PillButton>(
-        card, "", "icons/PlusKeyboard.svg",
-        ButtonStyle::Tertiary,
-        PillButtonSize::Small);
-    multiplayer_pill->add_pressed_callback(recompinput::playerassignment::add_keyboard_player);
-    multiplayer_pill->set_position(Position::Absolute);
-    multiplayer_pill->set_right(4);
-    multiplayer_pill->set_bottom(4);
-    multiplayer_pill->set_debug_id("AddMultiplayerPill");
-}
-
 void PlayerCard::update_assignment_player_card() {
     static const float scale_anim_duration = 0.25f;
 
     update_player_card_icon();
+    update_activity_highlight();
 
     if (cur_icon == PlayerCardIcon::Recording) {
         auto millis_since_start = std::chrono::duration_cast<std::chrono::milliseconds>(ultramodern::time_since_start()).count();
@@ -246,35 +290,54 @@ void PlayerCard::update_assignment_player_card() {
 
     bool player_is_currently_assigning = recompinput::playerassignment::is_player_currently_assigning(player_index);
 
-    if (player_is_currently_assigning) {
-        if (recompinput::playerassignment::was_keyboard_assigned()) {
-            create_add_multiplayer_pill();
-        }
-        if (!was_player_assigning) {
-            scroll_into_view(true);
-        }
-    } else if (multiplayer_pill != nullptr) {
-        card->remove_child(multiplayer_pill);
-        multiplayer_pill = nullptr;
+    if (player_is_currently_assigning && !was_player_assigning) {
+        scroll_into_view(true);
     }
-
     was_player_assigning = player_is_currently_assigning;
 
     bool use_temp_state = is_assignment_card && recompinput::playerassignment::is_active();
-    if (!recompinput::players::get_player_is_assigned(player_index, use_temp_state)) {
-        if (player_is_currently_assigning) {
-            icon->set_scale_2D(1.1f, 1.1f);
-            card->set_background_color(theme::color::PrimaryL, 255/5);
-            icon->set_color(theme::color::PrimaryL);
+    bool assigned = recompinput::players::get_player_is_assigned(player_index, use_temp_state);
+
+    // Name the device so identical pads can be told apart (together with the live highlight).
+    std::string text;
+    if (assigned) {
+        const auto& player = recompinput::players::get_player(player_index, use_temp_state);
+        if (player.controller != nullptr) {
+            const int number = recompinput::players::get_controller_number(player.controller);
+            text = number > 0 ? "Pad " + std::to_string(number) : "Controller";
+            if (player.keyboard_enabled) text += " + keys";
         } else {
-            icon->set_scale_2D(1.0f, 1.0f);
-            card->set_background_color(theme::color::Transparent);
-            icon->set_color(theme::color::TextDim);
+            text = "Keyboard";
         }
-        return;
+    } else {
+        text = player_is_currently_assigning ? "Press a button" : "Empty";
+    }
+    if (text != caption_text) {
+        caption_text = text;
+        caption->set_text(text);
+    }
+    remove_button->set_display(assigned && recompinput::playerassignment::is_active() ? Display::Block : Display::None);
+
+    // Selected for a swap, then in use right now, then the slot that fills next.
+    if (selected) {
+        card->set_border_color(theme::color::SecondaryL);
+        card->set_background_color(theme::color::SecondaryA30);
+    } else if (activity_highlighted) {
+        card->set_border_color(theme::color::SuccessL);
+        card->set_background_color(theme::color::SuccessA30);
+    } else if (player_is_currently_assigning) {
+        card->set_border_color(theme::color::PrimaryL);
+        card->set_background_color(theme::color::PrimaryL, 255/5);
+    } else {
+        card->set_border_color(theme::color::BorderSoft);
+        card->set_background_color(assigned ? theme::color::PrimaryA20 : theme::color::Transparent);
     }
 
-    card->set_background_color(theme::color::PrimaryA20);
+    if (!assigned) {
+        icon->set_scale_2D(player_is_currently_assigning ? 1.1f : 1.0f, player_is_currently_assigning ? 1.1f : 1.0f);
+        icon->set_color(player_is_currently_assigning ? theme::color::PrimaryL : theme::color::TextDim);
+        return;
+    }
 
     bool has_controller = recompinput::players::get_player_input_device(player_index, use_temp_state) == recompinput::InputDevice::Controller;
 

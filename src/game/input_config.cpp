@@ -220,6 +220,22 @@ InputConfig default_input_config() {
     return c;
 }
 
+bool has_default_port_layout(const InputConfig& config) {
+    const InputConfig defaults = default_input_config();
+    for (size_t port = 0; port < config.ports.size(); port++) {
+        const PortConfig& actual   = config.ports[port];
+        const PortConfig& expected = defaults.ports[port];
+        if (actual.connected != expected.connected || actual.device.type != expected.device.type) return false;
+        if (!expected.connected) continue;
+        for (size_t i = 0; i < expected.bindings.map.size(); i++) {
+            const Bind& a = actual.bindings.map[i];
+            const Bind& e = expected.bindings.map[i];
+            if (a.source != e.source || a.code != e.code || a.dir != e.dir) return false;
+        }
+    }
+    return true;
+}
+
 // ----------------------------------------------------------------------------------------
 // Canonical config + persistence.
 // ----------------------------------------------------------------------------------------

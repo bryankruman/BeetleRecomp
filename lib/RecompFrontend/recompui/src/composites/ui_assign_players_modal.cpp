@@ -90,6 +90,9 @@ AssignPlayersModal::AssignPlayersModal(ResourceId rid, Document *parent) : Eleme
     header->set_padding_right(localstyles::padding::horizontal);
 
     context.create_element<Label>(header, "Assign Players", theme::Typography::Header3);
+    status_label = context.create_element<Label>(header, "", LabelStyle::Small);
+    status_label->set_margin_top(8.0f);
+    status_label->set_color(theme::color::TextDim);
 
     player_elements_wrapper = context.create_element<Element>(modal, 0, "div", false);
     player_elements_wrapper->set_width(100, Unit::Percent);
@@ -115,21 +118,27 @@ AssignPlayersModal::AssignPlayersModal(ResourceId rid, Document *parent) : Eleme
 
     auto left = context.create_element<Container>(footer, FlexDirection::Row, JustifyContent::FlexStart, 0);
     set_button_side_styles(left);
-    keep_players_button = context.create_element<Button>(left, "Keep players", ButtonStyle::Tertiary);
-    keep_players_button->set_debug_id("KeepPlayersButton");
-    keep_players_button->add_pressed_callback(recompinput::playerassignment::stop_and_close_modal);
-    keep_players_button->set_enabled(false);
+    start_over_button = context.create_element<Button>(left, "Start over", ButtonStyle::Tertiary);
+    start_over_button->set_debug_id("StartOverPlayerAssignmentButton");
+    start_over_button->add_pressed_callback([this]() {
+        recompinput::playerassignment::start();
+        this->selected_slot = -1;
+    });
+    undo_button = context.create_element<Button>(left, "Undo", ButtonStyle::Tertiary);
+    undo_button->set_debug_id("UndoPlayerJoinButton");
+    undo_button->add_pressed_callback([this]() {
+        recompinput::playerassignment::undo_last_join();
+        this->selected_slot = -1;
+    });
 
     auto right = context.create_element<Container>(footer, FlexDirection::Row, JustifyContent::FlexEnd, 0);
-    retry_button = context.create_element<Button>(right, "Retry", ButtonStyle::Warning);
-    retry_button->set_debug_id("RetryPlayerAssignmentButton");
-    retry_button->set_enabled(false);
-    retry_button->add_pressed_callback([this](){
-        this->set_fake_focus_enabled(true);
-        this->fake_focus_button->focus();
-        recompinput::playerassignment::start();
-        this->init_pending_state();
-    });
+    cancel_button = context.create_element<Button>(right, "Cancel", ButtonStyle::Tertiary);
+    cancel_button->set_debug_id("CancelPlayerAssignmentButton");
+    cancel_button->add_pressed_callback(recompinput::playerassignment::stop_and_close_modal);
+
+    add_keyboard_button = context.create_element<Button>(right, "Add keyboard", ButtonStyle::Secondary);
+    add_keyboard_button->set_debug_id("AddKeyboardPlayerButton");
+    add_keyboard_button->add_pressed_callback(recompinput::playerassignment::add_keyboard_player);
 
     confirm_button = context.create_element<Button>(right, "Confirm", ButtonStyle::Primary);
     confirm_button->set_debug_id("ConfirmPlayerAssignmentButton");
@@ -148,27 +157,62 @@ void AssignPlayersModal::set_fake_focus_enabled(bool enabled) {
 }
 
 void AssignPlayersModal::init_pending_state() {
-    if (recompinput::playerassignment::is_active()) {
-        keep_players_button->set_display(Display::None);
-        keep_players_button->set_enabled(false);
-        retry_button->set_enabled(false);
-        retry_button->set_text("Retry");
-        confirm_button->set_display(Display::Flex);
-    } else {
-        keep_players_button->set_display(Display::Flex);
-        retry_button->set_enabled(true);
-        retry_button->set_text("Reassign");
+    selected_slot = -1;
+    status_text.clear();
+    update_controls();
+    // Park focus on the invisible button: a pad's first press joins it, and must not also
+    // activate whichever dialog button happened to have focus.
+    set_fake_focus_enabled(true);
+    fake_focus_button->focus();
+}
 
-        if (recompinput::players::has_enough_players_assigned()) {
-            keep_players_button->set_enabled(true);
-            keep_players_button->focus();
-        } else {
-            keep_players_button->set_enabled(false);
-            retry_button->focus();
-        }
-
-        confirm_button->set_display(Display::None);
+void AssignPlayersModal::on_card_pressed(int player_index) {
+    if (!recompinput::playerassignment::is_active()) {
+        return;
     }
+    if (selected_slot < 0) {
+        // Only a filled slot can be picked up; an empty one is just where a new pad lands.
+        if (recompinput::players::get_player_is_assigned(player_index, true)) {
+            selected_slot = player_index;
+        }
+    } else {
+        if (selected_slot != player_index) {
+            recompinput::playerassignment::swap_players(selected_slot, player_index);
+        }
+        selected_slot = -1;
+    }
+}
+
+void AssignPlayersModal::update_controls() {
+    using namespace recompinput;
+    const bool active = playerassignment::is_active();
+    const int next_slot = playerassignment::get_next_free_slot();
+    if (selected_slot >= 0 && !players::get_player_is_assigned(selected_slot, true)) {
+        selected_slot = -1;   // removed or undone while selected
+    }
+
+    std::string text;
+    if (selected_slot >= 0) {
+        text = "Moving player " + std::to_string(selected_slot + 1) +
+            ": select another slot to swap with it, or an empty slot to move it there. Select it again to cancel.";
+    } else if (next_slot >= 0) {
+        text = "Player " + std::to_string(next_slot + 1) +
+            ": press any button on a controller to join, or choose Add keyboard.";
+        if (playerassignment::get_assigned_count() > 0) {
+            text += " Select a player to move them, or \u00d7 to remove them.";
+        }
+    } else {
+        text = "All slots are filled. Select a player to swap them with another, then Confirm.";
+    }
+    if (text != status_text) {
+        status_text = text;
+        status_label->set_text(text);
+    }
+
+    start_over_button->set_enabled(active && playerassignment::get_assigned_count() > 0);
+    undo_button->set_enabled(playerassignment::can_undo());
+    add_keyboard_button->set_enabled(active && next_slot >= 0 && !playerassignment::was_keyboard_assigned());
+    confirm_button->set_enabled(active && playerassignment::met_assignment_requirements());
 }
 
 void AssignPlayersModal::lock_focus(bool lock) {
@@ -196,18 +240,13 @@ void AssignPlayersModal::process_event(const Event &e) {
             create_player_elements();
         }
 
+        update_controls();
         for (size_t i = 0; i < recompinput::players::get_max_number_of_players(); i++) {
+            player_elements[i]->set_selected(int(i) == selected_slot);
             player_elements[i]->update_assignment_player_card();
         }
 
-        if (recompinput::playerassignment::is_active()) {
-            bool met_assignment_reqs = recompinput::playerassignment::met_assignment_requirements();
-            lock_focus(!met_assignment_reqs);
-            confirm_button->set_enabled(met_assignment_reqs);
-            retry_button->set_enabled(met_assignment_reqs);
-        } else {
-            lock_focus(false);
-        }
+        lock_focus(recompinput::playerassignment::is_active() && !recompinput::playerassignment::met_assignment_requirements());
 
         queue_update();
     } else if (e.type == EventType::MenuAction) {
@@ -218,12 +257,11 @@ void AssignPlayersModal::process_event(const Event &e) {
         auto& action = std::get<EventMenuAction>(e.variant);
         switch (action.action) {
             case MenuAction::Back: {
-                ContextId context = get_current_context();
-                Element *close_as_element = static_cast<Element*>(keep_players_button);
-                if (context.get_focused_element() == close_as_element) {
-                    recompinput::playerassignment::stop_and_close_modal();
+                // Back cancels a pending swap first, then the whole session.
+                if (selected_slot >= 0) {
+                    selected_slot = -1;
                 } else {
-                    keep_players_button->focus();
+                    recompinput::playerassignment::stop_and_close_modal();
                 }
                 break;
             }
@@ -277,6 +315,9 @@ void AssignPlayersModal::create_player_elements() {
         }
         
         PlayerCard* player_element = context.create_element<PlayerCard>(row_wrapper, i, true);
+        player_element->set_on_pressed_callback([this](int player_index) {
+            this->on_card_pressed(player_index);
+        });
         if (should_scroll) {
             // Padding ensures that when focused via controller nav the card is fully visible.
             // Negative margin collapses the extra space.
@@ -303,6 +344,11 @@ void AssignPlayersModal::open() {
     if (assign_players_modal_instance == nullptr) {
         return;
     }
+
+    // Pads are ignored by the menu while assigning, so hand control to the mouse even if a
+    // controller was driving the menu when the dialog opened.
+    recompui::set_cont_active(false);
+    recompui::activate_mouse();
 
     ContextId prev_context = try_close_current_context();
     if (!recompui::is_context_shown(assign_players_modal_context)) {

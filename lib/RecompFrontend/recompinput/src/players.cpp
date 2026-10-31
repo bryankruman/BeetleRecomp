@@ -6,6 +6,11 @@
 #include "composites/ui_assign_players_modal.h"
 #include "config/ui_config_page_controls.h"
 
+#include <algorithm>
+#include <mutex>
+#include <unordered_set>
+#include <vector>
+
 namespace recompinput {
 
 void Player::button_pressed() {
@@ -52,6 +57,47 @@ public:
         (*this)[index] = player;
         if (player.controller != nullptr || player.keyboard_enabled) count = std::max(count, index + 1);
     }
+
+    // Slots may have gaps (a deliberately empty port), so count is "highest slot + 1", not the
+    // number of players. These helpers keep that invariant for the assignment editor.
+    size_t assigned_count() const {
+        size_t assigned = 0;
+        for (size_t i = 0; i < count; i++) {
+            assigned += player_is_assigned(int(i)) ? 1 : 0;
+        }
+        return assigned;
+    }
+
+    int first_free_slot(size_t limit) const {
+        for (size_t i = 0; i < std::min(limit, max_num_players_supported); i++) {
+            if (!player_is_assigned(int(i))) return int(i);
+        }
+        return -1;
+    }
+
+    void clear_slot(size_t index) {
+        if (index >= max_num_players_supported) return;
+        (*this)[index] = Player();
+        recount();
+    }
+
+    void swap_slots(size_t a, size_t b) {
+        if (a >= max_num_players_supported || b >= max_num_players_supported) return;
+        std::swap((*this)[a], (*this)[b]);
+        recount();
+    }
+
+private:
+    void recount() {
+        count = 0;
+        for (size_t i = 0; i < max_num_players_supported; i++) {
+            if (player_is_assigned_unbounded(i)) count = i + 1;
+        }
+    }
+
+    bool player_is_assigned_unbounded(size_t index) const {
+        return (*this)[index].controller != nullptr || (*this)[index].keyboard_enabled;
+    }
 };
 
 static struct {
@@ -61,6 +107,8 @@ static struct {
     size_t max_players = 4;
     PlayerArray players;
     PlayerArray temp_players;
+    // Slots filled during the current assignment session, oldest first, for "Undo".
+    std::vector<int> join_order;
 
     PlayerArray& get_player_array(bool temp) {
         return temp ? temp_players : players;
@@ -117,7 +165,7 @@ bool players::get_player_is_assigned(int player_index, bool temp_player) {
 }
 
 bool players::has_enough_players_assigned() {
-    return PlayerState.players.get_count() >= PlayerState.min_players;
+    return PlayerState.players.assigned_count() >= PlayerState.min_players;
 }
 
 InputDevice players::get_player_input_device(int player_index, bool temp_player) {
@@ -145,6 +193,56 @@ bool playerassignment::is_active() {
 void playerassignment::start(void) {
     PlayerState.is_assigning = true;
     PlayerState.temp_players = PlayerArray{};
+    PlayerState.join_order.clear();
+}
+
+void playerassignment::start_from_current(void) {
+    PlayerState.is_assigning = true;
+    PlayerState.temp_players = PlayerState.players;
+    PlayerState.join_order.clear();
+}
+
+size_t playerassignment::get_assigned_count() {
+    return PlayerState.temp_players.assigned_count();
+}
+
+int playerassignment::get_next_free_slot() {
+    if (!playerassignment::is_active()) return -1;
+    return PlayerState.temp_players.first_free_slot(players::get_max_number_of_players());
+}
+
+static void record_join(int slot) {
+    if (slot >= 0) PlayerState.join_order.push_back(slot);
+}
+
+void playerassignment::remove_player(int player_index) {
+    if (!playerassignment::is_active() || player_index < 0) return;
+    PlayerState.temp_players.clear_slot(size_t(player_index));
+    auto& order = PlayerState.join_order;
+    order.erase(std::remove(order.begin(), order.end(), player_index), order.end());
+}
+
+bool playerassignment::can_undo() {
+    return playerassignment::is_active() && !PlayerState.join_order.empty();
+}
+
+void playerassignment::undo_last_join() {
+    if (!playerassignment::can_undo()) return;
+    const int slot = PlayerState.join_order.back();
+    PlayerState.join_order.pop_back();
+    PlayerState.temp_players.clear_slot(size_t(slot));
+}
+
+void playerassignment::swap_players(int first, int second) {
+    const int max_players = int(players::get_max_number_of_players());
+    if (!playerassignment::is_active() || first == second || first < 0 || second < 0 ||
+        first >= max_players || second >= max_players) return;
+    PlayerState.temp_players.swap_slots(size_t(first), size_t(second));
+    // Undo follows the player, not the slot number.
+    for (int& slot : PlayerState.join_order) {
+        if (slot == first) slot = second;
+        else if (slot == second) slot = first;
+    }
 }
 
 void playerassignment::stop(void) {
@@ -237,21 +335,18 @@ void playerassignment::commit_player_assignment() {
     // keyboard profile, which is created with every binding cleared -- player two existed and
     // pressed nothing. Only one keyboard player can be assigned (see process_sdl_event), so the
     // overlap that clearing guards against cannot happen, and the single-player keyboard profile is
-    // the one with the defaults and the one the controls tab edits. If nobody takes the keyboard,
-    // player one keeps it, exactly as auto_assign_controllers does.
-    bool keyboard_taken = false;
-    for (int i = 0; i < players::get_number_of_assigned_players(); i++) {
-        keyboard_taken |= PlayerState.players[i].controller == nullptr;
-    }
-    for (int i = 0; i < players::get_number_of_assigned_players(); i++) {
+    // the one with the defaults and the one the controls tab edits. The keyboard drives only a
+    // player added with "Add keyboard"; pad players do not share it. Slots can be empty (a
+    // deliberate gap), and those get no profiles.
+    for (int i = 0; i < (int)recompinput::max_num_players_supported; i++) {
         Player &player = PlayerState.players[i];
         int cont_profile_index = -1;
         int kb_profile_index = -1;
-        if (player.controller != nullptr) {
+        if (!PlayerState.players.player_is_assigned(i)) {
+            // Empty slot: no profiles.
+        } else if (player.controller != nullptr) {
+            // Pad players get no keyboard: it belongs to whoever was added with "Add keyboard".
             cont_profile_index = profiles::get_controller_profile_index_from_sdl_controller(player.controller);
-            if (i == 0 && !keyboard_taken) {
-                kb_profile_index = profiles::get_sp_keyboard_profile_index();
-            }
         } else {
             kb_profile_index = profiles::get_sp_keyboard_profile_index();
         }
@@ -261,11 +356,22 @@ void playerassignment::commit_player_assignment() {
 }
 
 void playerassignment::add_keyboard_player() {
-    PlayerState.temp_players.add_keyboard_player();
+    if (playerassignment::was_keyboard_assigned()) return;
+    const int slot = playerassignment::get_next_free_slot();
+    if (slot < 0) return;
+    // The keyboard is one device: a pad player that was sharing it gives it up.
+    for (size_t i = 0; i < PlayerState.temp_players.size(); i++) {
+        if (PlayerState.temp_players[i].controller != nullptr) PlayerState.temp_players[i].keyboard_enabled = false;
+    }
+    Player player{};
+    player.keyboard_enabled = true;
+    player.button_pressed();
+    PlayerState.temp_players.assign_slot(size_t(slot), player);
+    record_join(slot);
 }
 
 bool playerassignment::met_assignment_requirements() {
-    return PlayerState.temp_players.get_count() >= PlayerState.min_players;
+    return PlayerState.temp_players.assigned_count() >= PlayerState.min_players;
 }
 
 bool playerassignment::is_blocking_input() {
@@ -273,7 +379,7 @@ bool playerassignment::is_blocking_input() {
 }
 
 bool playerassignment::is_player_currently_assigning(int player_index) {
-    return playerassignment::is_active() && player_index == (int)(PlayerState.temp_players.get_count());
+    return playerassignment::is_active() && player_index == playerassignment::get_next_free_slot();
 }
 
 bool playerassignment::was_keyboard_assigned() {
@@ -282,13 +388,72 @@ bool playerassignment::was_keyboard_assigned() {
         return false;
     }
 
+    // A keyboard-only player; a pad player sharing the keyboard does not count.
     for (size_t i = 0; i < num_temp; i++) {
-        if (PlayerState.temp_players[i].keyboard_enabled) {
+        if (PlayerState.temp_players[i].keyboard_enabled && PlayerState.temp_players[i].controller == nullptr) {
             return true;
         }
     }
 
     return false;
+}
+
+static std::mutex controller_activity_mutex;
+static std::unordered_set<SDL_JoystickID> active_controllers;
+
+void players::update_controller_activity() {
+    // Half deflection, so resting sticks and idle triggers never read as activity.
+    constexpr Sint16 axis_threshold = 16384;
+    std::unordered_set<SDL_JoystickID> active;
+    for (int index = 0; index < SDL_NumJoysticks(); index++) {
+        const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(index);
+        SDL_GameController* controller = SDL_GameControllerFromInstanceID(id);
+        if (controller == nullptr) {
+            continue;
+        }
+
+        bool pressed = false;
+        for (int button = 0; button < SDL_CONTROLLER_BUTTON_MAX && !pressed; button++) {
+            pressed = SDL_GameControllerGetButton(controller, static_cast<SDL_GameControllerButton>(button)) != 0;
+        }
+        for (int axis = 0; axis < SDL_CONTROLLER_AXIS_MAX && !pressed; axis++) {
+            const Sint16 value = SDL_GameControllerGetAxis(controller, static_cast<SDL_GameControllerAxis>(axis));
+            pressed = value > axis_threshold || value < -axis_threshold;
+        }
+        if (pressed) {
+            active.insert(id);
+        }
+    }
+
+    std::lock_guard lock(controller_activity_mutex);
+    active_controllers = std::move(active);
+}
+
+int players::get_controller_number(SDL_GameController* controller) {
+    if (controller == nullptr) {
+        return 0;
+    }
+    const SDL_JoystickID id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller));
+    int number = 0;
+    for (int index = 0; index < SDL_NumJoysticks(); index++) {
+        if (!SDL_IsGameController(index)) {
+            continue;
+        }
+        number++;
+        if (SDL_JoystickGetDeviceInstanceID(index) == id) {
+            return number;
+        }
+    }
+    return 0;
+}
+
+bool players::is_controller_active(SDL_GameController* controller) {
+    if (controller == nullptr) {
+        return false;
+    }
+    const SDL_JoystickID id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller));
+    std::lock_guard lock(controller_activity_mutex);
+    return active_controllers.count(id) != 0;
 }
 
 std::chrono::steady_clock::duration playerassignment::get_player_time_since_last_button_press(int player_index) {
@@ -318,13 +483,19 @@ void playerassignment::process_sdl_event(SDL_Event* event) {
 
         switch (keyevent->keysym.scancode) {
         case SDL_Scancode::SDL_SCANCODE_ESCAPE:
-            // TODO: Restore previous assignment?
-            playerassignment::stop();
+            // Cancel: edits live in temp_players, so the committed players are already intact.
+            playerassignment::stop_and_close_modal();
             return;
         case SDL_Scancode::SDL_SCANCODE_RIGHT:
         case SDL_Scancode::SDL_SCANCODE_LEFT:
         case SDL_Scancode::SDL_SCANCODE_UP:
         case SDL_Scancode::SDL_SCANCODE_DOWN:
+        // Menu navigation keys operate the dialog's buttons; they must not also join the keyboard.
+        case SDL_Scancode::SDL_SCANCODE_RETURN:
+        case SDL_Scancode::SDL_SCANCODE_KP_ENTER:
+        case SDL_Scancode::SDL_SCANCODE_SPACE:
+        case SDL_Scancode::SDL_SCANCODE_TAB:
+        case SDL_Scancode::SDL_SCANCODE_BACKSPACE:
             break;
         default:
             if (playerassignment::was_keyboard_assigned()) {
@@ -354,8 +525,13 @@ void playerassignment::process_sdl_event(SDL_Event* event) {
             }
         }
 
-        if (can_be_mapped) {
-            PlayerState.temp_players.add_controller_player(controller);
+        const int slot = playerassignment::get_next_free_slot();
+        if (can_be_mapped && controller != nullptr && slot >= 0) {
+            Player player{};
+            player.controller = controller;
+            player.button_pressed();
+            PlayerState.temp_players.assign_slot(size_t(slot), player);
+            record_join(slot);
         }
 
         break;

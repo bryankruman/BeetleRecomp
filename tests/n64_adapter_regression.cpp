@@ -31,7 +31,7 @@ int main() {
         require(SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) == 0, "SDL initialization failed");
         require(!recompinput::is_raphnet_dual_n64(0x289b, 0x0094), "future firmware must remain unverified");
         require(!recompinput::is_raphnet_dual_n64(0x9999, 0x0064), "other vendor must not match");
-        for (Uint16 product : {0x0030, 0x0036, 0x003c, 0x0064}) {
+        for (Uint16 product : {0x0030, 0x0036, 0x003c, 0x0063, 0x0064}) {
             const int first = attach(0x289b, product, "Dual N64 regression fixture");
             const int second = attach(0x289b, product, "Dual N64 regression fixture");
             require(first >= 0 && second >= 0, "virtual joystick attachment failed");

@@ -21,14 +21,32 @@ inline std::string n64_adapter_mapping(SDL_JoystickGUID guid) {
 
 // Called before recompinput drains DEVICEADDED events. Never replace a mapping
 // already supplied by SDL, SDL_GAMECONTROLLERCONFIG, or the player's mapping file.
+// SDL only announces a device as a controller (SDL_CONTROLLERDEVICEADDED) if it already has a
+// mapping when it is enumerated. Adapters present at launch are enumerated before this runs, so
+// post that event for each port the new mapping turns into a controller; recompinput then creates
+// its input profile exactly as for a hotplugged pad. Without it those pads have no profile, and
+// the game reads them as unbound.
 inline int register_n64_adapter_mappings() {
-    int added = 0;
+    // Both ports of an adapter share a GUID, so one mapping converts both: list them all first.
+    std::vector<int> unmapped;
     for (int index = 0; index < SDL_NumJoysticks(); ++index) {
-        if (!recompinput::is_raphnet_dual_n64(SDL_JoystickGetDeviceVendor(index),
-                                             SDL_JoystickGetDeviceProduct(index))) continue;
+        if (recompinput::is_raphnet_dual_n64(SDL_JoystickGetDeviceVendor(index), SDL_JoystickGetDeviceProduct(index)) &&
+            !SDL_IsGameController(index)) {
+            unmapped.push_back(index);
+        }
+    }
+    int added = 0;
+    for (int index : unmapped) {
         if (SDL_IsGameController(index)) continue;
         if (SDL_GameControllerAddMapping(n64_adapter_mapping(SDL_JoystickGetDeviceGUID(index)).c_str()) >= 0)
             ++added;
+    }
+    for (int index : unmapped) {
+        if (!SDL_IsGameController(index)) continue;
+        SDL_Event event{};
+        event.type = SDL_CONTROLLERDEVICEADDED;
+        event.cdevice.which = index;
+        SDL_PushEvent(&event);
     }
     return added;
 }

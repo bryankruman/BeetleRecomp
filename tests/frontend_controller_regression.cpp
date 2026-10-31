@@ -60,11 +60,17 @@ int main() {
         slots = reconcile(preferred, {"pad-B", "replacement"});
         require(slots[0].controller == "replacement" && slots[1].controller == "pad-B", "replacement must fill free automatic port");
 
+        preferred = automatic({"pad-A", "pad-B"}, false);
+        slots = reconcile(preferred, {"pad-A", "pad-B"});
+        require(slots[0].controller == "pad-A" && !slots[0].keyboard && !slots[2].keyboard, "discovery with pads must not seat the keyboard");
         preferred = automatic({"pad-A", "pad-B"}, true);
         slots = reconcile(preferred, {"pad-A", "pad-B"});
-        require(slots[0].controller == "pad-A" && !slots[0].keyboard && slots[2].keyboard, "explicit auto-configure must give keyboard its own next port");
+        require(slots[0].controller == "pad-A" && !slots[0].keyboard && !slots[2].keyboard, "auto-configure with pads must not seat the keyboard");
         slots = reconcile(preferred, {"pad-A", "pad-B", "pad-C"});
-        require(slots[2].keyboard && slots[2].controller.empty() && slots[3].controller == "pad-C", "new pad stole the dedicated keyboard port");
+        require(slots[2].controller == "pad-C" && !slots[2].keyboard, "a new pad must take the next free port");
+        preferred = automatic({}, true);
+        slots = reconcile(preferred, {});
+        require(slots[0].keyboard && !slots[0].share_keyboard, "auto-configure without pads must seat the keyboard on P1");
         preferred = automatic({"A", "B", "C", "D", "E"}, true);
         slots = reconcile(preferred, {"A", "B", "C", "D", "E"});
         require(slots[3].controller == "D" && !slots[3].keyboard, "four-controller limit changed");
