@@ -209,6 +209,9 @@ def main():
     shutil.copy2(executable, app / 'Contents/MacOS/BeetleRecomp')
     shutil.copy2(source / 'Contents/Info.plist', app / 'Contents/Info.plist')
     shutil.copytree(assets, app / 'Contents/Resources/assets')
+    icon = source / 'Contents/Resources/BeetleRecomp.icns'
+    if icon.is_file():
+        shutil.copy2(icon, app / 'Contents/Resources/BeetleRecomp.icns')
     for name in ('COPYING', 'THIRD_PARTY_NOTICES.md', 'README.md'):
         shutil.copy2(ROOT / name, stage / name)
     subprocess.run([sys.executable, str(ROOT / 'scripts/stage-licenses.py'), str(stage / 'licenses'),

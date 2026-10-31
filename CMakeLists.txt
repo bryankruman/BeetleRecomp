@@ -337,10 +337,22 @@ if (APPLE)
     find_package(SDL2 REQUIRED)
     target_include_directories(BeetleRecomp PRIVATE ${SDL2_INCLUDE_DIRS})
     target_link_libraries(BeetleRecomp PRIVATE SDL2::SDL2 "-framework Cocoa" "-framework Foundation")
+
+    # Finder/Dock icon, rendered from the shared PNG at build time.
+    set(BEETLE_MACOS_ICON "${CMAKE_BINARY_DIR}/BeetleRecomp.icns")
+    add_custom_command(OUTPUT "${BEETLE_MACOS_ICON}"
+        COMMAND ${CMAKE_COMMAND} -DICON_SOURCE=${CMAKE_SOURCE_DIR}/icons/Icon.png
+                -DICON_OUTPUT=${BEETLE_MACOS_ICON} -P ${CMAKE_SOURCE_DIR}/cmake/MakeMacOSIcon.cmake
+        DEPENDS "${CMAKE_SOURCE_DIR}/icons/Icon.png" "${CMAKE_SOURCE_DIR}/cmake/MakeMacOSIcon.cmake"
+        COMMENT "Building macOS app icon")
+    target_sources(BeetleRecomp PRIVATE "${BEETLE_MACOS_ICON}")
+    set_source_files_properties("${BEETLE_MACOS_ICON}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+
     set_target_properties(BeetleRecomp PROPERTIES
         MACOSX_BUNDLE TRUE
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.beetlerecomp.BeetleRecomp"
         MACOSX_BUNDLE_BUNDLE_NAME "BeetleRecomp"
+        MACOSX_BUNDLE_ICON_FILE "BeetleRecomp.icns"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/cmake/BeetleRecomp-Info.plist.in")
 endif()
 
